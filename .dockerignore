@@ -1,0 +1,8 @@
+.git
+**/__pycache__
+*.egg-info
+build
+results
+.release-patterns.local
+.pytest_cache
+.github

@@ -1,0 +1,7 @@
+# Package metadata is in setup.py (works with old and new setuptools).
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,145 @@
+# Single-host demo: two replicas of a 2-stage pipeline behind one Connex
+# front-router. Each replica is a stage-0 (OpenAI API) + stage-1 chain; both
+# register under the same logical endpoints, so when a stage of one replica
+# dies its in-flight requests hand over to the other replica's stage.
+#
+#   export VLLM_FORK_REPO=<git URL of the external-PP vLLM fork>   # only for --build
+#   export HF_TOKEN=...                       # gated models; MODEL defaults to Llama-3-8B
+#   docker compose -f docker/docker-compose.yml up --build -d
+#   docker/smoke_test.sh                      # replica 0 (:8000)
+#   docker/smoke_test.sh http://127.0.0.1:8010   # replica 1
+#
+# GPUs: replica 0 uses GPU0/GPU1 (default 0, 1), replica 1 GPU2/GPU3 (default
+# 2, 3). On two GPUs with >= 40 GB each, pack both replicas:
+#   GPU2=0 GPU3=1 GPU_MEM_UTIL=0.4, and start replica 1 only after replica 0
+#   is up (concurrent vLLM startups on one GPU break its memory profiling)
+# One replica only: docker compose -f docker/docker-compose.yml up -d router stage0 stage1
+#
+# Optional: --profile proxy   the request retry/resume proxy on :5199 over both
+#                             replicas' APIs (hides a stage-0 death from clients)
+# A local model directory instead of a Hugging Face download: add
+#   -f docker/compose.local-model.yml with MODEL_DIR=/path/to/model
+# Router ports: ROUTER_PORT / ROUTER_EVENT_PORT (default 15555 / 15560).
+#
+# Mooncake runs in P2PHANDSHAKE metadata mode, so no etcd is needed. TCP is the
+# default; set MOONCAKE_PROTOCOL=rdma (and mount /dev/infiniband, see the
+# commented lines) to use RDMA. All services use the host network so the
+# Mooncake handshake and Connex ports are reachable without port mappings.
+
+x-stage: &stage
+  image: ${CONNEX_IMAGE:-connex-vllm:dev}
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+    args:
+      BASE_IMAGE: ${BASE_IMAGE:-vllm/vllm-openai:v0.11.2}
+      VLLM_FORK_REPO: ${VLLM_FORK_REPO:-}
+      VLLM_FORK_REF: ${VLLM_FORK_REF:-380186d57}
+  network_mode: host
+  ipc: host
+  shm_size: 16gb
+  depends_on: [router]
+  volumes:
+    # Hugging Face cache shared by the stages (downloads happen once)
+    - ${HF_CACHE:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+  # devices: ["/dev/infiniband:/dev/infiniband"]   # RDMA
+  # cap_add: [IPC_LOCK]
+  environment: &stage_env
+    BACKEND: ${BACKEND:-connexte}
+    NUM_STAGES: "2"
+    NUM_LAYERS: ${NUM_LAYERS:-32}
+    MODEL_PATH: ${MODEL:-meta-llama/Meta-Llama-3-8B}
+    MODEL_NAME: ${MODEL_NAME:-connex-demo}
+    HF_TOKEN: ${HF_TOKEN:-}
+    ROUTER_ADDR: 127.0.0.1:${ROUTER_PORT:-15555}
+    HOST_IP: 127.0.0.1
+    GPU_SELECT: none
+    MOONCAKE_PROTOCOL: ${MOONCAKE_PROTOCOL:-tcp}
+    MOONCAKE_METADATA_SERVER: P2PHANDSHAKE
+    CONNEX_HEARTBEAT_INTERVAL_S: "0.5"
+    # same failure-detection timing as deploy/k8s: 3 s data-path timeout,
+    # 15 adaptive retries outlast the 2 s router lease (handover ~2-3 s)
+    CONNEXTE_SEND_TIMEOUT_MS: "3000"
+    CONNEXTE_RECV_TIMEOUT_MS: "3000"
+    CONNEXTE_SEND_RETRIES: "3"
+    CONNEXTE_RECV_RETRIES: "15"
+    CONNEX_PP_INFLIGHT: ${CONNEX_PP_INFLIGHT:-1}
+    UCX_TLS: ${UCX_TLS:-tcp,sm,self,cuda_copy}
+    UCX_WARN_UNUSED_ENV_VARS: "n"
+    GPU_MEM_UTIL: ${GPU_MEM_UTIL:-0.6}
+
+services:
+  router:
+    image: ${CONNEX_IMAGE:-connex-vllm:dev}
+    network_mode: host
+    command: ["python3", "-m", "connex.front_router",
+              "--api-address", "tcp://127.0.0.1:${ROUTER_PORT:-15555}",
+              "--event-address", "tcp://127.0.0.1:${ROUTER_EVENT_PORT:-15560}"]
+    environment:
+      CONNEX_HEARTBEAT_TIMEOUT_S: "2"
+      CONNEX_UNHEALTHY_GRACE_S: "10"
+
+  # replica 0: stage 0 (API :8000) and stage 1
+  stage0:
+    <<: *stage
+    environment:
+      <<: *stage_env
+      STAGE: "0"
+      API_PORT: "8000"
+      BASE_PORT: "25500"
+      MOONCAKE_BASE_PORT: "50000"
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${GPU0:-0}"], capabilities: [gpu]}]
+
+  stage1:
+    <<: *stage
+    environment:
+      <<: *stage_env
+      STAGE: "1"
+      API_PORT: "8001"
+      BASE_PORT: "25510"
+      MOONCAKE_BASE_PORT: "50100"
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${GPU1:-1}"], capabilities: [gpu]}]
+
+  # replica 1: stage 0 (API :8010) and stage 1, ports shifted
+  stage0-r1:
+    <<: *stage
+    environment:
+      <<: *stage_env
+      STAGE: "0"
+      REPLICA: "1"
+      API_PORT: "8010"
+      BASE_PORT: "25520"
+      MOONCAKE_BASE_PORT: "50200"
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${GPU2:-2}"], capabilities: [gpu]}]
+
+  stage1-r1:
+    <<: *stage
+    environment:
+      <<: *stage_env
+      STAGE: "1"
+      REPLICA: "1"
+      API_PORT: "8011"
+      BASE_PORT: "25530"
+      MOONCAKE_BASE_PORT: "50300"
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${GPU3:-3}"], capabilities: [gpu]}]
+
+  # --profile proxy: request retry/resume proxy in front of both replicas
+  proxy:
+    image: ${CONNEX_IMAGE:-connex-vllm:dev}
+    profiles: [proxy]
+    network_mode: host
+    depends_on: [stage0]
+    command: ["python3", "-m", "connex.serving.proxy", "--port", "5199",
+              "--endpoints", "http://127.0.0.1:8000,http://127.0.0.1:8010"]

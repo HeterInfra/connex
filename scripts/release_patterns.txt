@@ -1,0 +1,15 @@
+# Forbidden patterns for scripts/check_release.py: NAME<TAB>REGEX, one per line.
+# Keep this list generic. Deployment-specific names (hosts, namespaces,
+# registries, people) belong in an uncommitted .release-patterns.local.
+home directory	/home/[A-Za-z][\w.-]*/
+data/user directory	/data/[a-z][\w-]*/
+NFS path	/nfs[\w-]*/
+local user path (macOS)	/Users/[A-Za-z]
+container registry host	\b[\w-]+\.harbor\.[\w.]+
+academic/internal domain	\b[\w-]+\.(?:ac\.cn|edu\.cn|internal|corp|lan)\b
+e-mail address	\b[A-Za-z0-9._%+-]+@(?!example\.(?:com|org))[A-Za-z0-9.-]+\.[a-z]{2,}\b
+proxy setting	(?i)\b(?:https?|all)_proxy\s*=\s*\S+
+pip/conda private index	--(?:extra-)?index-url\s+https?://(?!pypi\.org|download\.pytorch\.org)
+k8s node pinning to a literal node	kubernetes\.io/hostname["']?\s*:\s*["'][\w-]+["']
+git remote with host	(?:git@|https?://)(?!127\.0\.0\.1|localhost)[\w.-]+:\d+/
+Chinese text (internal notes)	[一-鿿]

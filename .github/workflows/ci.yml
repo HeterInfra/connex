@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  release-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Scan for environment-specific data and secrets
+        run: python scripts/check_release.py
+
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install (CPU torch, no UCX/Mooncake)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[test]"
+      - name: Shell syntax and lint
+        run: |
+          for f in docker/*.sh benchmarks/*.sh benchmarks/k8s/*.sh examples/*.sh; do bash -n "$f"; done
+          shellcheck -S warning docker/*.sh benchmarks/*.sh benchmarks/k8s/*.sh examples/*.sh
+      - name: Unit tests
+        # Tests that need the vLLM fork source (VLLM_FORK_DIR), ucx-py or GPUs skip.
+        run: python -m pytest -q -p no:cacheprovider tests
+      - name: CPU-only end-to-end demo (directory + ZeroMQ, resume proxy)
+        run: examples/cpu_demo.sh
+
+  connex-rs:
+    # Rust data plane: build against the distro UCX (no CUDA/RDMA on runners),
+    # run the Rust tests and the Python backend tests over UCX TCP on loopback.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: UCX and Rust
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libucx-dev ucx-utils
+          rustup toolchain install stable --profile minimal
+      - name: cargo build and test
+        working-directory: native/connex-rs
+        env:
+          UCX_HOME: /usr
+          UCX_TLS: tcp
+        run: |
+          cargo build --release
+          cargo test --release
+      - name: Python wheel and backend tests
+        env:
+          UCX_HOME: /usr
+          UCX_TLS: tcp
+        run: |
+          python -m pip install --upgrade pip maturin
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ".[test]"
+          (cd native/connex-rs && maturin build --release -o dist && pip install dist/connex_rs-*.whl)
+          python -m pytest -q -p no:cacheprovider tests/test_connexrs_backend.py
+
+  deploy-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Compose files
+        run: |
+          docker compose -f docker/docker-compose.yml --profile proxy config -q
+          MODEL_DIR=/tmp docker compose -f docker/docker-compose.yml -f docker/compose.local-model.yml config -q
+      - name: Kubernetes manifests (kubeconform)
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
+          G="python deploy/k8s/manifests.py --namespace demo --image example/connex-vllm:0.1.0"
+          mkdir -p out
+          $G router > out/router.json
+          $G pipeline --num-stages 4 --model-hf-id org/model --hf-token-secret hf > out/pipe.json
+          $G stage --stage 2 --replica 1 --model-pvc models --host-network --ib --protocol rdma > out/s2.json
+          $G proxy --proxy-endpoints http://cte-s0-r0:5100 > out/proxy.json
+          ./kubeconform -strict -summary out/*.json
+      - name: Image build fails fast without a fork URL
+        run: |
+          if docker build -f docker/Dockerfile --build-arg BASE_IMAGE=python:3.11-slim . > build.log 2>&1; then exit 1; fi
+          grep -q "set --build-arg VLLM_FORK_REPO" build.log
