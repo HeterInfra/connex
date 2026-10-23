@@ -3,3 +3,7 @@
 *.egg-info/
 __pycache__/
 .release-patterns.local
+dist/
+*.so
+.pytest_cache/
+.venv/

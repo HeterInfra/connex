@@ -66,7 +66,7 @@ Without `VLLM_FORK_DIR`, ucx-py or GPUs, the affected tests skip.
   extra, private patterns for your own deployment in `.release-patterns.local`
   (ignored by git).
 - New runtime knobs must be documented in the configuration tables of
-  `README.md`, with their default.
+  `docs/configuration.md`, with their default.
 - Engine patches in `integrations/vllm/patches/` must be idempotent, fail
   loudly when their anchor is missing, and come with a test that applies them
   to a copy of the fork source.
@@ -79,3 +79,7 @@ Without `VLLM_FORK_DIR`, ucx-py or GPUs, the affected tests skip.
 Include the Connex commit, the fork commit (`VLLM_FORK_REF`), the backend
 (`connexte`/`connex`), the data plane (`CONNEX_PP_BACKEND`, and the
 connex-rs version if used), the Mooncake/UCX transport, and the stage logs.
+
+Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report security
+problems privately as described in [SECURITY.md](SECURITY.md), not in a
+public issue.
