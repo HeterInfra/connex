@@ -222,6 +222,8 @@ class RegistryClient:
     def __init__(self, url, timeout=120.0):
         self.url = url.rstrip("/")
         self.timeout = timeout
+        # cluster-internal: never go through an HTTP(S)_PROXY from the env
+        self._open = urllib.request.build_opener(urllib.request.ProxyHandler({})).open
 
     def __getattr__(self, name):
         if name not in _METHODS:
@@ -231,8 +233,13 @@ class RegistryClient:
             req = urllib.request.Request(f"{self.url}/{name}", data=json.dumps(kw).encode(),
                                          headers={"Content-Type": "application/json"})
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                with self._open(req, timeout=self.timeout) as r:
                     return json.loads(r.read())["result"]
             except urllib.error.HTTPError as e:
-                raise RuntimeError(json.loads(e.read()).get("error")) from None
+                body = e.read()
+                try:
+                    msg = json.loads(body).get("error")
+                except ValueError:
+                    msg = f"HTTP {e.code}: {body[:200]!r}"
+                raise RuntimeError(msg) from None
         return call

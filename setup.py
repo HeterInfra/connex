@@ -53,10 +53,14 @@ setup(
         "test": ["pytest", "pyflakes", "aiohttp"],
         "dev": ["pytest", "pyflakes", "aiohttp", "ruff"],
     },
-    entry_points={"console_scripts": [
-        "connex-front-router=connex.front_router:main",
-        "connex-directory=connex.directory_server:main",
-    ]},
+    entry_points={
+        "console_scripts": [
+            "connex-front-router=connex.front_router:main",
+            "connex-directory=connex.directory_server:main",
+        ],
+        # registers the "connex" weight-transfer backend (connex.rl) in vLLM
+        "vllm.general_plugins": ["connex_rl=connex.rl.vllm_plugin:register"],
+    },
     classifiers=[
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",

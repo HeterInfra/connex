@@ -100,9 +100,17 @@ class ConnexRsTransport:
     def __init__(self, lid=("connex-rl", 0, 0, 0), listen_ip="0.0.0.0", port=0,
                  advertise_ip=None, timeout_ms=10000):
         import connex_rs  # optional dependency
+        ip = advertise_ip or advertise_ip_()
+        if not os.environ.get("UCX_NET_DEVICES"):
+            # pin UCX to the RDMA device (and IPoIB interface) that carries
+            # ``ip``; otherwise it also tries calico / tailscale interfaces
+            from connex.pp.transports import ucx_net_devices_for_ip
+            nd = ucx_net_devices_for_ip(ip)
+            if nd:
+                os.environ["UCX_NET_DEVICES"] = nd
         model, stage, shard, replica = lid
         self.e = connex_rs.Engine(model, stage, shard, replica, listen_ip=listen_ip,
-                                  port=port, advertise_ip=advertise_ip or advertise_ip_(),
+                                  port=port, advertise_ip=ip,
                                   heartbeat_ms=1000)
         self.url = self.e.local_url
         self.timeout_ms = timeout_ms
