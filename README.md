@@ -1,4 +1,21 @@
-# Connex
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/connex-logo-dark.svg">
+    <img alt="Connex" src="docs/assets/connex-logo.svg" width="320">
+  </picture>
+</p>
+
+<p align="center"><b>Endpoint mobility primitives for dynamic LLM serving</b><br>
+communication endpoints that join, leave, fail and migrate with traffic in flight</p>
+
+<p align="center">
+  <a href="https://github.com/HeterInfra/connex/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/HeterInfra/connex/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <img alt="Python 3.10 | 3.11 | 3.12" src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-3776ab?logo=python&logoColor=white">
+  <a href="https://pypi.org/project/connex-ai/"><img alt="PyPI: connex-ai" src="https://img.shields.io/badge/pypi-connex--ai-3775a9?logo=pypi&logoColor=white"></a>
+  <a href="https://github.com/HeterInfra/connex-rs"><img alt="data plane: connex-rs (Rust over UCX)" src="https://img.shields.io/badge/data%20plane-connex--rs%20(Rust%2FUCX)-0d9488?logo=rust"></a>
+  <a href="#citation"><img alt="SIGCOMM 2026" src="https://img.shields.io/badge/paper-SIGCOMM%202026-8a2be2"></a>
+</p>
 
 Connex is a communication library for distributed AI infrastructure, built
 on **endpoint mobility primitives**: communication endpoints that join,
@@ -22,6 +39,38 @@ Mooncake Transfer Engine, UCX and ZeroMQ remain available.
 
 Connex is the system described in *Connex: Endpoint Mobility Primitives for
 Dynamic LLM Serving* (SIGCOMM 2026, see [Citation](#citation)).
+
+## Highlights
+
+- 🔁 **In-flight handover across replicas.** Kill a pipeline stage
+  mid-generation and its in-flight steps move to the same stage of another
+  replica: all 32 affected requests complete with 0 non-argmax tokens; a
+  larger campaign (72 kill runs, 518,400 tokens) found 0 non-argmax tokens.
+- ⚡ **Sub-second failover with connex-rs.** Peer-death events from the
+  transport bring kill-to-next-token from 2-3 s (Mooncake TE, lease + probe)
+  to 0.01-0.9 s with 4 steps in flight, at the same steady-state latency.
+- 📈 **Elastic by construction.** Replicas join and leave a running
+  deployment; with a replica killed every 60 s goodput stays at 99.2-99.6 %,
+  and 100 % with the resume proxy.
+- 🧩 **Pluggable data plane.** connex-rs, Mooncake Transfer Engine, UCX or
+  ZeroMQ behind a seven-method interface; none of the mobility logic lives in
+  the transport.
+- 🚀 **Runs where you are.** CPU-only demo, one GPU box with docker compose,
+  several RDMA hosts, or Kubernetes; `pip install connex-ai`.
+
+## Contents
+
+- [Why: dynamic serving needs mobile endpoints](#why-dynamic-serving-needs-mobile-endpoints)
+- [Core abstractions](#core-abstractions)
+- [Scenarios and status](#scenarios-and-status)
+- [Library layout](#library-layout)
+- [Architecture: Connex control, pluggable data plane](#architecture-connex-control-pluggable-data-plane)
+- [Integration: multi-replica pipeline-parallel serving with vLLM](#integration-multi-replica-pipeline-parallel-serving-with-vllm)
+- [Results](#results)
+- [Install](#install)
+- [Configuration](#configuration)
+- [Limitations](#limitations)
+- [Contributing](#contributing) · [Citation](#citation) · [License](#license)
 
 ## Why: dynamic serving needs mobile endpoints
 
@@ -84,6 +133,9 @@ a.register(addresses=[new_addr_a])      # replica 0 migrates, same LID
 b.deregister()                          # scale down
 ```
 
+<details>
+<summary>Output</summary>
+
 ```
 $ python examples/mobile_endpoints.py
 replicas:   [('demo', 1, 0, 0), ('demo', 1, 0, 1)]
@@ -93,6 +145,8 @@ rejoin:     [('demo', 1, 0, 0), ('demo', 1, 0, 1)]
 migrate:    b'after-migrate'
 scale-down: [('demo', 1, 0, 0)]
 ```
+
+</details>
 
 `examples/two_stage_pipeline.py` shows directory discovery plus a tensor
 transfer, and `make cpu-demo` the resume proxy surviving a backend kill.
@@ -133,25 +187,15 @@ chains whose stages fail over to each other.
 Connex separates *who talks to whom, and what happens when that changes*
 from *how the bytes move*. Connex owns the first part. The second part is a
 pluggable data plane. On RDMA hosts the default is **connex-rs**
-([HeterInfra/connex-rs](https://github.com/HeterInfra/connex-rs), `pip install "connex-ai[rs]"`), Connex's own data plane in Rust
-over UCX; the [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake)
+([HeterInfra/connex-rs](https://github.com/HeterInfra/connex-rs),
+`pip install "connex-ai[rs]"`), Connex's own data plane in Rust over UCX; the [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake)
 remains supported (`CONNEX_PP_BACKEND=mooncake`) and is the default where no
 RDMA device is present. "ConnexTE" names the combination of Connex control
 with a transfer-engine data plane.
 
-```
-             control plane (Connex)                       data plane (pluggable)
- ┌───────────────────────────────────────────┐   ┌────────────────────────────────┐
- │ front router / directory                  │   │ connex-rs    (default w/ RDMA) │
- │   LIDs, routes, leases, membership events │   │   UCX RDMA, GPUDirect,         │
- │ mobility: ElasticPeerSet, cutover, epochs │   │   peer-failure events (ms)     │
- │ step protocol (connex.pp)                 │   │ Mooncake TE  (RDMA or TCP)     │
- │   signals over ZeroMQ: correlation ids,   │   │ ZeroMQ       (no RDMA needed)  │
- │   retries, reply cache, stale filter,     │   └───────────────▲────────────────┘
- │   K steps in flight, probe + handover,    │                   │ register memory,
- │   engine state hooks (re-prefill)         │───────────────────┘ one-sided read,
- └───────────────────────────────────────────┘     ◀── peer failed / rejoined events
-```
+<p align="center">
+  <img alt="Connex control plane (front router / directory, mobility, step protocol) and the pluggable data plane (connex-rs, Mooncake TE, UCX, ZeroMQ)" src="docs/assets/architecture.svg" width="860">
+</p>
 
 One step from a sender to its peer works like this. The sender copies the
 tensors into a send ring it registered with the data plane (GPU memory when
@@ -164,6 +208,9 @@ timeout or a dead peer means, retrying without executing a step twice,
 dropping late replies, re-sending all in-flight steps to another replica,
 and asking the engine to recompute state the new peer does not hold.
 
+<details>
+<summary>Who owns what</summary>
+
 | Concern | Owner |
 |---|---|
 | Moving tensor bytes: RDMA/TCP transfers, memory registration, GPUDirect | data plane (connex-rs with RDMA, else Mooncake TE) |
@@ -173,6 +220,8 @@ and asking the engine to recompute state the new peer does not hold.
 | Failure handling: failing all in-flight steps over at once; lease + TCP probe for hung or partitioned peers | Connex (`connex.pp`) |
 | What state a peer holds, re-prefill after handover | Connex hooks, implemented by the engine adapter |
 | Request retry/resume across front-end replicas | Connex resume proxy (optional) |
+
+</details>
 
 The data plane is an interface, not a dependency. `connex.pp` uses only
 seven methods of a transfer engine (`register_memory`, `unregister_memory`,
@@ -213,17 +262,13 @@ stage dies, hands its in-flight steps to the same stage of another replica
 (re-prefilling requests whose KV died with it). Stage-0 deaths are covered
 by the resume proxy.
 
-```
-        clients (OpenAI API)
-               |
-       [ optional resume proxy ]
-          /             \
-  stage 0 (replica 0)   stage 0 (replica 1)      <-- register / heartbeat / events -->
-       |    \         /    |                           Connex front-router
-  stage 1 (replica 0)   stage 1 (replica 1)            (routes, leases, health)
-       |    ...  failover across replicas ...
-  stage N-1 ...         stage N-1 ...
-```
+<p align="center">
+  <img alt="Two replica chains; a stage of replica 1 dies, its in-flight steps hand over to replica 0, lost KV is re-prefilled, the restarted stage rejoins" src="docs/assets/handover.svg" width="860">
+</p>
+
+Clients reach stage 0 of either replica directly or through the optional
+resume proxy; every stage registers, heartbeats and receives membership
+events through the Connex front-router (routes, leases, health).
 
 It needs a vLLM fork with an **external pipeline mode**
 (`--pipeline-stage-mode external`, one process per stage); upstream vLLM has
@@ -251,8 +296,17 @@ docker compose -f docker/docker-compose.yml kill stage1-r1   # replica 1's reque
 commands: CPU-only demo, one GPU box (docker compose), several hosts with
 RDMA or TCP, and Kubernetes (`deploy/k8s/manifests.py`).
 
-Results on a 4-stage Llama-3-8B pipeline on A40 nodes with InfiniBand
-(Mooncake TE over RDMA); full tables and reproduction commands are in
+## Results
+
+<p align="center">
+  <img alt="Handover time (kill a stage to next token) and steady-state mean latency, connex-rs vs Mooncake TE" src="docs/assets/results-connexrs-vs-mooncake.svg" width="860">
+</p>
+
+The chart compares the two RDMA data planes on the same deployment
+(numbers from [`docs/results.md`](docs/results.md), section 6; regenerate with
+`python docs/assets/src/results_chart.py`). The results below are on a
+4-stage Llama-3-8B pipeline on A40 nodes with InfiniBand (Mooncake TE over
+RDMA); full tables and reproduction commands are in
 [`docs/results.md`](docs/results.md):
 
 - **Steady state.** K=4 steps in flight keeps 100 % goodput up to QPS 8 with

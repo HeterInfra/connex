@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Documentation**
+- README: logo (light/dark), badges, highlights, table of contents, and SVG
+  figures in `docs/assets/` for the architecture, multi-replica handover and
+  the connex-rs vs Mooncake results (chart generated from `docs/results.md`
+  by `docs/assets/src/results_chart.py`).
+
 **Packaging: PyPI distribution `connex-ai`**
 - The package is published on PyPI as `connex-ai` (`pip install connex-ai`,
   extras `connex-ai[rs,proxy,mooncake,ucx,vllm,sglang,test,dev]`); the import

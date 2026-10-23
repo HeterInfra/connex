@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="360" height="120" viewBox="0 0 360 120" role="img" aria-label="Connex">
+  <title>Connex</title>
+  <g fill="none" stroke-linecap="round">
+    <!-- old link (dashed) and new link (solid): an endpoint that moved -->
+    <path d="M30 60 C 52 22, 82 22, 100 34" stroke="#64748b" stroke-width="4" stroke-dasharray="3 7"/>
+    <path d="M30 60 C 52 98, 82 98, 100 86" stroke="#2563eb" stroke-width="5"/>
+  </g>
+  <circle cx="30" cy="60" r="13" fill="#2563eb"/>
+  <circle cx="106" cy="30" r="11" fill="none" stroke="#64748b" stroke-width="4"/>
+  <circle cx="106" cy="90" r="13" fill="#0d9488"/>
+  <circle cx="66" cy="89" r="5" fill="#ffffff" stroke="#2563eb" stroke-width="3"/>
+  <text x="140" y="78" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="56" font-weight="700" fill="#e6edf3">Connex</text>
+</svg>

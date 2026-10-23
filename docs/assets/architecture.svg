@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="440" viewBox="0 0 880 440" role="img" aria-label="Connex architecture: Connex control plane and pluggable data plane">
+  <title>Connex architecture: control plane and pluggable data plane</title>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2937; }
+    .bg { fill: #ffffff; }
+    .panel { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
+    .box { fill: #ffffff; stroke: #94a3b8; stroke-width: 1.2; }
+    .ctl { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.5; }
+    .def { fill: #ecfdf5; stroke: #0d9488; stroke-width: 2; }
+    .h { font-size: 17px; font-weight: 700; }
+    .t { font-size: 14px; font-weight: 600; }
+    .s { font-size: 12px; fill: #475569; }
+    .tag { font-size: 11px; font-weight: 700; fill: #0d9488; }
+    .arr { stroke: #2563eb; stroke-width: 2; fill: none; }
+    .ev { stroke: #dc2626; stroke-width: 2; fill: none; stroke-dasharray: 6 4; }
+    .ah { fill: #2563eb; } .eh { fill: #dc2626; }
+    .lbl { font-size: 12px; fill: #1e3a8a; } .elbl { font-size: 12px; fill: #b91c1c; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; } .bg { fill: #0d1117; }
+      .panel { fill: #161b22; stroke: #30363d; } .box { fill: #0d1117; stroke: #484f58; }
+      .ctl { fill: #0c2244; stroke: #58a6ff; } .def { fill: #062b26; stroke: #2dd4bf; }
+      .s { fill: #9ca3af; } .tag { fill: #2dd4bf; }
+      .arr { stroke: #58a6ff; } .ah { fill: #58a6ff; } .lbl { fill: #93c5fd; }
+      .ev { stroke: #f87171; } .eh { fill: #f87171; } .elbl { fill: #fca5a5; }
+    }
+  </style>
+  <rect class="bg" width="880" height="440"/>
+
+  <!-- control plane -->
+  <rect class="panel" x="16" y="16" width="440" height="408" rx="12"/>
+  <text class="h" x="36" y="46">Control plane (Connex)</text>
+  <text class="s" x="36" y="64">who talks to whom, and what happens when that changes</text>
+
+  <rect class="ctl" x="36" y="80" width="400" height="76" rx="8"/>
+  <text class="t" x="52" y="104">Front router / directory</text>
+  <text class="s" x="52" y="124">logical endpoint ids (LIDs), routes, leases, health,</text>
+  <text class="s" x="52" y="141">membership events: JOIN, LEAVE, failure, address change</text>
+
+  <rect class="ctl" x="36" y="168" width="400" height="76" rx="8"/>
+  <text class="t" x="52" y="192">Mobility</text>
+  <text class="s" x="52" y="212">ElasticPeerSet, versioned routes (epochs), draining,</text>
+  <text class="s" x="52" y="229">cutover state machine, shadow connections</text>
+
+  <rect class="ctl" x="36" y="256" width="400" height="148" rx="8"/>
+  <text class="t" x="52" y="280">Step protocol (connex.pp)</text>
+  <text class="s" x="52" y="300">signals over ZeroMQ: correlation ids, idempotent retries,</text>
+  <text class="s" x="52" y="317">reply cache, stale-reply filter, K steps in flight</text>
+  <text class="s" x="52" y="341">failure handling: transport event, or lease / timeout</text>
+  <text class="s" x="52" y="358">confirmed by a TCP probe; all in-flight steps fail over</text>
+  <text class="s" x="52" y="382">engine state hooks: what a peer holds, re-prefill</text>
+
+  <!-- data plane -->
+  <rect class="panel" x="584" y="16" width="280" height="408" rx="12"/>
+  <text class="h" x="604" y="46">Data plane (pluggable)</text>
+  <text class="s" x="604" y="64">how the bytes move; CONNEX_PP_BACKEND</text>
+
+  <rect class="def" x="604" y="80" width="240" height="100" rx="8"/>
+  <text class="t" x="620" y="104">connex-rs</text>
+  <text class="tag" x="832" y="104" text-anchor="end">default w/ RDMA</text>
+  <text class="s" x="620" y="124">Rust over UCX, GPUDirect RMA</text>
+  <text class="s" x="620" y="141">peer-failure events in ms</text>
+  <text class="s" x="620" y="158">identity-keyed peers, rejoin</text>
+
+  <rect class="box" x="604" y="192" width="240" height="62" rx="8"/>
+  <text class="t" x="620" y="216">Mooncake Transfer Engine</text>
+  <text class="s" x="620" y="236">RDMA or TCP; default without RDMA</text>
+
+  <rect class="box" x="604" y="266" width="240" height="62" rx="8"/>
+  <text class="t" x="620" y="290">UCX (ucx-py)</text>
+  <text class="s" x="620" y="310">connex.ucx_transport</text>
+
+  <rect class="box" x="604" y="340" width="240" height="62" rx="8"/>
+  <text class="t" x="620" y="364">ZeroMQ</text>
+  <text class="s" x="620" y="384">no RDMA needed; fallback</text>
+
+  <!-- arrows -->
+  <path class="arr" d="M436 296 H 576"/>
+  <polygon class="ah" points="584,296 572,290 572,302"/>
+  <text class="lbl" x="448" y="270">register memory,</text>
+  <text class="lbl" x="448" y="286">one-sided read</text>
+
+  <path class="ev" d="M604 136 H 560 V 372 H 446"/>
+  <polygon class="eh" points="438,372 450,366 450,378"/>
+  <text class="elbl" x="448" y="336">peer failed /</text>
+  <text class="elbl" x="448" y="352">rejoined</text>
+</svg>

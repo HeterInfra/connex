@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="420" viewBox="0 0 880 420" role="img" aria-label="Multi-replica in-flight handover">
+  <title>In-flight handover across pipeline replicas</title>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2937; }
+    .bg { fill: #ffffff; }
+    .st { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.5; }
+    .dead { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .back { fill: #ecfdf5; stroke: #0d9488; stroke-width: 1.5; stroke-dasharray: 5 4; }
+    .t { font-size: 14px; font-weight: 600; } .s { font-size: 12px; fill: #475569; }
+    .rl { font-size: 13px; font-weight: 700; fill: #475569; }
+    .ln { stroke: #64748b; stroke-width: 2; fill: none; } .lh { fill: #64748b; }
+    .ho { stroke: #ea580c; stroke-width: 2.5; fill: none; } .hh { fill: #ea580c; }
+    .rj { stroke: #0d9488; stroke-width: 2; fill: none; stroke-dasharray: 5 4; } .rh { fill: #0d9488; }
+    .x { stroke: #dc2626; stroke-width: 4; stroke-linecap: round; }
+    .n { fill: #ea580c; } .nt { font-size: 12px; font-weight: 700; fill: #ffffff; }
+    .cap { font-size: 12.5px; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; } .bg { fill: #0d1117; }
+      .st { fill: #0c2244; stroke: #58a6ff; } .dead { fill: #2d1214; stroke: #f87171; }
+      .back { fill: #062b26; stroke: #2dd4bf; } .s, .rl { fill: #9ca3af; }
+      .ln { stroke: #8b949e; } .lh { fill: #8b949e; } .x { stroke: #f87171; }
+      .rj { stroke: #2dd4bf; } .rh { fill: #2dd4bf; } .nt { fill: #ffffff; }
+    }
+  </style>
+  <rect class="bg" width="880" height="420"/>
+  <text class="rl" x="24" y="123">replica 0</text>
+  <rect class="st" x="150" y="90" width="130" height="56" rx="8"/>
+  <text class="t" x="215.0" y="115" text-anchor="middle">stage 0</text>
+  <text class="s" x="215.0" y="133" text-anchor="middle">LID (m, 0, 0, 0)</text>
+  <path class="ln" d="M280 118.0 H 322"/><polygon class="lh" points="330,118.0 320,113.0 320,123.0"/>
+  <rect class="st" x="330" y="90" width="130" height="56" rx="8"/>
+  <text class="t" x="395.0" y="115" text-anchor="middle">stage 1</text>
+  <text class="s" x="395.0" y="133" text-anchor="middle">LID (m, 1, 0, 0)</text>
+  <path class="ln" d="M460 118.0 H 502"/><polygon class="lh" points="510,118.0 500,113.0 500,123.0"/>
+  <rect class="st" x="510" y="90" width="130" height="56" rx="8"/>
+  <text class="t" x="575.0" y="115" text-anchor="middle">stage 2</text>
+  <text class="s" x="575.0" y="133" text-anchor="middle">LID (m, 2, 0, 0)</text>
+  <path class="ln" d="M640 118.0 H 682"/><polygon class="lh" points="690,118.0 680,113.0 680,123.0"/>
+  <rect class="st" x="690" y="90" width="130" height="56" rx="8"/>
+  <text class="t" x="755.0" y="115" text-anchor="middle">stage 3</text>
+  <text class="s" x="755.0" y="133" text-anchor="middle">LID (m, 3, 0, 0)</text>
+  <text class="rl" x="24" y="283">replica 1</text>
+  <rect class="st" x="150" y="250" width="130" height="56" rx="8"/>
+  <text class="t" x="215.0" y="275" text-anchor="middle">stage 0</text>
+  <text class="s" x="215.0" y="293" text-anchor="middle">LID (m, 0, 0, 1)</text>
+  <path class="ln" d="M280 278.0 H 322"/><polygon class="lh" points="330,278.0 320,273.0 320,283.0"/>
+  <rect class="st" x="330" y="250" width="130" height="56" rx="8"/>
+  <text class="t" x="395.0" y="275" text-anchor="middle">stage 1</text>
+  <text class="s" x="395.0" y="293" text-anchor="middle">LID (m, 1, 0, 1)</text>
+  <rect class="dead" x="510" y="250" width="130" height="56" rx="8"/>
+  <text class="t" x="575.0" y="275" text-anchor="middle">stage 2</text>
+  <text class="s" x="575.0" y="293" text-anchor="middle">LID (m, 2, 0, 1)</text>
+  <path class="ln" d="M640 278.0 H 682"/><polygon class="lh" points="690,278.0 680,273.0 680,283.0"/>
+  <rect class="st" x="690" y="250" width="130" height="56" rx="8"/>
+  <text class="t" x="755.0" y="275" text-anchor="middle">stage 3</text>
+  <text class="s" x="755.0" y="293" text-anchor="middle">LID (m, 3, 0, 1)</text>
+  <path class="x" d="M618 256 L634 272 M634 256 L618 272"/>
+  <path class="ho" d="M460 268 C 500 268, 530 216, 530 155"/><polygon class="hh" points="530,147 524,158 536,158"/>
+  <rect class="back" x="510" y="350" width="130" height="44" rx="8"/>
+  <text class="t" x="575.0" y="377" text-anchor="middle">stage 2 restarted</text>
+  <path class="rj" d="M575.0 350 V 314"/><polygon class="rh" points="575.0,307 570.0,317 580.0,317"/>
+  <circle class="n" cx="642" cy="196" r="10"/><text class="nt" x="642" y="200" text-anchor="middle">1</text>
+  <circle class="n" cx="160" cy="346" r="10"/><text class="nt" x="160" y="350" text-anchor="middle">2</text>
+  <circle class="n" cx="658" cy="372" r="10"/><text class="nt" x="658" y="376" text-anchor="middle">3</text>
+  <text class="s" x="178" y="350">KV lost with stage 2: stage 0</text>
+  <text class="s" x="178" y="366">re-prefills those requests</text>
+  <text class="s" x="674" y="368">same LID: rejoins, carries</text>
+  <text class="s" x="674" y="384">traffic again (connex-rs)</text>
+  <text class="s" x="658" y="200">in-flight steps hand over to</text>
+  <text class="s" x="658" y="216">replica 0 (peer-death event)</text>
+  <text class="cap" x="24" y="40">A stage of replica 1 dies with steps in flight: its peers learn it from the transport,</text>
+  <text class="cap" x="24" y="58">fail every affected step over to the same stage of replica 0, and recompute lost state.</text>
+</svg>
