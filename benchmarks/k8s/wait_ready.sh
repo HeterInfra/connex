@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Block until every stage of pipeline PREFIX is serving: stage 0's readiness
 # probe passes and stages >0 have entered the external-PP loop.
 # usage: wait_ready.sh PREFIX [TIMEOUT_S] [EXTRA_LABEL_SELECTOR e.g. replica=1]

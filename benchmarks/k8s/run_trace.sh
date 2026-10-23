@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Run one trace replay against a deployed pipeline and record run metadata.
 # usage: [PROXY=local|URL] run_trace.sh PREFIX TRACE_CSV OUT_DIR [ENDPOINTS]
 # env:   CONNEX_API_URL     default endpoint list (comma-separated stage-0 URLs)

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Churn matrix: configuration variants x QPS list, clean restart
 # (router + both replicas) before every run. Deploys with deploy/k8s/manifests.py.
 # usage: churn_matrix.sh MODE OUT_DIR [VARIANTS] [QPS_LIST]

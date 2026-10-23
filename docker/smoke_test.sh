@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Wait for the stage-0 API and send one greedy completion.
 # usage: smoke_test.sh [API_URL] [MODEL_NAME]
 # env:   TIMEOUT_S (default 900)

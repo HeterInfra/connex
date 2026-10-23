@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Trace replay under churn against a 2-replica pipeline deployed with
 # deploy/k8s/manifests.py.
 # usage: [PROXY=local|URL] run_churn.sh PREFIX MODE TRACE REPEAT DURATION OUT_DIR

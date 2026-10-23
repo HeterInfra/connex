@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Entrypoint for one external-PP vLLM stage on Connex (docker/Dockerfile image).
 #
 # Required env:

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # CPU-only end-to-end demo, no GPU, RDMA or vLLM needed:
 #   1. two pipeline stages find each other through the Connex directory and
 #      exchange a tensor (ZeroMQ, or UCX over TCP if ucx-py is installed);

@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # Compare baseline vs optimized Connex under scale-out / graceful leave / kill.
 # usage: benchmarks/run_elastic_matrix.sh OUTDIR [RUNS]
 set -u
