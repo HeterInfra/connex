@@ -170,6 +170,8 @@ chains whose stages fail over to each other.
 | Heterogeneous transports and hardware | connex-rs and Mooncake (RDMA/TCP, GPUDirect or host buffers), UCX, ZeroMQ, capability negotiation | Transports **validated** (RDMA and TCP, GPUDirect and host staging); mixed GPU types in one deployment **not validated** |
 | Prefill-decode (PD) disaggregation, prefill and decode pools | role-aware endpoint ids (`PDRole`), role lookup in `VersionedRouteTable`, KV block transfer manager (`connex.mooncake_integration`) | **Primitives available** (unit-tested in `tests/test_pd_primitives.py`); **engine integration on the roadmap** |
 | Attention-FFN disaggregation | the generic primitives only | **Roadmap**: no attention/FFN-specific code yet |
+| RL post-training: elastic weight sync | `connex.rl`: versioned weight publish/pull over connex-rs with tree fan-out and source failover, weight registry, `RolloutPool` (no request on mixed versions), vLLM weight-transfer backend `connex`, SGLang custom-loader hook ([`docs/rl.md`](docs/rl.md)) | **Implemented and validated** on GPUs with vLLM (0.32.0 and `main`) and SGLang (0.5.9 and 0.5.22): Qwen2.5-0.5B GRPO loop with an engine killed and one joining; cross-node sync measured with synthetic weights; TP > 1 not tested |
+| Agent session migration | `connex.agents`: session logical ids, sticky routing, `migrate` / `drain` with pluggable KV movers (re-prefill built in), in-flight cut-over through the resume proxy, failover ([`docs/agent-migration.md`](docs/agent-migration.md)) | **Implemented and validated** on vLLM `main` and SGLang 0.5.22 (8k and 30k-token contexts, in-flight generations cut over, greedy output identical); moving the KV itself is a plug-in point with no mover yet, migration re-prefills |
 
 ## Library layout
 
@@ -181,6 +183,8 @@ chains whose stages fail over to each other.
 | step protocol | `connex.pp` | `PipelineEndpoint`, correlation ids, K in flight, idempotent retries, sticky failover, handover, the `EngineHooks` protocol, wire format |
 | engine adapters | `connex.adapters.vllm`, `connex.adapters.sglang` | vLLM communicator for the fork's external pipeline mode (plus patches in `integrations/vllm/patches`); SGLang `pp_group` replacement (prototype) |
 | serving | `connex.serving.proxy` | optional request retry/resume proxy |
+| RL | `connex.rl` | versioned weight sync (publisher, subscriber, registry), rollout pool, vLLM backend and SGLang hook |
+| agents | `connex.agents` | session logical ids, session-aware proxy, migration and drain |
 
 ## Architecture: Connex control, pluggable data plane
 

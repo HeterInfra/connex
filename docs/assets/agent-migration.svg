@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="380" viewBox="0 0 880 380" role="img" aria-label="Live agent session migration">
+  <title>Live agent session migration with connex.agents</title>
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #1f2937; }
+    .bg { fill: #ffffff; }
+    .st { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.5; }
+    .px { fill: #fff7ed; stroke: #ea580c; stroke-width: 1.5; }
+    .cl { fill: #f8fafc; stroke: #64748b; stroke-width: 1.5; }
+    .t { font-size: 14px; font-weight: 600; } .s { font-size: 12px; fill: #475569; }
+    .ln { stroke: #64748b; stroke-width: 2; fill: none; } .lh { fill: #64748b; }
+    .old { stroke: #64748b; stroke-width: 2; fill: none; stroke-dasharray: 5 4; }
+    .wm { stroke: #0d9488; stroke-width: 2; fill: none; stroke-dasharray: 5 4; } .wh { fill: #0d9488; }
+    .co { stroke: #ea580c; stroke-width: 2.5; fill: none; } .ch { fill: #ea580c; }
+    .n { fill: #ea580c; } .nt { font-size: 12px; font-weight: 700; fill: #ffffff; }
+    .cap { font-size: 12.5px; }
+    @media (prefers-color-scheme: dark) {
+      text { fill: #e6edf3; } .bg { fill: #0d1117; }
+      .st { fill: #0c2244; stroke: #58a6ff; } .px { fill: #2b1606; stroke: #fb923c; }
+      .cl { fill: #161b22; stroke: #8b949e; } .s { fill: #9ca3af; }
+      .ln, .old { stroke: #8b949e; } .lh { fill: #8b949e; } .wm { stroke: #2dd4bf; } .wh { fill: #2dd4bf; }
+      .nt { fill: #ffffff; }
+    }
+  </style>
+  <rect class="bg" width="880" height="380"/>
+  <rect class="cl" x="30" y="140" width="140" height="60" rx="8"/>
+  <text class="t" x="100" y="166" text-anchor="middle">agent client</text>
+  <text class="s" x="100" y="184" text-anchor="middle">one stream, same id</text>
+  <path class="ln" d="M170 170 H 252"/><polygon class="lh" points="260,170 250,165 250,175"/>
+  <rect class="px" x="260" y="120" width="210" height="100" rx="8"/>
+  <text class="t" x="365" y="146" text-anchor="middle">session proxy</text>
+  <text class="s" x="365" y="166" text-anchor="middle">session/s1 -> placement</text>
+  <text class="s" x="365" y="182" text-anchor="middle">epoch 3 -> 4</text>
+  <text class="s" x="365" y="198" text-anchor="middle">in-flight requests, last context</text>
+  <rect class="st" x="640" y="50" width="200" height="70" rx="8"/>
+  <text class="t" x="740" y="78" text-anchor="middle">instance A (source)</text>
+  <text class="s" x="740" y="96" text-anchor="middle">prefix KV of s1</text>
+  <rect class="st" x="640" y="220" width="200" height="70" rx="8"/>
+  <text class="t" x="740" y="248" text-anchor="middle">instance B (target)</text>
+  <text class="s" x="740" y="266" text-anchor="middle">prefix KV of s1 after step 1</text>
+  <path class="old" d="M470 150 C 560 150 580 90 632 87"/><polygon class="lh" points="640,86 630,82 630,92"/>
+  <path class="wm" d="M470 196 C 540 210 590 236 632 240"/><polygon class="wh" points="640,241 630,236 630,246"/>
+  <path class="co" d="M470 210 C 540 250 590 270 632 268"/><polygon class="ch" points="640,267 630,262 630,272"/>
+  <circle class="n" cx="545" cy="214" r="10"/><text class="nt" x="545" y="218" text-anchor="middle">1</text>
+  <circle class="n" cx="365" cy="235" r="10"/><text class="nt" x="365" y="239" text-anchor="middle">2</text>
+  <circle class="n" cx="590" cy="276" r="10"/><text class="nt" x="590" y="280" text-anchor="middle">3</text>
+  <text class="cap" x="30" y="318">1 prepare the target: KV mover, or re-prefill of the context into its prefix cache, while A keeps generating</text>
+  <text class="cap" x="30" y="336">2 bump the epoch and repoint the session; new turns go to B</text>
+  <text class="cap" x="30" y="354">3 cut in-flight generations over: abort on A, resume on B with prompt + tokens so far</text>
+</svg>
