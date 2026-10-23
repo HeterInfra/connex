@@ -23,7 +23,8 @@ stage within milliseconds and lets a single restarted stage rejoin.
 ## Build the image (tiers 1-3)
 
 The vLLM integration needs the external-PP vLLM fork (see the README,
-"vLLM fork requirement").
+[Integration](../README.md#integration-multi-replica-pipeline-parallel-serving-with-vllm)
+and [Limitations](../README.md#limitations)).
 
 ```bash
 make image IMAGE=<registry>/connex-vllm:0.1.0 VLLM_FORK_REPO=<git URL of the fork> \

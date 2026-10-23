@@ -13,7 +13,7 @@ communication endpoints that join, leave, fail and migrate with traffic in fligh
   <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
   <img alt="Python 3.10 | 3.11 | 3.12" src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-3776ab?logo=python&logoColor=white">
   <a href="https://pypi.org/project/connex-ai/"><img alt="PyPI: connex-ai" src="https://img.shields.io/badge/pypi-connex--ai-3775a9?logo=pypi&logoColor=white"></a>
-  <a href="https://github.com/HeterInfra/connex-rs"><img alt="data plane: connex-rs (Rust over UCX)" src="https://img.shields.io/badge/data%20plane-connex--rs%20(Rust%2FUCX)-0d9488?logo=rust"></a>
+  <a href="https://github.com/HeterInfra/connex-rs"><img alt="data plane: connex-rs (Rust over UCX)" src="https://img.shields.io/badge/data%20plane-connex--rs%20%28Rust%2FUCX%29-0d9488?logo=rust"></a>
   <a href="#citation"><img alt="SIGCOMM 2026" src="https://img.shields.io/badge/paper-SIGCOMM%202026-8a2be2"></a>
 </p>
 
@@ -48,7 +48,7 @@ Dynamic LLM Serving* (SIGCOMM 2026, see [Citation](#citation)).
   larger campaign (72 kill runs, 518,400 tokens) found 0 non-argmax tokens.
 - ⚡ **Sub-second failover with connex-rs.** Peer-death events from the
   transport bring kill-to-next-token from 2-3 s (Mooncake TE, lease + probe)
-  to 0.01-0.9 s with 4 steps in flight, at the same steady-state latency.
+  to 0.01-0.83 s with 4 steps in flight, at the same steady-state latency.
 - 📈 **Elastic by construction.** Replicas join and leave a running
   deployment; with a replica killed every 60 s goodput stays at 99.2-99.6 %,
   and 100 % with the resume proxy.
@@ -277,6 +277,13 @@ build (`docker/Dockerfile`) installs the fork, copies the communicators and
 applies the engine patches (K steps in flight, re-prefill, downstream CUDA
 graphs and external-PP fixes); see
 [`integrations/vllm/README.md`](integrations/vllm/README.md).
+
+> **About `VLLM_FORK_REPO`.** The external-PP vLLM fork is not part of this
+> repository and is not yet published, so the image build has no default for
+> it: `VLLM_FORK_REPO` is a placeholder for the git URL of a copy of that
+> fork you can access (the integration is validated at fork commit
+> `380186d57`, the default `VLLM_FORK_REF`). The library, the CPU-only demo
+> and the test suite need neither the fork nor a GPU.
 
 Quick start on one host with GPUs (two replicas of a 2-stage Llama-3-8B
 pipeline; four GPUs, or two GPUs of 40 GB or more with `GPU2=0 GPU3=1

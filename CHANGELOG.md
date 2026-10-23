@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.1.0
+
+First public release of Connex, a communication library for distributed AI
+infrastructure built on endpoint mobility primitives: logical endpoint ids,
+leased membership, versioned routes and a step-level delivery contract that
+let endpoints join, leave, fail over and migrate with traffic in flight,
+so that in a deployment of many replicas (pipeline chains, prefill/decode
+pools, attention/FFN workers) in-flight requests hand over across replicas on
+failure or scale-down and new replicas take traffic as they join.
+Multi-replica pipeline parallelism (vLLM) is the first fully integrated and
+GPU-validated scenario; prefill-decode primitives are included, and engine integration for
+PD and attention-FFN disaggregation is on the roadmap (see the README's
+scope table and `docs/design/overview.md`).
 
 **Documentation**
 - README: logo (light/dark), badges, highlights, table of contents, and SVG
@@ -9,7 +21,7 @@
   by `docs/assets/src/results_chart.py`).
 
 **Packaging: PyPI distribution `connex-ai`**
-- The package is published on PyPI as `connex-ai` (`pip install connex-ai`,
+- The package is distributed on PyPI as `connex-ai` (`pip install connex-ai`,
   extras `connex-ai[rs,proxy,mooncake,ucx,vllm,sglang,test,dev]`); the import
   name stays `connex`. Source checkouts install as before
   (`pip install -e ".[test]"`).
@@ -42,7 +54,7 @@
   fails the chain over at once; the router lease and the TCP probe remain
   for hung or partitioned peers (transport heartbeat 1 s / 3 s only raises a
   suspicion). Kill-to-resume after a stage dies drops from 2-3 s to
-  0.01-0.9 s with K=4 (see `docs/results.md`); steady-state latency and
+  0.01-0.83 s with K=4 (see `docs/results.md`); steady-state latency and
   throughput match Mooncake.
 - Single-stage same-identity rejoin works (with Mooncake a re-added stage
   could break its peers).
@@ -50,21 +62,6 @@
   connex-rs wheel (`BUILD_CONNEX_RS`, `UCX_VERSION`, `RUST_TOOLCHAIN`);
   `pip install "connex-ai[rs]"`; CI builds the wheel and tests the Python
   backend over UCX/TCP.
-
-## 0.1.0
-
-First public release of Connex, a communication library for distributed AI
-infrastructure built on endpoint mobility primitives: logical endpoint ids,
-leased membership, versioned routes and a step-level delivery contract that
-let endpoints join, leave, fail over and migrate with traffic in flight,
-so that in a deployment of many replicas (pipeline chains, prefill/decode
-pools, attention/FFN workers) in-flight requests hand over across replicas on
-failure or scale-down and new replicas take traffic as they join.
-Multi-replica pipeline parallelism (vLLM) is the first fully integrated and
-GPU-validated scenario; prefill-decode primitives are included, and engine integration for
-PD and attention-FFN disaggregation is on the roadmap (see the README's
-scope table and `docs/design/overview.md`).
-
 
 **Single-box deployment**
 - `docker/docker-compose.yml` runs two replicas of a 2-stage pipeline by
