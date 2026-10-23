@@ -43,7 +43,7 @@ SECRET_PATTERNS = [
     ("AWS access key", r"\bAKIA[0-9A-Z]{16}\b"),
     ("GitHub token", r"\bgh[pousr]_[A-Za-z0-9]{30,}\b"),
     ("Slack token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
-    ("OpenAI/Anthropic-style key", r"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}"),
+    ("sk- style API key", r"\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}"),
     ("HF token", r"\bhf_[A-Za-z0-9]{30,}\b"),
     ("Notion token", r"\b(?:secret_|ntn_)[A-Za-z0-9]{30,}\b"),
     ("password/token assignment",

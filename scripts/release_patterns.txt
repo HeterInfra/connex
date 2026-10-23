@@ -4,6 +4,7 @@
 home directory	/home/[A-Za-z][\w.-]*/
 data/user directory	/data/[a-z][\w-]*/
 NFS path	/nfs[\w-]*/
+agent scratch path	/tmp/[\w.-]+/-home-
 local user path (macOS)	/Users/[A-Za-z]
 container registry host	\b[\w-]+\.harbor\.[\w.]+
 academic/internal domain	\b[\w-]+\.(?:ac\.cn|edu\.cn|internal|corp|lan)\b

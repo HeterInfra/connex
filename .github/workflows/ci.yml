@@ -45,6 +45,10 @@ jobs:
         run: python -m pytest -q -p no:cacheprovider tests
       - name: CPU-only end-to-end demo (directory + ZeroMQ, resume proxy)
         run: examples/cpu_demo.sh
+      - name: Distribution builds as connex-ai
+        run: |
+          python -m pip wheel --no-deps --no-build-isolation . -w dist
+          ls dist/connex_ai-*.whl
 
   connex-rs:
     # Rust data plane: build against the distro UCX (no CUDA/RDMA on runners),

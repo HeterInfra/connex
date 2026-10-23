@@ -9,7 +9,7 @@ over UCX on localhost (TCP), no GPU, no cluster, no fakes on the data path.
 * same-identity rejoin: a restarted stage under the same id and URL is read
   from again without anything else restarting.
 
-Skipped when connex_rs is not installed (pip install connex[rs]).
+Skipped when connex_rs is not installed (pip install "connex-ai[rs]").
 """
 
 import os

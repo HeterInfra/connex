@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+**Packaging: PyPI distribution `connex-ai`**
+- The package is published on PyPI as `connex-ai` (`pip install connex-ai`,
+  extras `connex-ai[rs,proxy,mooncake,ucx,vllm,sglang,test,dev]`); the import
+  name stays `connex`. Source checkouts install as before
+  (`pip install -e ".[test]"`).
+
 **connex-rs: Connex's own data plane, default on RDMA hosts**
 - `native/connex-rs`: a Rust data plane over UCX with a Python binding
   (`connex_rs.Engine`). One-sided RMA (get/put) on registered host or GPU

@@ -23,7 +23,7 @@ optional aiohttp proxy for `/v1/completions` and `/v1/chat/completions`
   other requests.
 
 ```bash
-pip install -e ".[proxy]"
+pip install "connex-ai[proxy]"     # or, from a checkout: pip install -e ".[proxy]"
 python -m connex.serving.proxy --port 5199 \
     --endpoints http://stage0-a:5100,http://stage0-b:5101
 # or let it re-read the endpoint list:   --endpoints-file endpoints.txt

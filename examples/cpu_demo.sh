@@ -5,7 +5,7 @@
 #   2. the request retry/resume proxy in front of two deterministic fake
 #      OpenAI backends: one backend is killed mid-stream, the client still
 #      receives the full, correct completion.
-# usage: examples/cpu_demo.sh        (needs: pip install -e ".[proxy]")
+# usage: examples/cpu_demo.sh        (needs: pip install -e ".[proxy]", or pip install "connex-ai[proxy]")
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH=$PWD${PYTHONPATH:+:$PYTHONPATH}

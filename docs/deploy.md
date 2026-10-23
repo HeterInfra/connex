@@ -57,7 +57,7 @@ restarted and tries again.
 ## Tier 0: CPU-only demo
 
 ```bash
-pip install -e ".[proxy]"
+pip install -e ".[proxy]"   # from a checkout (the demo scripts live in the repository)
 make cpu-demo             # = examples/cpu_demo.sh
 ```
 

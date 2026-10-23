@@ -40,7 +40,7 @@ except ImportError:  # optional dependency
 
 
 def connexrs_module():
-    """connex_rs (optional, pip install connex[rs]) or None. Imported only
+    """connex_rs (optional, pip install "connex-ai[rs]") or None. Imported only
     when the backend is used: it loads the system UCX into the process."""
     try:
         import connex_rs  # type: ignore
@@ -181,7 +181,7 @@ def create_connexrs_engine(stage_idx: int, replica_idx: int, model: str,
     if engine_cls is None:
         mod = connexrs_module()
         if mod is None:
-            log.warning("Stage %s: connex_rs not installed (pip install connex[rs])", stage_idx)
+            log.warning("Stage %s: connex_rs not installed (pip install 'connex-ai[rs]')", stage_idx)
             return None, None
         engine_cls = mod.Engine
     # Restarted stages listen on the same port at once.

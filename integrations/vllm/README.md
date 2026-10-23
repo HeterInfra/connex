@@ -21,7 +21,8 @@ worker/scheduler), which change between vLLM releases.
 The easiest way is the image in `docker/Dockerfile`, which does all of this
 at build time. By hand:
 
-1. `pip install -e /path/to/connex` (the communicators import `connex.*`;
+1. `pip install connex-ai` (or `pip install -e /path/to/connex` from a
+   checkout; the communicators import `connex.*`;
    remove any vendored `vllm/connex` package from the fork so the standalone
    package is used).
 2. Copy `connex_communicator.py` and `connexte_communicator.py` into

@@ -269,18 +269,25 @@ Results on a 4-stage Llama-3-8B pipeline on A40 nodes with InfiniBand
 
 ## Install
 
-Python 3.10 or newer.
+Python 3.10 or newer. The distribution on PyPI is **`connex-ai`**; the
+import name is `connex`.
 
 ```bash
-pip install -e .                    # core: torch, pyzmq, msgpack, numpy, safetensors
-pip install -e ".[proxy]"           # + aiohttp, for connex.serving.proxy
-pip install -e ".[rs]"              # + connex-rs data plane (prebuilt wheel, see native/connex-rs)
-pip install -e ".[mooncake]"        # + Mooncake Transfer Engine
-pip install -e ".[ucx]"             # + ucx-py (CUDA 12 build)
-pip install -e ".[test]"            # + pytest, pyflakes, aiohttp
-pip install -e ".[vllm]"            # vLLM (the adapter needs the fork, see above)
-pip install -e ".[sglang]"          # SGLang (adapter prototype)
-python -m pytest -q tests           # CPU only
+pip install connex-ai                # core: torch, pyzmq, msgpack, numpy, safetensors
+pip install "connex-ai[proxy]"       # + aiohttp, for connex.serving.proxy
+pip install "connex-ai[rs]"          # + connex-rs data plane (connex-rs>=0.1,<0.2)
+pip install "connex-ai[mooncake]"    # + Mooncake Transfer Engine
+pip install "connex-ai[ucx]"         # + ucx-py (CUDA 12 build)
+pip install "connex-ai[vllm]"        # vLLM (the adapter needs the fork, see above)
+pip install "connex-ai[sglang]"      # SGLang (adapter prototype)
+pip install "connex-ai[rs,proxy,mooncake]"   # extras combine
+```
+
+From a checkout (development, tests, examples, deployment files):
+
+```bash
+pip install -e ".[test]"             # + pytest, pyflakes, aiohttp
+python -m pytest -q tests            # CPU only
 ```
 
 Optional dependencies degrade gracefully: without `ucx-py`, `UCXTransport`
