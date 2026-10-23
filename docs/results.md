@@ -235,6 +235,7 @@ everything else from two. Mooncake's handover figures come from section 2.
 | closed loop, 128 clients, tok/s | 2530 | 2608 |
 | kill -> first resumed token (median per run), K=4, stage 1 / 2 / 3 | 0.01-0.02 / 0.03-0.04 / 0.03-0.83 s | 2-3 s |
 | same, K=1 | 0.02-0.03 s for every stage | 2-3 s |
+| slowest single request across those runs, K=1 / K=4 | 1.03 s / 0.92 s | |
 | failover correctness, N=32, stages 1-3, K=1 and K=4 (18 runs) | all complete, 0 non-argmax tokens | all complete, 0 non-argmax tokens |
 | false failovers, 10 min at QPS 8 | 0 | |
 | single stage killed and restarted under the same identity | both replicas serve, rejoined stage carries traffic | restart the whole chain |

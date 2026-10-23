@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """
 Prometheus metrics for pipeline parallelism communication backends.
 
