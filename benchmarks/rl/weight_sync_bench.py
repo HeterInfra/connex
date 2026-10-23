@@ -83,7 +83,7 @@ def connex_receiver(a, reg_url, idx, dev, q_ready, q_res, rounds):
     last = 0
     for r in range(rounds):
         q_ready.put(idx)
-        lt = reg.get_latest(wait_newer_than=last, timeout=600)
+        reg.get_latest(wait_newer_than=last, timeout=600)
         st = sub.sync(lambda it: None)
         last = st["version"]
         q_res.put({"idx": idx, "round": r, "t_end": time.time(), **st})
@@ -97,7 +97,6 @@ def run_connex(a, gpus):
     q_t, q_ready, q_res = ctx.Queue(), ctx.Queue(), ctx.Queue()
     rx = [ctx.Process(target=connex_receiver, args=(a, url, i, g, q_ready, q_res, a.rounds))
           for i, g in enumerate(gpus[1:])]
-    tr = ctx.Process(target=connex_trainer, args=(a, url, q_t, a.rounds))
     a.trainer_dev = gpus[0]
     tr = ctx.Process(target=connex_trainer, args=(a, url, q_t, a.rounds))
     tr.start()
@@ -190,9 +189,172 @@ def run_nccl(a, gpus):
     return results
 
 
+# -- distributed (one process per pod/host; rank 0 = trainer) ---------------
+def run_dist(a):
+    """Both modes on the same processes: NCCL rounds, then Connex rounds.
+    Timing is taken on the trainer: round start to the barrier after every
+    receiver has the full model (the barrier adds well under a ms)."""
+    import torch.distributed as dist
+    from connex.rl import (RegistryClient, RegistryServer, WeightPublisher, WeightRegistry,
+                           WeightSubscriber, make_transport)
+    rank, world = a.rank, a.world
+    torch.cuda.set_device(0)
+    torch.zeros(1, device="cuda")
+    dist.init_process_group("nccl", init_method=f"tcp://{a.master}:{a.port}", rank=rank,
+                            world_size=world, device_id=torch.device("cuda", 0))
+    named = tensors(a.size, a.tensor_mb, "cuda") if rank == 0 else None
+    total = sum(t.numel() * 2 for _, t in tensors(a.size, a.tensor_mb, "meta"))
+    chunk = a.chunk_mb << 20
+    out = []
+    # NCCL broadcast of the packed arena
+    arena = torch.empty(total, dtype=torch.uint8, device="cuda")
+    for r in range(a.rounds):
+        dist.barrier()
+        torch.cuda.synchronize()
+        t0 = time.time()
+        if rank == 0:
+            off = 0
+            for _, t in named:
+                n = t.numel() * 2
+                arena[off:off + n].copy_(t.view(-1).view(torch.uint8))
+                off += n
+        for off in range(0, total, chunk):
+            dist.broadcast(arena[off:off + chunk], src=0)
+        torch.cuda.synchronize()
+        dist.barrier()
+        if rank == 0:
+            out.append({"mode": "nccl", "size": a.size, "receivers": world - 1, "round": r,
+                        "total_s": time.time() - t0})
+            print(json.dumps(out[-1]), flush=True)
+    del arena
+    torch.cuda.empty_cache()
+    # Connex: registry in the trainer process
+    if rank == 0:
+        srv = RegistryServer(WeightRegistry(fanout=a.fanout), port=a.port + 1)
+    dist.barrier()
+    reg = RegistryClient(f"http://{a.master}:{a.port + 1}")
+    if rank == 0:
+        pub = WeightPublisher(reg, make_transport("connex-rs", lid=("bench", 0, 0, 0)),
+                              device="cuda", buffers=a.pub_buffers)
+    else:
+        sub = WeightSubscriber(reg, make_transport("connex-rs", lid=("bench", 1, 0, rank)),
+                               f"rx{rank}", device="cuda", chunk_bytes=chunk, window=a.window)
+    for r in range(a.rounds):
+        dist.barrier()
+        t0 = time.time()
+        if rank == 0:
+            v = pub.publish(named)
+            pack = time.time() - t0
+        else:
+            reg.get_latest(wait_newer_than=r, timeout=600)
+            st = sub.sync(lambda it: None)
+        stats = [None] * world
+        dist.all_gather_object(stats, None if rank == 0 else st)
+        if rank == 0:
+            rx = [s for s in stats[1:]]
+            out.append({"mode": "connex", "size": a.size, "receivers": world - 1, "round": r,
+                        "version": v, "total_s": time.time() - t0, "pack_s": pack,
+                        "per_receiver_s": sorted(round(s["pull_s"], 4) for s in rx),
+                        "sources": [s["sources"][0] for s in rx], "fanout": a.fanout})
+            print(json.dumps(out[-1]), flush=True)
+    dist.barrier()
+    if rank == 0 and a.out:
+        with open(a.out, "a") as f:
+            for o in out:
+                f.write(json.dumps(o) + "\n")
+    dist.destroy_process_group()
+    if rank == 0:
+        srv.close()
+
+
+# -- churn: no collective group; a receiver dies in the middle of a round -----
+def run_churn(a):
+    """Rank 0 = trainer (+ registry); ranks 1.. = receivers that start
+    ``--stagger`` s apart (so later ones read from earlier ones: a tree).
+    In round ``--kill-round``, rank ``--kill-rank`` exits after ``--kill-after-chunks``
+    chunk batches -- typically while another receiver is reading from it.
+    The trainer reports when every live receiver holds the version."""
+    from connex.rl import (RegistryClient, RegistryServer, WeightPublisher, WeightRegistry,
+                           WeightSubscriber, make_transport)
+    rank = a.rank
+    torch.cuda.set_device(0)
+    torch.zeros(1, device="cuda")
+    url = f"http://{a.master}:{a.port + 1}"
+    if rank == 0:
+        srv = RegistryServer(WeightRegistry(fanout=a.fanout, member_ttl_s=3.0), port=a.port + 1)
+        reg = srv.reg
+        pub = WeightPublisher(reg, make_transport("connex-rs", lid=("churn", 0, 0, 0)),
+                              device="cuda", buffers=a.pub_buffers)
+        named = tensors(a.size, a.tensor_mb, "cuda")
+        while len(reg.status()["members"]) < a.world - 1:
+            time.sleep(0.2)
+        for r in range(a.rounds):
+            t0 = time.time()
+            v = pub.publish(named)
+            while True:
+                st = reg.status()
+                live = st["members"]
+                if live and all(x == v for x in live.values()):
+                    break
+                time.sleep(0.01)
+            rec = {"mode": "connex-churn", "size": a.size, "round": r, "version": v,
+                   "total_s": time.time() - t0, "live": sorted(live),
+                   "events": [e[1:] for e in reg.events if e[0] >= t0 and e[1] in
+                              ("source_failed", "expired", "leave")]}
+            print(json.dumps(rec), flush=True)
+            time.sleep(4.0)            # let the registry expire a dead member
+        srv.close()
+        return
+    while True:
+        try:
+            reg = RegistryClient(url, timeout=600)
+            reg.status()
+            break
+        except Exception:
+            time.sleep(0.5)
+    t = make_transport("connex-rs", lid=("churn", 1, 0, rank))
+    sub = WeightSubscriber(reg, t, f"rx{rank}", device="cuda", chunk_bytes=a.chunk_mb << 20,
+                           window=a.window, heartbeat_s=0.5)
+    last = 0
+    for r in range(a.rounds):
+        reg.get_latest(wait_newer_than=last, timeout=600)
+        time.sleep(a.stagger * (rank - 1))
+        if r == a.kill_round and rank == a.kill_rank and a.kill_mode == "puller":
+            orig, n = t.read_batch, [0]
+
+            def dying(*args, **kw):
+                n[0] += 1
+                if n[0] > a.kill_after_chunks:
+                    print(json.dumps({"rank": rank, "event": "exit", "t": time.time()}),
+                          flush=True)
+                    os._exit(1)
+                return orig(*args, **kw)
+            t.read_batch = dying
+        st = sub.sync(lambda it: None)
+        last = st["version"]
+        print(json.dumps({"rank": rank, "round": r, **{k: st[k] for k in (
+            "version", "pull_s", "sources", "source_failures")}}), flush=True)
+        if r == a.kill_round and rank == a.kill_rank and a.kill_mode == "source":
+            # die while later receivers read this copy
+            time.sleep(a.kill_delay)
+            print(json.dumps({"rank": rank, "event": "exit", "t": time.time()}), flush=True)
+            os._exit(1)
+    time.sleep(2)
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["local"])
+    ap.add_argument("cmd", choices=["local", "dist", "churn"])
+    ap.add_argument("--stagger", type=float, default=0.0)
+    ap.add_argument("--kill-round", type=int, default=-1)
+    ap.add_argument("--kill-rank", type=int, default=-1)
+    ap.add_argument("--kill-after-chunks", type=int, default=2)
+    ap.add_argument("--kill-mode", choices=["puller", "source"], default="source")
+    ap.add_argument("--kill-delay", type=float, default=0.2)
+    ap.add_argument("--rank", type=int, default=0)
+    ap.add_argument("--world", type=int, default=2)
+    ap.add_argument("--master", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=29611)
     ap.add_argument("--mode", choices=["connex", "nccl"], default="connex")
     ap.add_argument("--size", choices=list(SIZES), default="0.5B")
     ap.add_argument("--gpus", default="1,2,3", help="first = trainer")
@@ -201,9 +363,14 @@ def main():
     ap.add_argument("--chunk-mb", type=int, default=64)
     ap.add_argument("--window", type=int, default=4)
     ap.add_argument("--fanout", type=int, default=2)
+    ap.add_argument("--pub-buffers", type=int, default=2)
     ap.add_argument("--kill-at", type=float, default=0.0)
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
+    if a.cmd == "dist":
+        return run_dist(a)
+    if a.cmd == "churn":
+        return run_churn(a)
     gpus = [int(g) for g in a.gpus.split(",")]
     res = (run_connex if a.mode == "connex" else run_nccl)(a, gpus)
     if a.out:

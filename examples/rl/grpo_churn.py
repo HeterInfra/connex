@@ -46,12 +46,13 @@ def start_engine(a, gpu, port):
         cmd = [sys.executable, "-m", "sglang.launch_server", "--model-path", a.model,
                "--host", "127.0.0.1", "--port", str(port), "--mem-fraction-static", str(a.gmu),
                "--context-length", "2048", "--served-model-name", "policy",
-               "--custom-weight-loader", "connex.rl.sglang_ext.connex_load"]
+               "--custom-weight-loader", "connex.rl.sglang_ext.connex_load"] + a.engine_args.split()
         return subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
                                 start_new_session=True)
     cmd = [sys.executable, "-m", "vllm.entrypoints.cli.main", "serve", a.model, "--port", str(port),
            "--enforce-eager", "--gpu-memory-utilization", str(a.gmu), "--max-model-len", "2048",
-           "--served-model-name", "policy", "--weight-transfer-config", '{"backend": "connex"}']
+           "--served-model-name", "policy", "--weight-transfer-config", '{"backend": "connex"}'
+           ] + a.engine_args.split()
     return subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
                             start_new_session=True)
 
@@ -219,6 +220,7 @@ def main():
     ap.add_argument("--model", required=True)
     ap.add_argument("--engines", required=True, help="gpu:port,...")
     ap.add_argument("--engine", choices=["vllm", "sglang"], default="vllm")
+    ap.add_argument("--engine-args", default="", help="extra engine CLI arguments")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--steps", type=int, default=6)
     ap.add_argument("--prompts", type=int, default=8)

@@ -111,6 +111,7 @@ class SGLangInstance(_HTTP):
     def __init__(self, *a, tp_size=1, **kw):
         super().__init__(*a, **kw)
         self.tp_size = tp_size
+        self._has_sessions = None
 
     async def generate(self, req, partial=None):
         sp = {"max_new_tokens": req["max_tokens"], "temperature": req.get("temperature", 0.0),
@@ -134,8 +135,27 @@ class SGLangInstance(_HTTP):
         s = base64.b64encode(buf.getvalue()).decode()
         return [s] * self.tp_size
 
+    async def _session_call(self, path):
+        """begin/end_weight_update (SGLang >= 0.5.2x); absent on older servers."""
+        if self._has_sessions is False:
+            return
+        s = await self._session()
+        try:
+            async with s.post(self.url + path, json={}) as r:
+                body = await r.read()
+                if r.status == 404:
+                    self._has_sessions = False
+                    return
+                if r.status != 200:
+                    raise InstanceDead(f"{path}: HTTP {r.status}: {body[:300]!r}")
+                self._has_sessions = True
+        except RETRY as e:
+            raise InstanceDead(f"{path}: {e!r}") from e
+
     async def update(self, version):
+        await self._session_call("/begin_weight_update")
         await self._post("/update_weights_from_tensor", {
             "serialized_named_tensors": self.payload(version), "load_format": LOADER,
             "flush_cache": True, "weight_version": str(version)})
+        await self._session_call("/end_weight_update")
         self.version = version

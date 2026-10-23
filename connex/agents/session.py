@@ -57,13 +57,19 @@ class ReprefillMover(KVMover):
     name = "reprefill"
 
     async def move(self, proxy, session, src, dst):
-        ctx = session.context
+        live = [st for st in session.inflight if st.k > 0 and st.can_resume()]
+        if live:     # warm what the cut-over request will resend: prompt + output so far
+            st = live[-1]
+            ctx = await st.build(proxy.pool.eps[dst])
+        else:
+            ctx = session.context
         if ctx is None:
             return {"mode": self.name, "tokens": 0}
         body = dict(ctx)
         body.update(stream=False, max_tokens=1, temperature=0.0)
         body.pop("max_completion_tokens", None)
-        body.pop("stream_options", None)
+        for k in ("stream_options", "logprobs", "return_tokens_as_token_ids", "min_tokens"):
+            body.pop(k, None)
         path = "/v1/chat/completions" if session.kind == "chat" else "/v1/completions"
         async with proxy.session.post(dst.rstrip("/") + path, json=body) as r:
             if r.status != 200:
@@ -226,11 +232,14 @@ def main():
     ap.add_argument("--endpoints-file", default=None)
     ap.add_argument("--idle-timeout", type=float, default=30.0)
     ap.add_argument("--probe-interval", type=float, default=1.0)
+    ap.add_argument("--no-token-ids", action="store_true",
+                    help="resume from text (engines without token-id logprobs, e.g. SGLang)")
     ap.add_argument("--log-level", default="INFO")
     a = ap.parse_args()
     logging.basicConfig(level=a.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     pool = Pool([u for u in a.endpoints.split(",") if u], a.endpoints_file)
-    proxy = SessionProxy(pool, idle_timeout=a.idle_timeout, probe_interval=a.probe_interval)
+    proxy = SessionProxy(pool, idle_timeout=a.idle_timeout, probe_interval=a.probe_interval,
+                         token_ids=not a.no_token_ids)
     web.run_app(proxy.app(), host=a.host, port=a.port, access_log=None)
 
 

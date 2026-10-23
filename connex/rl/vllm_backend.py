@@ -116,6 +116,7 @@ class ConnexTrainerInitInfo(TrainerInitInfo):
     device: str = "cuda"
     chunk_bytes: int = DEFAULT_CHUNK
     member: str | None = None          # worker-side member prefix (single client)
+    buffers: int = 2                   # publisher arenas (1 halves trainer memory)
 
 
 class ConnexTrainerWeightTransferEngine(TrainerWeightTransferEngine[ConnexTrainerInitInfo]):
@@ -135,7 +136,7 @@ class ConnexTrainerWeightTransferEngine(TrainerWeightTransferEngine[ConnexTraine
             t = make_transport(init_info.transport, name="trainer",
                                lid=("connex-rl", 0, 0, 0), advertise_ip=_advertise_ip())
             pub = WeightPublisher(RegistryClient(init_info.registry_url), t,
-                                  device=init_info.device)
+                                  device=init_info.device, buffers=init_info.buffers)
             client.init_weight_transfer_engine(asdict(ConnexWeightTransferInitInfo(
                 registry_url=init_info.registry_url, member=init_info.member,
                 transport=init_info.transport, chunk_bytes=init_info.chunk_bytes)))
