@@ -1,0 +1,22 @@
+Connex
+Copyright contributors to the Connex project
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Portions of this product were developed inside a fork of vLLM
+(https://github.com/vllm-project/vllm), which is licensed under the
+Apache License, Version 2.0, Copyright contributors to the vLLM project.
+These portions are the files that carry the header
+"SPDX-FileCopyrightText: Copyright contributors to the vLLM project",
+including:
+
+  connex/epc_client.py
+  integrations/vllm/connex_communicator.py
+  integrations/vllm/zeromq_communicator.py
+  tests/reference/connexte_communicator_reference.py
+
+The patches under integrations/vllm/patches/ modify vLLM source code at
+install time and contain code fragments from vLLM.
+
+The connex-rs data plane (third_party/connex-rs, a git submodule) is a
+separate project under the Apache License, Version 2.0.
