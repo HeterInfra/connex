@@ -6,3 +6,5 @@ results
 .release-patterns.local
 .pytest_cache
 .github
+third_party/connex-rs/target
+third_party/connex-rs/dist

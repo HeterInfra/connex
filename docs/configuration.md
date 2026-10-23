@@ -91,7 +91,7 @@ the fork's extensions fail to load `libcudart`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CONNEX_PP_BACKEND` | `auto` | data plane: `auto` (connex-rs if installed and an RDMA device exists, else Mooncake, else ZeroMQ), `connex-rs`, `mooncake`, `zmq` |
+| `CONNEX_PP_BACKEND` | `auto` | data plane: `auto` (connex-rs, `pip install "connex-ai[rs]"`, if installed and an RDMA device exists, else Mooncake, else ZeroMQ), `connex-rs`, `mooncake`, `zmq` |
 | `CONNEX_RS_LOCAL_IP` | `MOONCAKE_LOCAL_IP` / `CONNEX_HOST_IP` / `VLLM_HOST_IP` | address connex-rs listens on and advertises |
 | `CONNEX_RS_PORT` / `CONNEX_RS_BASE_PORT` | unset / `MOONCAKE_BASE_PORT` + 1000 if set, else `51000 + 100*REPLICA` | fixed listen port, or base + stage index (fixed so a restarted stage keeps its URL) |
 | `CONNEX_RS_NET_DEVICES` | `auto` | sets `UCX_NET_DEVICES` when that is unset; `auto` = the RDMA device whose IPoIB interface carries the local IP, plus that interface |

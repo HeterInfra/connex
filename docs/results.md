@@ -220,6 +220,9 @@ instead of by a request. The first request on a cold engine still takes
 
 ## 6. connex-rs data plane vs Mooncake
 
+[connex-rs](https://github.com/HeterInfra/connex-rs) is Connex's data plane
+in Rust over UCX (its own repository; `pip install "connex-ai[rs]"`).
+
 Same setup as above (4 stages, Llama-3-8B, A40 + 100 Gb InfiniBand,
 GPUDirect), with the data plane switched between connex-rs and Mooncake
 Transfer Engine (`CONNEX_PP_BACKEND`). Steady state is from one replica,

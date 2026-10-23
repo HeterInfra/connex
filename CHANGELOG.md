@@ -8,8 +8,19 @@
   name stays `connex`. Source checkouts install as before
   (`pip install -e ".[test]"`).
 
+**connex-rs: its own repository, consumed as a component**
+- connex-rs moved out of this tree (`native/connex-rs`) into
+  https://github.com/HeterInfra/connex-rs, released as `connex-rs` on PyPI
+  and crates.io. Connex depends on it through the `rs` extra
+  (`connex-ai[rs]` -> `connex-rs>=0.1,<0.2`) and imports `connex_rs` only when
+  that backend is used; `auto` falls back to Mooncake or ZeroMQ without it.
+- Source builds and the image use the git submodule `third_party/connex-rs`
+  (or `CONNEX_RS_REPO`/`CONNEX_RS_REF`); CI builds the wheel from the
+  submodule and runs the backend tests. `scripts/check_release.py` skips
+  submodules unless `--recurse-submodules`.
+
 **connex-rs: Connex's own data plane, default on RDMA hosts**
-- `native/connex-rs`: a Rust data plane over UCX with a Python binding
+- connex-rs: a Rust data plane over UCX with a Python binding
   (`connex_rs.Engine`). One-sided RMA (get/put) on registered host or GPU
   memory with GPUDirect RDMA, `put_signal` (write, then a message that
   arrives after the data), plain messages, on a dedicated progress thread
@@ -31,7 +42,7 @@
   could break its peers).
 - Image: a builder stage compiles UCX (verbs, rdmacm, CUDA) and the
   connex-rs wheel (`BUILD_CONNEX_RS`, `UCX_VERSION`, `RUST_TOOLCHAIN`);
-  `pip install -e ".[rs]"`; CI builds and tests the crate and the Python
+  `pip install "connex-ai[rs]"`; CI builds the wheel and tests the Python
   backend over UCX/TCP.
 
 ## 0.1.0

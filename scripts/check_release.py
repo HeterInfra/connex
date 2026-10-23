@@ -5,6 +5,11 @@
     python scripts/check_release.py                 # scan git-tracked files (or the whole tree)
     python scripts/check_release.py --all-files     # scan every file under the root
     python scripts/check_release.py --list          # print the active patterns
+    python scripts/check_release.py --recurse-submodules   # also scan third_party/*
+
+Scope: files tracked (or untracked, not ignored) by git in this repository.
+Submodules (third_party/connex-rs) are separate repositories with their own
+scanner and CI; they are skipped unless --recurse-submodules is given.
 
 Checks
   * generic patterns in scripts/release_patterns.txt (IPv4 literals outside an
@@ -73,17 +78,24 @@ def load_patterns(path):
     return out
 
 
-def tracked_files(all_files):
+def tracked_files(all_files, submodules=False):
     if not all_files:
         try:
             r = subprocess.run(["git", "-C", ROOT, "ls-files", "-co", "--exclude-standard"],
                                capture_output=True, text=True, check=True)
-            return [f for f in r.stdout.splitlines() if os.path.isfile(os.path.join(ROOT, f))]
+            files = r.stdout.splitlines()
+            if submodules:
+                r = subprocess.run(["git", "-C", ROOT, "ls-files", "--recurse-submodules"],
+                                   capture_output=True, text=True, check=True)
+                files = sorted(set(files) | set(r.stdout.splitlines()))
+            # a submodule is listed as its directory (a gitlink), not as files
+            return [f for f in files if os.path.isfile(os.path.join(ROOT, f))]
         except Exception:
             pass
     out = []
     for d, dirs, files in os.walk(ROOT):
-        dirs[:] = [x for x in dirs if x not in (".git", "__pycache__", "build") and not x.endswith(".egg-info")]
+        dirs[:] = [x for x in dirs if x not in (".git", "__pycache__", "build", "target", "dist")
+                   and not x.endswith(".egg-info")]
         out += [os.path.relpath(os.path.join(d, f), ROOT) for f in files]
     return out
 
@@ -102,6 +114,8 @@ def main():
     ap.add_argument("--extra", default=os.environ.get("CONNEX_RELEASE_PATTERNS", LOCAL_FILE))
     ap.add_argument("--no-ip", action="store_true", help="skip the IPv4 literal check")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--recurse-submodules", action="store_true",
+                    help="also scan files of git submodules (third_party/*)")
     a = ap.parse_args()
 
     pats = [(n, re.compile(r)) for n, r in
@@ -112,8 +126,9 @@ def main():
         return 0
     me = os.path.relpath(os.path.abspath(__file__), ROOT)
     hits = 0
-    for rel in sorted(tracked_files(a.all_files)):
-        if rel in SKIP_FILES or rel == me or rel.startswith(".release-patterns") \
+    for rel in sorted(tracked_files(a.all_files, a.recurse_submodules)):
+        if rel in SKIP_FILES or any(rel.endswith("/" + f) for f in SKIP_FILES) or rel == me \
+                or rel.startswith(".release-patterns") \
                 or os.path.splitext(rel)[1].lower() in SKIP_EXT:
             continue
         # a file *name* can leak as well

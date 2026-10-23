@@ -13,11 +13,11 @@ behind an identity changes, so requests hand over to another replica on
 failure or scale-down and new replicas take traffic as soon as they join.
 
 Tensor bytes move through a pluggable data plane. On RDMA hosts the default
-is [**connex-rs**](native/connex-rs), Connex's own Rust data plane over UCX:
+is [**connex-rs**](https://github.com/HeterInfra/connex-rs), Connex's own Rust data plane over UCX:
 GPUDirect one-sided transfers as fast as Mooncake Transfer Engine, plus
 peer-death events within milliseconds and same-identity rejoin, which bring
 handover after a killed stage from 2-3 s to well under 1 s
-([comparison](native/connex-rs/README.md#performance-vs-mooncake-transfer-engine)).
+([comparison](https://github.com/HeterInfra/connex-rs#performance-vs-mooncake-transfer-engine)).
 Mooncake Transfer Engine, UCX and ZeroMQ remain available.
 
 Connex is the system described in *Connex: Endpoint Mobility Primitives for
@@ -48,7 +48,7 @@ is in [`docs/design/overview.md`](docs/design/overview.md).
 | Cutover | versioned routes (epochs), draining routes, a cutover state machine and shadow connections for switching a LID to a new endpoint | `connex.mobility_control`, `connex.cutover_fsm`, `connex.route_table` |
 | Step delivery contract | correlation ids, idempotent retried sends and receives, reply cache, stale-reply filter, K steps in flight; this is what makes re-sending in-flight work to another replica safe | `connex.pp` |
 | Fast handover and state hooks | a missed lease or receive timeout, confirmed by a TCP probe, fails all affected steps over at once (2-3 s kill to next token, measured); the engine reports which state a peer held, and lost state is recomputed instead of continued | `connex.pp`, engine adapters |
-| Transports | [connex-rs](native/connex-rs) (Rust over UCX: RDMA/TCP, GPUDirect, peer-death events, same-identity rejoin; default with RDMA), Mooncake Transfer Engine (RDMA/TCP, GPUDirect or host staging), UCX via ucx-py, ZeroMQ fallback, per-peer capability negotiation | `native/connex-rs`, `connex.pp.endpoint`, `connex.ucx_transport`, `connex.mooncake_integration`, `connex.gpu_fastpath` |
+| Transports | [connex-rs](https://github.com/HeterInfra/connex-rs) (Rust over UCX: RDMA/TCP, GPUDirect, peer-death events, same-identity rejoin; default with RDMA), Mooncake Transfer Engine (RDMA/TCP, GPUDirect or host staging), UCX via ucx-py, ZeroMQ fallback, per-peer capability negotiation | `connex_rs` ([separate repository](https://github.com/HeterInfra/connex-rs), `third_party/connex-rs`), `connex.pp.endpoint`, `connex.ucx_transport`, `connex.mooncake_integration`, `connex.gpu_fastpath` |
 | Resume proxy | optional OpenAI-API proxy that retries a request before its first token, or resumes it on another replica after k tokens, when a front-end replica dies | `connex.serving.proxy` |
 
 A small example, CPU only and not tied to any serving scenario: a sender
@@ -123,7 +123,7 @@ chains whose stages fail over to each other.
 |---|---|---|
 | control plane | `connex.front_router`, `connex.directory*`, `connex.epc_*` | logical endpoint registry: routes, leases, health, membership and migration events |
 | mobility | `connex.elastic`, `connex.cutover_fsm`, `connex.mobility_control`, `connex.route_table` | elastic peer sets, versioned routes, cutover state machine, shadow connections |
-| transports | [`native/connex-rs`](native/connex-rs) (default data plane with RDMA), `connex.pp.endpoint`, `connex.ucx_transport`, `connex.mooncake_integration` | tensor transport over RDMA or TCP; KV block transfer for PD |
+| transports | [connex-rs](https://github.com/HeterInfra/connex-rs) (default data plane with RDMA; submodule `third_party/connex-rs`), `connex.pp.endpoint`, `connex.ucx_transport`, `connex.mooncake_integration` | tensor transport over RDMA or TCP; KV block transfer for PD |
 | step protocol | `connex.pp` | `PipelineEndpoint`, correlation ids, K in flight, idempotent retries, sticky failover, handover, the `EngineHooks` protocol, wire format |
 | engine adapters | `connex.adapters.vllm`, `connex.adapters.sglang` | vLLM communicator for the fork's external pipeline mode (plus patches in `integrations/vllm/patches`); SGLang `pp_group` replacement (prototype) |
 | serving | `connex.serving.proxy` | optional request retry/resume proxy |
@@ -133,7 +133,7 @@ chains whose stages fail over to each other.
 Connex separates *who talks to whom, and what happens when that changes*
 from *how the bytes move*. Connex owns the first part. The second part is a
 pluggable data plane. On RDMA hosts the default is **connex-rs**
-([`native/connex-rs`](native/connex-rs)), Connex's own data plane in Rust
+([HeterInfra/connex-rs](https://github.com/HeterInfra/connex-rs), `pip install "connex-ai[rs]"`), Connex's own data plane in Rust
 over UCX; the [Mooncake Transfer Engine](https://github.com/kvcache-ai/Mooncake)
 remains supported (`CONNEX_PP_BACKEND=mooncake`) and is the default where no
 RDMA device is present. "ConnexTE" names the combination of Connex control
@@ -292,9 +292,11 @@ python -m pytest -q tests            # CPU only
 
 Optional dependencies degrade gracefully: without `ucx-py`, `UCXTransport`
 logs a warning and uses ZeroMQ; `connex.pp` uses connex-rs, else Mooncake,
-else a ZeroMQ-only data path. connex-rs is built from
-[`native/connex-rs`](native/connex-rs) (Rust toolchain, maturin, and a UCX
-with verbs/rdmacm and CUDA support; the image build does this).
+else a ZeroMQ-only data path. connex-rs is its own package and repository
+([HeterInfra/connex-rs](https://github.com/HeterInfra/connex-rs)). For RDMA and GPUDirect, build its wheel
+against a UCX with verbs/rdmacm and CUDA support from the
+`third_party/connex-rs` submodule (Rust toolchain, maturin; see
+[CONTRIBUTING.md](CONTRIBUTING.md)); the image build does this.
 
 ## Configuration
 

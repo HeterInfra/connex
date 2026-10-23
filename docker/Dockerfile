@@ -1,5 +1,6 @@
 # Connex + external-PP vLLM fork + connex-rs (default data plane, Rust over
-# UCX) + ucx-py + Mooncake Transfer Engine (optional data plane).
+# UCX; from the third_party/connex-rs submodule or CONNEX_RS_REPO) + ucx-py +
+# Mooncake Transfer Engine (optional data plane).
 #
 #   make image IMAGE=<registry>/connex-vllm:<tag> VLLM_FORK_REPO=<git URL of the fork>
 # or
@@ -32,18 +33,43 @@
 ARG BASE_IMAGE=vllm/vllm-openai:v0.11.2
 
 # ---- connex-rs builder: UCX (verbs, rdmacm, CUDA) + Rust + maturin ---------
-# The UCX in the pip wheels (libucx-cu12) has no InfiniBand transports, so
-# connex-rs links a UCX built here; it is copied to /opt/ucx in the final image
-# (the wheel finds it by rpath). BUILD_CONNEX_RS=0 skips all of this
-# (CONNEX_PP_BACKEND=auto then picks Mooncake).
+# connex-rs lives in its own repository (https://github.com/HeterInfra/connex-rs).
+# Source, in this order:
+#   1. the git submodule third_party/connex-rs in the build context
+#      (git submodule update --init), pinned by this repository;
+#   2. otherwise CONNEX_RS_REPO at CONNEX_RS_REF (git clone).
+# The build fails with a message if neither is available. The UCX in the pip
+# wheels (libucx-cu12) has no InfiniBand transports, so connex-rs links a UCX
+# built here; it is copied to /opt/ucx in the final image (the wheel finds it
+# by rpath). BUILD_CONNEX_RS=0 skips all of this (CONNEX_PP_BACKEND=auto then
+# picks Mooncake).
 FROM ${BASE_IMAGE} AS connex-rs-build
 ARG BUILD_CONNEX_RS=1
+ARG CONNEX_RS_REPO=https://github.com/HeterInfra/connex-rs.git
+ARG CONNEX_RS_REF=v0.1.0
 ARG UCX_VERSION=1.18.1
 ARG RUST_TOOLCHAIN=1.86.0
 ARG MAX_JOBS=8
 ARG PIP_INDEX_URL=
 ENV DEBIAN_FRONTEND=noninteractive
-RUN set -eux; mkdir -p /opt/ucx /wheels; \
+COPY third_party/ /src/third_party/
+RUN set -eux; mkdir -p /wheels; \
+    if [ "${BUILD_CONNEX_RS}" != 1 ]; then exit 0; fi; \
+    if [ -f /src/third_party/connex-rs/Cargo.toml ]; then \
+        echo "connex-rs: using the third_party/connex-rs submodule"; \
+        cp -a /src/third_party/connex-rs /src/connex-rs; \
+    else \
+        command -v git >/dev/null || (apt-get update && apt-get install -y --no-install-recommends git ca-certificates); \
+        if [ -z "${CONNEX_RS_REPO}" ] || ! git clone --filter=blob:none "${CONNEX_RS_REPO}" /src/connex-rs \
+            || ! git -C /src/connex-rs checkout "${CONNEX_RS_REF}"; then \
+            echo "ERROR: connex-rs source unavailable. Run 'git submodule update --init third_party/connex-rs'" \
+                 "before building, or pass --build-arg CONNEX_RS_REPO=<git URL> --build-arg CONNEX_RS_REF=<tag or commit>" \
+                 "(or --build-arg BUILD_CONNEX_RS=0 to build without connex-rs)." >&2; \
+            exit 1; \
+        fi; \
+    fi; \
+    rm -rf /src/third_party /src/connex-rs/target /src/connex-rs/dist
+RUN set -eux; mkdir -p /opt/ucx; \
     if [ "${BUILD_CONNEX_RS}" != 1 ]; then exit 0; fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends build-essential curl ca-certificates pkg-config \
@@ -59,10 +85,8 @@ RUN set -eux; mkdir -p /opt/ucx /wheels; \
     /opt/ucx/bin/ucx_info -v
 RUN set -eux; if [ "${BUILD_CONNEX_RS}" != 1 ]; then exit 0; fi; \
     curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain "${RUST_TOOLCHAIN}"; \
-    pip install ${PIP_INDEX_URL:+-i $PIP_INDEX_URL} "maturin>=1.5,<2"
-COPY native/connex-rs /src/connex-rs
-RUN set -eux; if [ "${BUILD_CONNEX_RS}" != 1 ]; then exit 0; fi; \
-    cd /src/connex-rs; rm -rf target dist; \
+    pip install ${PIP_INDEX_URL:+-i $PIP_INDEX_URL} "maturin>=1.5,<2"; \
+    cd /src/connex-rs; \
     UCX_HOME=/opt/ucx PATH="/root/.cargo/bin:$PATH" maturin build --release -o /wheels
 
 FROM ${BASE_IMAGE}

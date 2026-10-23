@@ -31,10 +31,16 @@ make image IMAGE=<registry>/connex-vllm:0.1.0 VLLM_FORK_REPO=<git URL of the for
 make push IMAGE=<registry>/connex-vllm:0.1.0       # tiers 2 and 3, if hosts pull from a registry
 ```
 
-The image also builds connex-rs in a builder stage: UCX (`UCX_VERSION`,
-default 1.18.1, with verbs, rdmacm and CUDA) into `/opt/ucx`, and the Rust
-wheel against it (`RUST_TOOLCHAIN`); the pip UCX wheels lack InfiniBand
-transports. `--build-arg BUILD_CONNEX_RS=0` skips it (Mooncake only).
+The image also builds [connex-rs](https://github.com/HeterInfra/connex-rs)
+in a builder stage: UCX (`UCX_VERSION`, default 1.18.1, with verbs, rdmacm
+and CUDA) into `/opt/ucx`, and the Rust wheel against it (`RUST_TOOLCHAIN`);
+the pip UCX wheels lack InfiniBand transports. The source is the
+`third_party/connex-rs` submodule of the build context (run
+`git submodule update --init` first, or clone with `--recurse-submodules`);
+without it the build clones `CONNEX_RS_REPO` at `CONNEX_RS_REF` (default
+the connex-rs GitHub repository, `v0.1.0`) and fails with a message if that
+is not reachable. `--build-arg BUILD_CONNEX_RS=0` skips connex-rs
+(Mooncake only).
 
 The default `FORK_INSTALL=overlay` copies the fork's Python tree over the
 compiled vLLM in `BASE_IMAGE`, so the base image must match the fork's torch
