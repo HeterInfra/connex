@@ -46,17 +46,25 @@ setup(
         # Request retry/resume proxy (connex.serving.proxy) and benchmarks.
         "proxy": ["aiohttp"],
         "bench": ["aiohttp"],
-        # Engine adapters (connex.adapters.*). The vLLM adapter targets the
-        # Connex vLLM fork (external pipeline mode); stock vLLM lacks its hooks.
-        "vllm": ["vllm"],
-        "sglang": ["sglang"],
+        # Engine adapters (connex.adapters.*). PD disaggregation works with
+        # upstream vLLM (KV connector) and SGLang (transfer backend plugin);
+        # the pipeline-parallel adapter needs the Connex vLLM fork.
+        "vllm": ["vllm", "aiohttp"],
+        "sglang": ["sglang", "aiohttp"],
         "test": ["pytest", "pyflakes", "aiohttp"],
         "dev": ["pytest", "pyflakes", "aiohttp", "ruff"],
     },
-    entry_points={"console_scripts": [
-        "connex-front-router=connex.front_router:main",
-        "connex-directory=connex.directory_server:main",
-    ]},
+    entry_points={
+        "console_scripts": [
+            "connex-front-router=connex.front_router:main",
+            "connex-directory=connex.directory_server:main",
+            "connex-pd-router=connex.serving.pd_router:main",
+        ],
+        # PD disaggregation on upstream engines, no fork: vLLM finds the
+        # ConnexConnector by name, SGLang gets the "connex" transfer backend.
+        "vllm.general_plugins": ["connex_pd = connex.adapters.vllm.plugin:register"],
+        "sglang.srt.plugins": ["connex = connex.adapters.sglang.pd_backend:register"],
+    },
     classifiers=[
         "License :: OSI Approved :: Apache Software License",
         "Programming Language :: Python :: 3",
