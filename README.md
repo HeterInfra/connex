@@ -168,7 +168,7 @@ chains whose stages fail over to each other.
 | Failover with in-flight request handover across replicas | correlation ids, idempotent retried steps, fast handover, re-prefill (`connex.pp`); resume proxy (`connex.serving.proxy`) | **Implemented and validated** for pipeline stages (all requests complete, greedy output correct, 2-3 s handover) |
 | Endpoint migration (same identity, new address) | re-registration with `address_changed`; MIGRATE handling in `ElasticPeerSet`; cutover state machine and shadow connections | Implemented, partly unit-tested; **not validated at scale** (re-adding a stage under the same identity has a known Mooncake limitation, see Limitations) |
 | Heterogeneous transports and hardware | connex-rs and Mooncake (RDMA/TCP, GPUDirect or host buffers), UCX, ZeroMQ, capability negotiation | Transports **validated** (RDMA and TCP, GPUDirect and host staging); mixed GPU types in one deployment **not validated** |
-| Prefill-decode (PD) disaggregation, prefill and decode pools | role-aware endpoint ids (`PDRole`), role lookup in `VersionedRouteTable`, KV block transfer manager (`connex.mooncake_integration`) | **Primitives available** (unit-tested in `tests/test_pd_primitives.py`); **engine integration on the roadmap** |
+| Prefill-decode (PD) disaggregation, prefill and decode pools | `connex.pd` (KV layout, holds, pulls over connex-rs or Mooncake, PD pools in the front-router), vLLM KV connector and SGLang transfer backend as plugins on **upstream engines (no fork)**, PD router with elastic pools and failover (`connex.serving.pd_router`) | **Implemented and validated** on vLLM 0.32.0 and SGLang 0.5.22 (Llama-3-8B, 1P1D/1P2D/2P1D/2P2D on one 4-GPU host): greedy outputs pass the teacher-forced check, throughput and latency match NIXL (vLLM) and Mooncake (SGLang), decode/prefill kills and pool scaling under load complete every request. **Not validated**: across hosts, TP > 1, MLA/hybrid KV ([`docs/pd-disaggregation.md`](docs/pd-disaggregation.md)) |
 | Attention-FFN disaggregation | the generic primitives only | **Roadmap**: no attention/FFN-specific code yet |
 
 ## Library layout
@@ -179,8 +179,9 @@ chains whose stages fail over to each other.
 | mobility | `connex.elastic`, `connex.cutover_fsm`, `connex.mobility_control`, `connex.route_table` | elastic peer sets, versioned routes, cutover state machine, shadow connections |
 | transports | [connex-rs](https://github.com/HeterInfra/connex-rs) (default data plane with RDMA; submodule `third_party/connex-rs`), `connex.pp.endpoint`, `connex.ucx_transport`, `connex.mooncake_integration` | tensor transport over RDMA or TCP; KV block transfer for PD |
 | step protocol | `connex.pp` | `PipelineEndpoint`, correlation ids, K in flight, idempotent retries, sticky failover, handover, the `EngineHooks` protocol, wire format |
-| engine adapters | `connex.adapters.vllm`, `connex.adapters.sglang` | vLLM communicator for the fork's external pipeline mode (plus patches in `integrations/vllm/patches`); SGLang `pp_group` replacement (prototype) |
-| serving | `connex.serving.proxy` | optional request retry/resume proxy |
+| engine adapters | `connex.adapters.vllm`, `connex.adapters.sglang` | vLLM communicator for the fork's external pipeline mode (plus patches in `integrations/vllm/patches`); SGLang `pp_group` replacement (prototype); PD: vLLM `ConnexConnector` and SGLang `connex` transfer backend for upstream engines |
+| PD transfer | `connex.pd` | engine-neutral KV transfer with renewable holds, data planes, PD pool membership |
+| serving | `connex.serving.proxy`, `connex.serving.pd_router` | optional request retry/resume proxy; PD router (prefill then decode, elastic pools, failover) |
 
 ## Architecture: Connex control, pluggable data plane
 
@@ -339,8 +340,8 @@ pip install "connex-ai[proxy]"       # + aiohttp, for connex.serving.proxy
 pip install "connex-ai[rs]"          # + connex-rs data plane (connex-rs>=0.1,<0.2)
 pip install "connex-ai[mooncake]"    # + Mooncake Transfer Engine
 pip install "connex-ai[ucx]"         # + ucx-py (CUDA 12 build)
-pip install "connex-ai[vllm]"        # vLLM (the adapter needs the fork, see above)
-pip install "connex-ai[sglang]"      # SGLang (adapter prototype)
+pip install "connex-ai[vllm,rs]"     # vLLM: PD connector for upstream vLLM (PP needs the fork)
+pip install "connex-ai[sglang,rs]"   # SGLang: PD transfer backend plugin (PP adapter is a prototype)
 pip install "connex-ai[rs,proxy,mooncake]"   # extras combine
 ```
 
@@ -370,9 +371,10 @@ in [`docs/deploy.md`](docs/deploy.md).
 
 ## Limitations
 
-- **Only pipeline parallelism is integrated with an engine.** PD
-  disaggregation has primitives but no engine integration in this
-  repository; attention-FFN disaggregation is roadmap.
+- **Pipeline parallelism and PD disaggregation are integrated with engines.**
+  PD runs on upstream vLLM and SGLang as plugins, validated on one host only
+  (see [`docs/pd-disaggregation.md`](docs/pd-disaggregation.md) for its
+  limits); attention-FFN disaggregation is roadmap.
 - **vLLM fork required.** vLLM support needs the external-PP vLLM fork. The
   communicators and patches use vLLM internals and are not a plugin for
   upstream vLLM.
