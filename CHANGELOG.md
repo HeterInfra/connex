@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1
 
 **Prefill-decode disaggregation on upstream vLLM and SGLang (no fork)**
 - `connex.pd`: engine-neutral KV transfer with renewable holds (the prefill

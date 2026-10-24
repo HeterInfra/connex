@@ -25,7 +25,7 @@ The pipeline-parallel core used with inference engines is ``connex.pp``
 proxy is ``connex.serving.proxy``.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Original components
 from connex.directory import DirectoryClient, EndpointInfo

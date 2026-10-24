@@ -41,7 +41,7 @@ setup(
         # (https://github.com/HeterInfra/connex-rs). For RDMA/GPUDirect, build
         # the wheel against your UCX (third_party/connex-rs submodule, maturin)
         # or use the image (docker/Dockerfile).
-        "rs": ["connex-rs>=0.1,<0.2"],
+        "rs": ["connex-rs>=0.1.1,<0.2"],
         "mooncake": ["mooncake-transfer-engine"],
         # Request retry/resume proxy (connex.serving.proxy) and benchmarks.
         "proxy": ["aiohttp"],
