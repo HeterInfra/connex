@@ -161,7 +161,7 @@ class Resumer:
                           and (self.chat or isinstance(prompt, str) or
                                (isinstance(prompt, list) and prompt and isinstance(prompt[0], int))))
         lp = body.get("logprobs")
-        self.client_lp = lp not in (None, False)
+        self.client_lp = lp is not None and lp is not False   # logprobs=0 is a request too
         # token-id resume: completions only (chat cannot take token ids as input)
         self.use_ids = (self.resumable and not self.chat and proxy.token_ids
                         and (not self.client_lp or body.get("return_tokens_as_token_ids")))
@@ -288,6 +288,8 @@ class Resumer:
 
 
 class Proxy:
+    resumer_cls = Resumer   # subclasses (e.g. the PD router) extend per-request state
+
     def __init__(self, pool, idle_timeout=2.5, connect_timeout=2.0, max_attempts=4,
                  probe_interval=1.0, token_ids=True, first_token_timeout=None):
         self.pool = pool
@@ -408,7 +410,7 @@ class Proxy:
                                 raise asyncio.TimeoutError()
                             last[0] = loop.time()
                         else:
-                            line = await self._wait_first(content, ep)
+                            line = await self._wait_first(content, ep, getattr(st, "abort_first", None))
                         if not line:
                             raise StreamBroken("EOF before [DONE]")
                         if not line.startswith(b"data:"):
@@ -416,7 +418,12 @@ class Proxy:
                         data = line[5:].strip()
                         if data == b"[DONE]":
                             return
-                        out = st.on_chunk(_loads(data), base_k)
+                        obj = _loads(data)
+                        if isinstance(obj, dict) and obj.get("error") and not obj.get("choices"):
+                            # vLLM reports a failed request (e.g. a KV load
+                            # failure) as an error event inside a 200 stream
+                            raise StreamBroken(f"backend error: {str(obj['error'])[:200]}")
+                        out = st.on_chunk(obj, base_k)
                         if st.k > base_k:
                             got_first = True
                         if out is not None:
@@ -437,25 +444,35 @@ class Proxy:
                 return
             await asyncio.sleep(max(wait, 0.01))
 
-    async def _wait_first(self, content, ep):
+    async def _wait_first(self, content, ep, abort=None):
         """Wait for the next line before the first token, without a fixed idle
-        timeout: give up only if the replica is declared dead meanwhile."""
+        timeout: give up only if the replica is declared dead meanwhile, or
+        if ``abort`` (an optional coroutine factory, e.g. a failed companion
+        prefill) completes first."""
         read = asyncio.ensure_future(content.readline())
         dead = asyncio.ensure_future(ep.dead.wait())
+        waits = {read, dead}
+        ab = asyncio.ensure_future(abort()) if abort is not None else None
+        if ab is not None:
+            waits.add(ab)
         try:
-            done, _ = await asyncio.wait({read, dead}, timeout=self.first_token_timeout,
+            done, _ = await asyncio.wait(waits, timeout=self.first_token_timeout,
                                          return_when=asyncio.FIRST_COMPLETED)
             if read in done:
                 return read.result()
+            if ab is not None and ab in done:
+                raise StreamBroken(f"aborted before first token: {ab.result()}")
             raise StreamBroken("replica died before first token" if done else "first-token timeout")
         finally:
             dead.cancel()
+            if ab is not None:
+                ab.cancel()
             if not read.done():
                 read.cancel()
 
     async def generate(self, kind, body):
         """Async generator of client chunks for one request, with retry/resume."""
-        st = Resumer(self, kind, body)
+        st = self.resumer_cls(self, kind, body)
         path = "/v1/chat/completions" if st.chat else "/v1/completions"
         self.stats["requests"] += 1
         tried = []
@@ -482,7 +499,9 @@ class Proxy:
                 last_err = f"{type(e).__name__}: {e}"
                 if isinstance(e, asyncio.TimeoutError):
                     last_err = f"idle > {self.idle_timeout}s"
-                if isinstance(e, asyncio.TimeoutError) and await self._alive(ep):
+                if getattr(st, "spare_endpoint", False):
+                    st.spare_endpoint = False   # failure was not the replica's fault
+                elif isinstance(e, asyncio.TimeoutError) and await self._alive(ep):
                     log.info("%s idle but alive: resuming elsewhere without blacklisting", ep.url)
                 else:
                     self.pool.mark_bad(ep, last_err)
