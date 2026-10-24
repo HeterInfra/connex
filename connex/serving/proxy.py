@@ -187,6 +187,10 @@ class Resumer:
         if self.inject_lp:
             b["logprobs"] = True if self.chat else 0
             b["return_tokens_as_token_ids"] = True
+        if self.use_ids:
+            # token ids per chunk: vLLM and SGLang both honour return_token_ids
+            # (SGLang ignores return_tokens_as_token_ids)
+            b["return_token_ids"] = True
         if self.k == 0:
             return b
         for key in ("max_tokens", "max_completion_tokens"):
