@@ -30,6 +30,32 @@
   abort hook for subclasses.
 - Benchmarks: `benchmarks/pd/` (local deployment, load/check/score, tables).
 
+**RL post-training: elastic weight sync (`connex.rl`)**
+- `WeightPublisher` / `WeightSubscriber`: the trainer packs weights into a
+  registered, double-buffered arena and publishes version `v`; engines pull
+  it with one-sided connex-rs reads from the trainer or from engines that
+  already hold it (tree fan-out), replace a source that dies mid-pull, and
+  catch up to the latest version when they join.
+- `WeightRegistry` (HTTP/JSON, soft state): members by logical id, their
+  versions, holders and fan-out assignment, heartbeats and expiry.
+- `RolloutPool`: a request runs only on an instance at the version it was
+  admitted with; drain or abort-and-restart before an update, rolling
+  updates, failed instances dropped.
+- vLLM: `connex` backend for the pluggable weight-transfer API, registered
+  through the `vllm.general_plugins` entry point (`connex.rl.vllm_backend`);
+  SGLang: custom weight loader `connex.rl.sglang_ext.connex_load`.
+- Examples `examples/rl/` (weight sync into vLLM and SGLang, a GRPO loop with
+  engine churn); benchmarks `benchmarks/rl/` (vs NCCL broadcast, vs vLLM's
+  NCCL backend, a receiver dying mid-broadcast); `docs/rl.md`.
+
+**Agent session migration (`connex.agents`)**
+- `SessionProxy`: session logical ids with placement and epoch, sticky
+  routing, `migrate` (KV movers, re-prefill built in, then cut-over of
+  in-flight generations through the resume proxy), `drain`, failover.
+- Resume proxy hooks: `Proxy.pick`, `Proxy.move` (planned cut-over that is
+  not a failure), `begin` / `end`.
+- Benchmark `benchmarks/agents/migration_bench.py`; `docs/agent-migration.md`.
+
 ## 0.1.0
 
 First public release of Connex, a communication library for distributed AI

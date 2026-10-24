@@ -1,8 +1,9 @@
 # Results
 
 This page collects the measurements behind Connex v0.1.0 on a vLLM pipeline
-(sections 1-6) and prefill-decode disaggregation on upstream vLLM and SGLang
-(section 7):
+(sections 1-6), prefill-decode disaggregation on upstream vLLM and SGLang
+(section 7), RL weight sync (section 8) and agent session migration
+(section 9). Sections 1-6 cover
 steady-state latency and throughput with one and four pipeline steps in
 flight, correctness and latency of in-flight request handover when a
 downstream stage dies, goodput while a replica churns (with and without the
@@ -352,6 +353,147 @@ editing the `prefill.txt` / `decode.txt` pool files (`--pool-files`) or with
 Not covered for PD: instances on different hosts (RDMA across nodes), tensor
 parallelism > 1, MLA or hybrid KV caches, front-router membership under real
 failures (unit-tested only), and repeated runs for the steady-state table.
+
+## 8. RL weight sync
+
+`connex.rl` ([`rl.md`](rl.md)). Hardware as above: A40 GPUs, 100 Gb
+InfiniBand, GPUs shared with other tenants. One run per configuration;
+"warm" is the mean over the rounds after the first (the first round also
+opens the connections and registers memory), with [min-max].
+
+**Transfer only, across nodes** (`benchmarks/rl/weight_sync_bench.py dist`,
+pods from `benchmarks/rl/k8s_weight_sync.py`). Synthetic bf16 weights sized
+like the named model, already on the trainer GPU; the time runs until every
+receiver holds the whole model on its GPU. Connex: all receivers start at
+once, so all of them read from the trainer (the tree only forms when
+receivers start at different times, see below). NCCL: one process group,
+the trainer broadcasts the packed buffer in 64 MB chunks. **The NCCL column
+is NCCL over IPoIB sockets** (`NCCL_IB_DISABLE=1`): NCCL over IB verbs failed
+at the first collective between the pods of this image (see the insights in
+[`design/rl-and-agent-migration.md`](design/rl-and-agent-migration.md)), so
+this is not a comparison with NCCL over IB verbs.
+
+| weights | receivers (nodes) | NCCL over IPoIB, warm | Connex (connex-rs, IB), warm | Connex first round |
+|---|---|---|---|---|
+| 0.99 GB (Qwen2.5-0.5B size) | 3 (2 nodes, trainer on a third) | 0.611 s [0.608-0.615] | 0.394 s [0.379-0.417] | 0.90 s |
+| 3.09 GB (Qwen2.5-1.5B size) | 3 (same) | 1.949 s [1.939-1.955] | 1.192 s [1.172-1.217] | 2.64 s |
+| 16.06 GB (Llama-3-8B size) | 2 (one on the trainer's node, one on another) | 5.821 s [5.773-5.868] | 3.334 s [3.329-3.339] | 3.53 s |
+
+Aggregate read bandwidth out of the trainer was 7.5-7.8 GB/s with three
+concurrent readers and 9.6 GB/s with two.
+
+**A source dies while another receiver reads from it** (`weight_sync_bench.py
+churn`, 3.09 GB, fan-out 1, three receivers starting 0.5 s apart so that
+later ones read from earlier ones). Round 0: receivers 2 and 3 both read
+from receiver 1. Round 1: receiver 1 finished, then exited 0.15 s later
+while receiver 2 was reading from it; receiver 2 reported the failure,
+switched to the trainer for the rest, and finished in 0.354 s (0.32-0.42 s in
+rounds without a failure); receiver 3 read from receiver 2 in 0.42 s. Round 2
+ran with the two survivors. No receiver waited on the dead one; the registry
+expired it after its heartbeat TTL (3 s).
+
+**On one node, NCCL is faster.** Same host, trainer and two receivers on
+three A40s without NVLink, 0.99 GB: chunked NCCL broadcast 0.051 s, Connex
+0.21 s. NCCL moves the bytes over the PCIe peer path; connex-rs reads go
+through the NIC. End to end through vLLM's weight-transfer API
+(`benchmarks/rl/vllm_update_bench.py`, vLLM 0.32.0, one engine, trainer on
+another GPU of the same host, `send_weights()` = start + transfer + load +
+finish, 5 rounds after a warm-up):
+
+| model (bytes sent) | `nccl` backend, warm | `connex` backend, warm | `connex` first round | `trainer_init`: nccl / connex |
+|---|---|---|---|---|
+| Qwen2.5-0.5B (0.99 GB) | 0.097 s [0.092-0.101] | 0.299 s [0.255-0.316] | 1.32 s | 0.38 / 0.99 s |
+| Qwen2.5-1.5B (3.55 GB) | 0.201 s [0.200-0.203] | 0.613 s [0.604-0.624] | 1.25 s | 0.41 / 0.69 s |
+| Llama-3-8B (16.06 GB) | 0.798 s [0.796-0.800] | 2.149 s [2.125-2.168] | 3.15 s | 0.36 / 0.94 s |
+
+The engine answered after every run. Connex used one publisher buffer here
+(`buffers=1`; the default two did not fit next to the 8B trainer model on
+one A40).
+
+**GRPO with churn** (`examples/rl/grpo_churn.py`, Qwen2.5-0.5B-Instruct,
+trainer on one GPU, two engines, 8 prompts x 4 samples x up to 192 tokens per
+step, 8 steps). An engine is killed 1.5 s into step 3's rollouts and a new
+one joins at step 5.
+
+| | vLLM `main` (`--enforce-eager`) | SGLang 0.5.22 (Triton attention, CUDA graphs) |
+|---|---|---|
+| rollouts completed / failed | 256 / 0 | 256 / 0 |
+| weight versions per step's rollouts | exactly one in every step | exactly one in every step |
+| rollout time, steps without churn | 3.4-3.6 s | 0.64-1.19 s |
+| rollout time, step with the kill | 4.93 s (killed engine's requests re-run at the same version on the survivor) | 1.00 s (kill 1.0 s into the step) |
+| publish (pack + announce) | 0.02-0.04 s | 0.02-0.04 s |
+| pool update (drain + pull + load + commit) | 0.29-0.45 s | 0.23-0.36 s |
+| joining engine: process start to serving / of which the catch-up pull | 39.3 s / 0.6 s | 34.9 s / 1.7 s |
+
+The same vLLM run without churn: rollout time 3.3-3.6 s per step, pool
+update 0.41-0.45 s, 256 / 0. Rollouts here are decode-bound with few
+concurrent requests, so one engine finishes a step about as fast as two;
+the kill shows up only as the re-run of the killed engine's requests. The
+vLLM and SGLang rollout times are not comparable (vLLM ran eager, SGLang
+with CUDA graphs).
+
+**Correctness.** Into a running engine, three versions (original weights,
+weights with every MLP matrix halved, original again): vLLM 0.32.0 and
+`main` reproduce the startup greedy outputs after versions 1 and 3 and
+change after version 2. In SGLang 0.5.9, versions 1 and 3 give identical
+outputs and version 2 changes them (0.5.9 and 0.5.22); but the outputs
+after an in-place load of the original weights differ from the startup
+outputs in one near-tie token, and SGLang's own `update_weights_from_tensor`
+with the same tensors shows the same flip (checked on 0.5.9), so it is not
+specific to Connex. The same GRPO run on SGLang 0.5.9 (FlashInfer backends)
+also completed 256 / 0 with one version per step.
+
+## 9. Agent session migration
+
+`connex.agents` ([`agent-migration.md`](agent-migration.md)),
+`benchmarks/agents/migration_bench.py`. vLLM `main`, Qwen2.5-1.5B-Instruct,
+two engines on two A40s of one host (prefix caching on, 0.45 memory
+fraction), session proxy in the client process. Each session's context
+starts with a unique header, so no session reuses another's cached prefix.
+Next turn: 32 greedy tokens after the context plus the first answer.
+3 sessions per variant and length; mean [min-max].
+
+| context | next-turn TTFT, sticky | migrate, cut-over only: next-turn TTFT | migrate with re-prefill: migration time / next-turn TTFT |
+|---|---|---|---|
+| 8k tokens | 0.073 s [0.070-0.076] | 0.374 s [0.368-0.383] | 0.376 s / 0.137 s [0.120-0.146] |
+| 30k tokens | 0.179 s [0.176-0.183] | 1.874 s [1.859-1.884] | 1.887 s / 0.199 s [0.164-0.217] |
+
+The next turn's text was identical across the three variants at both
+lengths. With re-prefill the migration takes as long as a prefill on the
+target, but the session keeps running on the source during it, and the
+next turn on the target costs about as much as a sticky one.
+
+**In-flight generation migrated mid-stream** (256 greedy tokens, migration
+started at token 64, the target has nothing cached):
+
+| context | output identical to unmigrated | largest gap between tokens at the client | same, without migration |
+|---|---|---|---|
+| 8k, re-prefill | yes | 0.12 s | 0.03 s |
+| 30k, re-prefill (1.91 s prefill on the target, while the source keeps streaming) | yes | 0.17 s | 0.03 s |
+| 8k, cut-over only | yes | 0.39 s | 0.03 s |
+| 30k, cut-over only | yes | 1.90 s | 0.03 s |
+
+**SGLang 0.5.22**, same model, contexts and procedure. SGLang's completions
+API has no token-id logprobs, so the proxy resumes cut-over requests from
+text (`--text-resume`); the outputs were still identical in every case
+below. The servers ran with the Triton attention backend and the PyTorch
+sampler because the shared environment's flashinfer packages did not match.
+
+| context | next-turn TTFT, sticky | cut-over only: next-turn TTFT | re-prefill: migration time / next-turn TTFT |
+|---|---|---|---|
+| 8k tokens | 0.115 s [0.086-0.168] | 0.420 s [0.401-0.430] | 0.419 s / 0.087 s [0.084-0.091] |
+| 30k tokens | 0.183 s [0.154-0.200] | 3.119 s [3.074-3.146] | 3.069 s / 0.173 s [0.142-0.199] |
+
+| in-flight, 1024 greedy tokens, migrated at token 256 | identical | largest gap at the client (without migration) |
+|---|---|---|
+| 8k, re-prefill | yes | 0.09 s (0.01 s) |
+| 30k, re-prefill (3.14 s prefill on the target) | yes | 0.19 s (0.02 s) |
+| 8k, cut-over only | yes | 0.43 s (0.01 s) |
+| 30k, cut-over only | yes | 3.10 s (0.02 s) |
+
+Not covered: moving the KV itself (no `KVMover` ships yet), more than two
+instances, sampling (greedy only), chat requests (completions only in this
+benchmark), text resume with tokenizations that do not round-trip.
 
 ## How to reproduce
 

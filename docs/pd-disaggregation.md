@@ -100,7 +100,7 @@ Admin endpoints of the router: `GET /pd/pools`, `POST /pd/drain` and
 its own GPU), `benchmarks/pd/pd_bench.py` drives load (`load`), checks
 outputs against a non-disaggregated instance (`ref`, `check`) and scores them
 teacher-forced (`score`), and `benchmarks/pd/summarize.py` prints the tables
-in [`docs/results.md`](results.md#prefill-decode-disaggregation).
+in [`docs/results.md`](results.md#7-prefill-decode-disaggregation-on-upstream-vllm-and-sglang).
 
 ## Requirements and limits
 

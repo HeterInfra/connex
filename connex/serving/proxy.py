@@ -178,6 +178,9 @@ class Resumer:
         self.stop_reason = None
         self.attempts = 0
         self.sent_role = False
+        self.resp = None         # backend response of the running attempt
+        self.ep = None           # its endpoint
+        self.moved = False       # set by Proxy.move for a planned cutover
 
     # -- request construction -------------------------------------------------
     async def build(self, ep):
@@ -385,6 +388,7 @@ class Proxy:
         ep.inflight += 1
         try:
             async with self.session.post(ep.url + path, json=req) as r:
+                st.resp, st.ep = r, ep
                 if r.status != 200:
                     payload = await r.read()
                     if r.status >= 500 or r.status in (404, 408, 429) or base_k > 0:
@@ -436,6 +440,7 @@ class Proxy:
                     if watchdog is not None:
                         watchdog.cancel()
         finally:
+            st.resp = None
             ep.inflight -= 1
 
     async def _watchdog(self, r, last, fired):
@@ -477,6 +482,20 @@ class Proxy:
     async def generate(self, kind, body):
         """Async generator of client chunks for one request, with retry/resume."""
         st = self.resumer_cls(self, kind, body)
+        self.begin(st)
+        try:
+            async for c in self._generate(st):
+                yield c
+        finally:
+            self.end(st)
+
+    def begin(self, st):
+        """Hook: request ``st`` admitted (subclasses track it)."""
+
+    def end(self, st):
+        """Hook: request ``st`` finished, failed or was cancelled."""
+
+    async def _generate(self, st):
         path = "/v1/chat/completions" if st.chat else "/v1/completions"
         self.stats["requests"] += 1
         tried = []
@@ -485,7 +504,7 @@ class Proxy:
             if st.remaining() is not None and st.remaining() <= 0 and st.k > 0:
                 st.finish = st.finish or "length"
                 break
-            ep = self.pool.pick(exclude=tried) or self.pool.pick()
+            ep = self.pick(st, tried)
             if ep is None:
                 break
             st.attempts += 1
@@ -500,6 +519,13 @@ class Proxy:
             except HTTPPassthrough:
                 raise
             except (StreamBroken, ValueError, KeyError, *RETRYABLE) as e:
+                if st.moved:
+                    # planned cutover (migration): not a failure; resume on the
+                    # new placement without blacklisting or using up an attempt
+                    st.moved = False
+                    st.attempts -= 1
+                    self.stats["moves"] = self.stats.get("moves", 0) + 1
+                    continue
                 last_err = f"{type(e).__name__}: {e}"
                 if isinstance(e, asyncio.TimeoutError):
                     last_err = f"idle > {self.idle_timeout}s"
@@ -518,6 +544,22 @@ class Proxy:
                     break
         self.stats["failed"] += 1
         raise UpstreamFailed(last_err, st)
+
+    def pick(self, st, tried):
+        """Replica for the next attempt of ``st``; subclasses (session-aware
+        routing, connex.agents) override this."""
+        return self.pool.pick(exclude=tried) or self.pool.pick()
+
+    def move(self, st):
+        """Cut ``st``'s current attempt over: close its backend stream (the
+        engine aborts the request) and resume it on ``pick``'s next answer
+        with the tokens emitted so far. Returns False if nothing is in flight."""
+        r = st.resp
+        if r is None or not st.can_resume():
+            return False
+        st.moved = True
+        r.close()
+        return True
 
     # -- HTTP handlers ----------------------------------------------------------
     async def handle_completions(self, request):

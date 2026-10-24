@@ -60,9 +60,13 @@ setup(
             "connex-directory=connex.directory_server:main",
             "connex-pd-router=connex.serving.pd_router:main",
         ],
-        # PD disaggregation on upstream engines, no fork: vLLM finds the
-        # ConnexConnector by name, SGLang gets the "connex" transfer backend.
-        "vllm.general_plugins": ["connex_pd = connex.adapters.vllm.plugin:register"],
+        # Upstream engines, no fork: vLLM finds the ConnexConnector by name and
+        # the "connex" weight-transfer backend; SGLang gets the "connex"
+        # disaggregation transfer backend.
+        "vllm.general_plugins": [
+            "connex_pd = connex.adapters.vllm.plugin:register",
+            "connex_rl = connex.rl.vllm_plugin:register",
+        ],
         "sglang.srt.plugins": ["connex = connex.adapters.sglang.pd_backend:register"],
     },
     classifiers=[
