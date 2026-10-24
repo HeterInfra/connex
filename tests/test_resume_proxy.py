@@ -316,3 +316,16 @@ def test_batch_prompt_not_resumed():
             assert "error" in chunks[-1]                # cut, but visibly
             assert rig.proxy.stats["resumes"] == 0
     run(go())
+
+
+def test_logprobs_zero_is_passed_through():
+    """logprobs=0 (token ids only, no alternatives) is a logprobs request:
+    0 == False must not make the proxy strip the client's logprobs."""
+    async def go():
+        async with Rig(1) as r:
+            st, chunks = await r.stream("/v1/completions",
+                                        comp_body(logprobs=0, return_tokens_as_token_ids=True))
+            assert st == 200
+            lps = [c["choices"][0]["logprobs"] for c in chunks if c.get("choices")]
+            assert lps and all(lp and lp["tokens"][0].startswith("token_id:") for lp in lps)
+    run(go())

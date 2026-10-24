@@ -59,7 +59,7 @@ release:
 | Failover with in-flight handover across replicas | step contract, fast handover, state hooks, resume proxy | implemented and validated for pipeline stages |
 | Migration (same LID, new address) | re-registration events, versioned routes | implemented, partly unit-tested, not validated at scale |
 | Heterogeneous transports / hardware | ConnexTE (Mooncake RDMA/TCP), UCX, ZeroMQ, capability negotiation | transports validated; mixed GPU types not validated |
-| Prefill-decode disaggregation (prefill and decode pools) | PD roles in LIDs, role lookup, KV block transfer manager | primitives available and unit-tested; engine integration on the roadmap |
+| Prefill-decode disaggregation (prefill and decode pools) | PD roles in LIDs, membership, KV holds and pulls (`connex.pd`), vLLM connector, SGLang backend, PD router | implemented and validated on upstream vLLM 0.32.0 and SGLang 0.5.22 on one host (`pd-disaggregation.md`) |
 | Attention-FFN disaggregation | generic primitives | roadmap |
 
 Pipeline parallelism came first because it stresses every primitive: a

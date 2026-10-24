@@ -1,6 +1,8 @@
 # Results
 
-This page collects the measurements behind Connex v0.1.0 on a vLLM pipeline:
+This page collects the measurements behind Connex v0.1.0 on a vLLM pipeline
+(sections 1-6) and prefill-decode disaggregation on upstream vLLM and SGLang
+(section 7):
 steady-state latency and throughput with one and four pipeline steps in
 flight, correctness and latency of in-flight request handover when a
 downstream stage dies, goodput while a replica churns (with and without the
@@ -261,6 +263,95 @@ when an RDMA device is usable.
 Not covered: node loss or a network partition (no RST), where detection
 falls back to the transport heartbeat (1 s / 3 s) or the router lease plus
 probe.
+
+## 7. Prefill-decode disaggregation on upstream vLLM and SGLang
+
+Setup: one host, 4x A40 (48 GB), ConnectX HDR InfiniBand (GPUDirect RDMA
+through the NIC loopback), Llama-3-8B (bf16), each instance on its own GPU,
+`max_model_len` 4096. vLLM 0.32.0 (PyPI wheel, torch 2.13 cu130) with the
+Connex `ConnexConnector` (connex-rs data plane) or vLLM's NixlConnector (NIXL
+1.5, separate environment); SGLang 0.5.22 (torch 2.14 cu130, Triton attention,
+page size 16) with the `connex` or the built-in `mooncake` transfer backend.
+The same Connex PD router (`connex.serving.pd_router`) fronts every
+configuration. Load: `benchmarks/pd/pd_bench.py`, token-id prompts of 1024
+tokens, 128 greedy output tokens (`ignore_eos`), Poisson arrivals for
+60 s at each QPS, then 128 requests from 32 closed-loop clients. Single runs.
+
+**Steady state, 1P1D.** Connex is on par with each engine's own transfer
+path:
+
+| engine / transfer | load | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) | E2E mean / p99 (s) | tok/s |
+|---|---|---|---|---|---|
+| vLLM, Connex | QPS 1 | 354 / 537 | 31 / 33 | 4.31 / 4.55 | 128 |
+| vLLM, NIXL | QPS 1 | 352 / 594 | 31 / 33 | 4.31 / 4.60 | 128 |
+| vLLM, Connex | QPS 2 | 364 / 630 | 32 / 34 | 4.48 / 4.86 | 215 |
+| vLLM, NIXL | QPS 2 | 363 / 630 | 32 / 34 | 4.49 / 4.88 | 216 |
+| vLLM, Connex | QPS 4 | 471 / 1003 | 36 / 38 | 5.06 / 5.70 | 459 |
+| vLLM, NIXL | QPS 4 | 456 / 996 | 36 / 38 | 5.04 / 5.69 | 459 |
+| vLLM, Connex | QPS 6 | 734 / 2090 | 38 / 40 | 5.69 / 7.14 | 694 |
+| vLLM, NIXL | QPS 6 | 711 / 2018 | 38 / 40 | 5.65 / 7.01 | 694 |
+| vLLM, Connex | 32 clients | 625 / 4939 | 38 / 38 | 5.85 / 9.73 | 639 |
+| vLLM, NIXL | 32 clients | 573 / 4751 | 38 / 38 | 5.79 / 9.54 | 646 |
+| SGLang, Connex | QPS 1 | 214 / 460 | 31 / 32 | 4.15 / 4.37 | 128 |
+| SGLang, Mooncake | QPS 1 | 213 / 455 | 31 / 33 | 4.16 / 4.38 | 128 |
+| SGLang, Connex | QPS 2 | 224 / 500 | 32 / 33 | 4.31 / 4.70 | 216 |
+| SGLang, Mooncake | QPS 2 | 221 / 500 | 32 / 33 | 4.31 / 4.71 | 216 |
+| SGLang, Connex | QPS 4 | 339 / 1098 | 36 / 37 | 4.90 / 5.75 | 460 |
+| SGLang, Mooncake | QPS 4 | 338 / 1256 | 36 / 37 | 4.92 / 5.83 | 460 |
+| SGLang, Connex | QPS 6 | 998 / 2638 | 39 / 63 | 6.33 / 10.08 | 694 |
+| SGLang, Mooncake | QPS 6 | 1041 / 2604 | 38 / 55 | 6.18 / 8.44 | 694 |
+| SGLang, Connex | 32 clients | 689 / 4952 | 38 / 38 | 6.04 / 9.76 | 617 |
+| SGLang, Mooncake | 32 clients | 1042 / 4872 | 38 / 38 | 6.18 / 9.69 | 601 |
+
+At QPS 6 the single prefill GPU is saturated and run-to-run noise dominates
+(single runs). The vLLM rows have about 140 ms more TTFT than the SGLang rows
+because the vLLM protocol runs prefill and decode one after the other (the
+decode request is sent when the prefill response arrives), while SGLang runs
+them concurrently; this is the same for NIXL and Connex.
+
+**Correctness.** 48 natural-language prompts, 128 greedy tokens, teacher-forced
+on a non-disaggregated vLLM instance (`pd_bench.py score`, a token counts as
+wrong if it is more than 0.5 nats below the argmax given its own prefix):
+
+| configuration | tokens | off argmax | exact match vs non-disaggregated |
+|---|---|---|---|
+| vLLM 1P1D, concurrency 1 | 6,144 | 0 | 28 / 48 |
+| vLLM 1P1D, concurrency 8 | 6,144 | 0 | 33 / 48 |
+| vLLM 2P2D, concurrency 8 | 6,144 | 0 | not compared |
+| SGLang 1P1D, concurrency 8 | 6,144 | 0 | 30 / 48 |
+
+Exact match is not the criterion: the non-disaggregated vLLM instance against
+itself at concurrency 1 and 8 matches on 30 of 48 prompts (SGLang: 25 of 48),
+because batching changes floating-point results and greedy decoding diverges
+at near-ties.
+
+**Failures and scaling under load** (Connex connector / backend; 240 requests
+at QPS 2, 1024-token prompts, 256 output tokens unless noted; every generated
+token of every run scored as above; "stall" is the longest gap between two
+tokens of any request in the run, i.e. kill to next token for the resumed
+requests):
+
+| scenario | completed | router actions | off argmax | TTFT p99 / E2E p99 |
+|---|---|---|---|---|
+| vLLM 1P2D, one decode SIGKILLed at 30 s (3 runs) | 240 / 240 in each | 9 resumed on the other decode in each run, by re-pulling the held KV (0 extra prefills) | 0 / 61,440 in each | 0.87 s / 10.5 s; stall 0.63 s (run 3) |
+| SGLang 1P2D, one decode SIGKILLed at 30 s | 240 / 240 | 8 resumed on the other decode with a new prefill (SGLang pushes KV: nothing to re-pull) | 0 / 61,440 | 0.65 s / 14.6 s; stall 0.53 s |
+| vLLM 2P1D, one prefill SIGKILLed at 30 s (3000-token prompts, QPS 3, 128 tokens) | 240 / 240 | 1 prefill retried on the other prefill | 0 / 30,720 | 14.9 s / 19.4 s (one prefill left for QPS 3) |
+| vLLM 2P1D, prefill killed while its transfer is pending (3 runs, pull delayed 3 s by fault injection) | 3 / 3 | KV load failed on decode, prefilled again on the other prefill | n/a | E2E 9.8 s (3 s injected delay twice, plus a 3 s control timeout; now 1 s) |
+| vLLM 2P2D, one decode killed at 40 s, one prefill at 80 s (2048-token prompts) | 240 / 240 | 11 resumed, 11 re-pulls, 0 extra prefills | 0 / 61,440 | 1.23 s / 12.4 s |
+| vLLM prefill pool: add a prefill at 20 s, drain the original at 50 s, stop it at 80 s | 240 / 240 | none needed | 0 / 61,440 | 0.67 s / 10.6 s |
+| vLLM decode pool: add a decode at 20 s, drain the original at 50 s, stop it at 80 s | 240 / 240 | none needed | 0 / 61,440 | 0.71 s / 10.5 s |
+
+Reproduce: `benchmarks/pd/local_pd.py` starts a deployment (e.g.
+`--prefill-gpus 1 --decode-gpus 2,3 --model <llama3-8b>`; `--connector nixl`
+with an environment that has NIXL; `--engine sglang --connector connex|mooncake`),
+then `pd_bench.py ref/check/load/score` against the router on port 8000 and
+`summarize.py`. Kill an instance with `kill -9` on its process group; scale by
+editing the `prefill.txt` / `decode.txt` pool files (`--pool-files`) or with
+`POST /pd/drain`.
+
+Not covered for PD: instances on different hosts (RDMA across nodes), tensor
+parallelism > 1, MLA or hybrid KV caches, front-router membership under real
+failures (unit-tested only), and repeated runs for the steady-state table.
 
 ## How to reproduce
 

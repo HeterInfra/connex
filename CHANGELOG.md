@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+**Prefill-decode disaggregation on upstream vLLM and SGLang (no fork)**
+- `connex.pd`: engine-neutral KV transfer with renewable holds (the prefill
+  instance keeps a request's KV under a transfer id until the decode instance
+  releases it or a lease expires), pulls with one-sided reads over connex-rs
+  or Mooncake, per-request failure reporting, PD pool membership in the
+  front-router.
+- vLLM: `ConnexConnector` (`connex.adapters.vllm.pd_connector`), a
+  KVConnectorBase_V1 loaded with `kv_connector_module_path` or by name via the
+  `vllm.general_plugins` entry point. A request whose decode instance dies is
+  resumed on another decode instance that pulls the held prompt KV again.
+- SGLang: `connex` disaggregation transfer backend (SGLang's Mooncake protocol
+  over connex-rs), registered at import time by the `sglang.srt.plugins` entry
+  point.
+- `connex.serving.pd_router` (`connex-pd-router`): prefill then decode (vLLM,
+  also with NixlConnector) or paired by bootstrap room (SGLang); elastic pools
+  from URLs, files or the front-router; retries failed prefills, re-prefills
+  failed hand-offs, resumes decode failures.
+- Validated on vLLM 0.32.0 and SGLang 0.5.22 with Llama-3-8B on one 4-GPU A40
+  host: on par with NIXL and Mooncake in steady state, no off-argmax tokens,
+  every request completed under decode/prefill kills and pool scaling
+  (`docs/results.md` section 7, `docs/pd-disaggregation.md`). Not validated
+  across hosts, with TP > 1 or with MLA/hybrid KV.
+- Resume proxy: `logprobs: 0` is passed through (it was stripped because
+  `0 == False`); error events inside a 200 stream fail the attempt; token ids
+  are requested with `return_token_ids` (SGLang); `Proxy.resumer_cls` and an
+  abort hook for subclasses.
+- Benchmarks: `benchmarks/pd/` (local deployment, load/check/score, tables).
+
 ## 0.1.0
 
 First public release of Connex, a communication library for distributed AI

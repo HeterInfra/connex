@@ -220,6 +220,117 @@ class FakeBackend:
         return resp
 
 
+class FakePDBackend(FakeBackend):
+    """Fake prefill or decode instance for the PD router (``role`` = "prefill"
+    | "decode"). Instances of one deployment share ``kv`` (transfer id ->
+    held prompt ids and owner), standing in for the Connex KV connector:
+
+    * prefill: a request with ``kv_transfer_params.do_remote_decode`` stores
+      its prompt under the transfer id and returns ``kv_transfer_params``.
+    * decode: a request with ``do_remote_prefill`` "pulls" the held prompt;
+      it fails with HTTP 500 (vLLM's ``kv_load_failure_policy="fail"``) if the
+      hold is gone, the owner is down (``alive`` False) or the held ids are
+      not a prefix of the request's prompt (that would be wrong KV).
+    """
+
+    def __init__(self, role, kv, **kw):
+        super().__init__(**kw)
+        self.role = role
+        self.kv = kv
+        self.alive = True
+        self.prefills = 0
+        self.pulls = 0
+        self.url = None
+
+    async def start(self, port=0, host="127.0.0.1"):
+        self.url = await super().start(port, host)
+        self.alive = True
+        return self.url
+
+    async def stop(self):
+        self.alive = False
+        await super().stop()
+
+    async def _generate(self, req, b, ids, chat):
+        p = b.get("kv_transfer_params") or {}
+        if self.role == "prefill" and p.get("do_remote_decode"):
+            fail = self._take_fail()
+            if fail and fail[0] == "http500":
+                return web.json_response({"error": "boom"}, status=500)
+            if fail and fail[0] in ("reset", "stall"):
+                if fail[0] == "stall":
+                    await asyncio.sleep(3600)
+                req.transport.abort()
+                return web.Response()
+            self.prefills += 1
+            tid = p["transfer_id"]
+            self.kv[tid] = {"ids": list(ids), "owner": self}
+            return web.json_response({
+                "id": "cmpl-p", "object": "text_completion", "created": int(time.time()),
+                "model": self.model,
+                "choices": [{"index": 0, "text": detok(next_token(ids)), "finish_reason": "length"}],
+                "usage": {"prompt_tokens": len(ids), "completion_tokens": 1,
+                          "total_tokens": len(ids) + 1},
+                "kv_transfer_params": {"do_remote_prefill": True, "do_remote_decode": False,
+                                       "transfer_id": tid, "remote_ctrl": self.url,
+                                       "remote_num_tokens": len(ids)}})
+        if self.role == "decode":
+            if not p.get("do_remote_prefill"):
+                return web.json_response({"error": "decode instance needs kv_transfer_params"},
+                                         status=400)
+            held = self.kv.get(p.get("transfer_id"))
+            n = p.get("remote_num_tokens", 0)
+            if (held is None or not held["owner"].alive or held["ids"] != ids[:n]
+                    or len(held["ids"]) != n):
+                return web.json_response({"error": "KV load failed"}, status=500)
+            self.pulls += 1
+        return await super()._generate(req, b, ids, chat)
+
+
+class FakeSGLangPDBackend(FakeBackend):
+    """Fake SGLang PD instance: the router sends the request to a prefill and
+    a decode instance concurrently with ``bootstrap_room``; the decode waits
+    (up to ``wait_s``) for the prefill to publish the room in the shared
+    ``rooms`` dict, and fails if it does not or if the prefill is down."""
+
+    def __init__(self, role, rooms, wait_s=2.0, **kw):
+        super().__init__(**kw)
+        self.role, self.rooms, self.wait_s = role, rooms, wait_s
+        self.alive = True
+        self.prefills = 0
+
+    async def start(self, port=0, host="127.0.0.1"):
+        self.url = await super().start(port, host)
+        self.alive = True
+        return self.url
+
+    async def stop(self):
+        self.alive = False
+        await super().stop()
+
+    async def _generate(self, req, b, ids, chat):
+        room = b.get("bootstrap_room")
+        if room is None:
+            return web.json_response({"error": "bootstrap_room required"}, status=400)
+        if self.role == "prefill":
+            fail = self._take_fail()
+            if fail and fail[0] == "http500":
+                return web.json_response({"error": "boom"}, status=500)
+            self.prefills += 1
+            self.rooms[room] = (list(ids), self)
+            b = {**b, "stream": False, "max_tokens": 1}
+            return await super()._generate(req, b, ids, chat)
+        t0 = time.monotonic()
+        while room not in self.rooms:
+            if time.monotonic() - t0 > self.wait_s:
+                return web.json_response({"error": "KV transfer timed out"}, status=500)
+            await asyncio.sleep(0.005)
+        held, owner = self.rooms[room]
+        if held != ids or not owner.alive:
+            return web.json_response({"error": "KV transfer failed"}, status=500)
+        return await super()._generate(req, b, ids, chat)
+
+
 def reference(prompt, max_tokens):
     """Uninterrupted greedy output of the fake model for a completion: (ids, text)."""
     seq = tokenize(prompt) if isinstance(prompt, str) else list(prompt)
