@@ -19,6 +19,7 @@ class FakeTransfer:
 class FakeEngine:
     def __init__(self, model, stage, shard, replica, **kw):
         self.local_url = f"{kw['listen_ip']}:5000#{model}|{stage}|{shard}|{replica}"
+        self.connected = []
         self.puts, self.regions, self.fail_after = [], {}, None
 
     def register_memory(self, ptr, n):
@@ -38,6 +39,7 @@ class FakeEngine:
         return 0
 
     def connect(self, url):
+        self.connected.append(url)
         if "dead" in url:
             raise RuntimeError("unreachable")
 
@@ -58,21 +60,29 @@ def engine():
     return ConnexRsTransferEngine("10.0.0.1", "prefill", gpu_id=2, engine_cls=FakeEngine)
 
 
-def test_session_id_is_the_logical_endpoint_url():
+def test_session_id_is_host_port_and_maps_back_to_the_identity():
+    """SGLang parses session ids as host:port; the connex-rs identity of a
+    peer is rebuilt from it (the port is the replica index)."""
     e = engine()
-    assert e.get_session_id().startswith("10.0.0.1:5000#sglang-pd|1000|2|")
+    assert e.url.startswith("10.0.0.1:5000#sglang-pd|1000|0|")
+    assert e.get_session_id() == "10.0.0.1:5000"
+    assert e.peer_url("10.0.0.2:5123") == "10.0.0.2:5123#sglang-pd|1001|0|5123"
     assert e.batch_register([1, 2], [10, 20]) == 0 and e.engine.regions == {1: 10, 2: 20}
 
 
 def test_batch_writes_are_posted_together_and_failures_reported():
     e = engine()
     n = 1 << 16
-    assert e.batch_transfer_sync("peer", [1, 2, 3], [11, 12, 13], [n, n, n]) == 0
+    assert e.batch_transfer_sync("10.0.0.2:5123", [1, 2, 3], [11, 12, 13], [n, n, n]) == 0
     assert [p[1:] for p in e.engine.puts] == [(1, 11, n), (2, 12, n), (3, 13, n)]
-    assert e.batch_transfer_sync("peer", [1], [2], [100]) == -4   # below zero-copy size
+    assert e.batch_transfer_sync("10.0.0.2:5123", [1], [2], [100]) == 0    # host memory: fine
+    e.device_regions.append((1, 1 << 20))
+    assert e.batch_transfer_sync("10.0.0.2:5123", [1], [2], [100]) == -4   # GPU, below zero-copy
+    e.device_regions.clear()
     e.engine.puts, e.engine.fail_after = [], 1
-    assert e.batch_transfer_sync("peer", [1, 2], [11, 12], [n, n]) < 0
-    assert e.send_probe("10.0.0.2:1#x|1|0|0") == 0 and e.send_probe("dead:1#x|1|0|0") == -1
+    assert e.batch_transfer_sync("10.0.0.2:5123", [1, 2], [11, 12], [n, n]) < 0
+    assert e.send_probe("10.0.0.2:1") == 0 and e.send_probe("dead:1") == -1
+    assert e.engine.connected[0] == "10.0.0.2:1#sglang-pd|1001|0|1"
 
 
 def test_plugin_registers_connex_backend():

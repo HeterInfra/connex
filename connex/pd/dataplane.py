@@ -42,6 +42,24 @@ class KVDataPlane(Protocol):
     def close(self) -> None: ...
 
 
+_CU = None
+
+
+def is_device_ptr(ptr: int) -> bool:
+    """True when ``ptr`` is CUDA device memory (cuPointerGetAttribute)."""
+    global _CU
+    if _CU is None:
+        try:
+            _CU = ctypes.CDLL("libcuda.so.1")
+        except OSError:
+            _CU = False
+    if not _CU:
+        return False
+    t = ctypes.c_uint(0)
+    rc = _CU.cuPointerGetAttribute(ctypes.byref(t), 2, ctypes.c_ulonglong(ptr))  # MEMORY_TYPE
+    return rc == 0 and t.value == 2   # CU_MEMORYTYPE_DEVICE
+
+
 def _make_cuda_ctx_current() -> None:
     """Make this thread's CUDA context current before connex-rs captures it.
 

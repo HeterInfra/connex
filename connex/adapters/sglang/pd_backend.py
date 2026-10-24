@@ -35,7 +35,6 @@ from __future__ import annotations
 import logging
 import os
 import threading
-import zlib
 from typing import List
 
 log = logging.getLogger("connex.pd.sglang")
@@ -67,25 +66,40 @@ class ConnexRsTransferEngine:
             nd = ucx_net_devices_for_ip(hostname) if nd == "auto" else nd
             if nd:
                 os.environ["UCX_NET_DEVICES"] = nd
-        replica = int(os.getenv("CONNEX_PD_REPLICA",
-                                zlib.crc32(f"{hostname}:{os.getpid()}".encode()) & 0x7FFFFFF))
-        port = int(os.getenv("CONNEX_RS_PORT", "0"))
-        self.engine = engine_cls("sglang-pd", PD_STAGE.get(role, 1001), gpu_id, replica,
-                                 listen_ip=hostname, port=port + gpu_id if port else 0,
+        # SGLang parses session ids as host:port, so the logical identity of
+        # an endpoint is derived from its address: (sglang-pd, role, 0, port).
+        # A peer's URL is then rebuilt from the session id alone.
+        base = int(os.getenv("CONNEX_RS_PORT", "0"))
+        port = base + gpu_id if base else _free_port(hostname)
+        self.role_stage = PD_STAGE.get(role, 1001)
+        self.engine = engine_cls("sglang-pd", self.role_stage, 0, port,
+                                 listen_ip=hostname, port=port,
                                  heartbeat_ms=int(os.getenv("CONNEX_RS_HEARTBEAT_MS", "1000")),
                                  heartbeat_timeout_ms=int(os.getenv("CONNEX_RS_HEARTBEAT_TIMEOUT_MS",
                                                                     "3000")))
-        self.session_id = self.engine.local_url
+        self.url = self.engine.local_url
+        self.session_id = self.url.split("#", 1)[0]
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.timeout_ms = timeout_ms
         self.min_len = int(os.environ["UCX_ZCOPY_THRESH"]) if os.environ[
             "UCX_ZCOPY_THRESH"].isdigit() else 0
         self._lock = threading.Lock()
+        self.device_regions: list[tuple[int, int]] = []   # GPU memory: no short writes
         log.info("connex-rs transfer engine at %s", self.session_id)
 
     # -- memory ------------------------------------------------------------------
+    def _note(self, ptr, length):
+        from connex.pd.dataplane import is_device_ptr
+
+        if is_device_ptr(ptr):
+            self.device_regions.append((ptr, length))
+
+    def _on_device(self, ptr) -> bool:
+        return any(s <= ptr < s + n for s, n in self.device_regions)
+
     def register(self, ptr, length) -> None:
+        self._note(ptr, length)
         rc = self.engine.register_memory(ptr, length)
         if rc != 0:
             raise RuntimeError(f"connex-rs memory registration failed (ret={rc})")
@@ -96,6 +110,7 @@ class ConnexRsTransferEngine:
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
         rc = 0
         for p, n in zip(ptrs, lengths):
+            self._note(p, n)
             rc = self.engine.register_memory(p, n) or rc
         return rc
 
@@ -106,14 +121,24 @@ class ConnexRsTransferEngine:
         return rc
 
     # -- transfers (prefill writes into decode memory) ----------------------------
+    @staticmethod
+    def peer_url(session_id: str, stage: int = 1001) -> str:
+        """connex-rs URL of the peer behind an SGLang session id (host:port).
+        Transfers go from prefill to decode, so peers are decode endpoints."""
+        if "#" in session_id:
+            return session_id
+        port = session_id.rsplit(":", 1)[1]
+        return f"{session_id}#sglang-pd|{stage}|0|{port}"
+
     def transfer_sync(self, session_id: str, buffer: int, peer_buffer_address: int,
                       length: int) -> int:
-        return self.engine.transfer_sync_write(session_id, buffer, peer_buffer_address, length,
+        return self.engine.transfer_sync_write(self.peer_url(session_id), buffer, peer_buffer_address, length,
                                                self.timeout_ms)
 
     def batch_transfer_sync(self, session_id: str, buffers: List[int],
                             peer_buffer_addresses: List[int], lengths: List[int]) -> int:
-        short = [n for n in lengths if n < self.min_len]
+        short = [n for b, n in zip(buffers, lengths)
+                 if n < self.min_len and self._on_device(b)]
         if short:
             # below UCX's zero-copy threshold the write is a CPU copy from GPU
             # memory (segfault); use --page-size >= 16 so pages are large enough
@@ -128,9 +153,10 @@ class ConnexRsTransferEngine:
                     return rc
             return 0
         handles, rc = [], 0
+        url = self.peer_url(session_id)
         try:
             for b, p, n in zip(buffers, peer_buffer_addresses, lengths):
-                handles.append(put(session_id, b, p, n, self.timeout_ms))
+                handles.append(put(url, b, p, n, self.timeout_ms))
         except Exception as e:  # noqa: BLE001
             log.warning("connex-rs: posting writes to %s failed: %s", session_id, e)
             rc = -2
@@ -148,7 +174,7 @@ class ConnexRsTransferEngine:
 
     def send_probe(self, peer_session_id: str) -> int:
         try:
-            self.engine.connect(peer_session_id)
+            self.engine.connect(self.peer_url(peer_session_id))
             return 0
         except Exception:  # noqa: BLE001
             return -1
@@ -158,6 +184,14 @@ class ConnexRsTransferEngine:
 
     def get_ib_device(self):
         return os.getenv("UCX_NET_DEVICES", "")
+
+
+def _free_port(host: str) -> int:
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("", 0))   # any interface: the port must just be free
+        return s.getsockname()[1]
 
 
 _ENGINE = None
@@ -241,10 +275,23 @@ def _extend_enum(enum_cls, name: str, value: str):
     return member
 
 
+def _native_backend(du) -> bool:
+    """This SGLang ships the connex backend itself (upstreamed)."""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("sglang.srt.disaggregation.connex") is not None
+    except ImportError:
+        return False
+
+
 def register() -> None:
     """``sglang.srt.plugins`` entry point: make ``connex`` a transfer backend."""
     import sglang.srt.disaggregation.utils as du
 
+    if "connex" in du.TransferBackend._value2member_map_ and not getattr(
+            du.get_kv_class, "_connex", False) and _native_backend(du):
+        return   # this SGLang has the backend built in
     try:
         from sglang.srt.arg_groups.choices import (
             DISAGG_TRANSFER_BACKEND_CHOICES,
