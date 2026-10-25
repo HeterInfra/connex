@@ -113,6 +113,14 @@ class ConnexRsTransport:
             nd = ucx_net_devices_for_ip(ip)
             if nd:
                 os.environ["UCX_NET_DEVICES"] = nd
+        # Small messages stay bcopy, as in the PD data plane. Without a
+        # registration cache (vLLM workers import OpenCV, which keeps UCX from
+        # installing its memory hooks) the zero-copy threshold collapses, and
+        # across hosts UCX then sends connex-rs's 1-byte heartbeat (a static
+        # read-only buffer) zero-copy: registering it fails and the sender
+        # segfaults during wire-up (seen on the first cross-host expert move).
+        from connex.pd.dataplane import ZCOPY_THRESH
+        os.environ.setdefault("UCX_ZCOPY_THRESH", str(ZCOPY_THRESH))
         model, stage, shard, replica = lid
         self.e = connex_rs.Engine(model, stage, shard, replica, listen_ip=listen_ip,
                                   port=port, advertise_ip=ip,

@@ -258,3 +258,33 @@ def test_stale_controller_is_refused_not_silently_ignored():
     fresh.table.epoch = eng.view["epoch"]          # adopt the engine's epoch
     fresh.drain_rank(0)
     assert eng.view["epoch"] == fresh.table.epoch
+
+
+def test_rank_death_watcher_fails_the_group_of_a_dead_remote_rank(tmp_path):
+    from connex.ep.groups import EPGroup, EPGroupSupervisor, RankDeathWatcher
+
+    class Engine:
+        def __init__(self):
+            self.connected = []
+
+        def connect(self, url):
+            self.connected.append(url)
+
+    sup = EPGroupSupervisor([EPGroup("a", "http://h1:1"), EPGroup("b", "http://h2:2")],
+                            str(tmp_path / "eps"))
+    w = RankDeathWatcher(sup, engine=Engine())
+    w.watch("a", ["10.0.0.1:5#connex-ep|0|0|0", "10.0.0.2:6#connex-ep|0|1|0"])
+    w.watch("b", ["10.0.0.1:7#connex-ep|0|0|1", "10.0.0.2:8#connex-ep|0|1|1"])
+    assert len(w.engine.connected) == 4
+    up = lambda r, g: {"type": "up", "peer": ["connex-ep", 0, r, g]}        # noqa: E731
+    dead = lambda r, g, why="reset": {"type": "failed", "peer": ["connex-ep", 0, r, g],  # noqa: E731
+                                      "reason": why}
+    for r in (0, 1):
+        for g in (0, 1):
+            w.handle(up(r, g))
+    assert w.handle(dead(1, 0, "timeout")) is None           # suspicion only
+    assert sup.groups["a"].state == "up"
+    assert w.handle(dead(1, 0)) == "a"                        # rank 1 of group a (remote host)
+    assert sup.groups["a"].state == "down" and sup.groups["b"].state == "up"
+    assert open(tmp_path / "eps").read().split() == ["http://h2:2"]
+    assert w.handle(dead(0, 0)) is None                       # group already out

@@ -74,7 +74,7 @@ def test_decode_pulls_prompt_and_releases_on_finish():
         ("10.0.0.1:17100", "T", [20, 21, 22], 0)
     assert r.kv_transfer_params["do_remote_prefill"] is False   # one transfer per scheduling
     assert c.request_finished(r, ([20, 21, 22],)) == (False, None)
-    assert c.build_connector_meta(None).releases == [("10.0.0.1:17100", "T")]
+    assert c.build_connector_meta(None).releases == [("10.0.0.1:17100", "T", 0)]
 
 
 def test_resumed_request_loads_prompt_prefix_and_skips_local_hit():

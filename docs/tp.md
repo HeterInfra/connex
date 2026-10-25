@@ -151,8 +151,12 @@ python benchmarks/pp/local_pp.py --image connex-vllm:dev --model /models/Llama-3
 
 ## Limits
 
-* Validated on one host (4x A40, ConnectX InfiniBand loopback); TP across
-  hosts and pipelines over RDMA between hosts with TP stages are not.
+* PD with TP groups is validated on one host and across hosts (prefill and
+  decode groups on different A40 nodes over 100 Gb InfiniBand: TP 2 -> 2,
+  2 -> 1, 1 -> 2 correct, steady state on par with one host, group failure
+  out in 0.3-0.5 s; [results section 12](results.md#12-across-hosts-and-mixed-gpus)).
+  Not validated: a TP group that itself spans nodes for PD, and pipelines
+  over RDMA between hosts with TP stages.
 * KV heads must divide evenly by both TP sizes (no replicated KV heads, e.g.
   TP 16 with 8 KV heads); MLA and hybrid caches are not covered.
 * NIXL could not be compared at TP 2: vLLM's NixlConnector (NIXL 1.5 in its
