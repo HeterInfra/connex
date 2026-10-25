@@ -126,6 +126,15 @@ the fork's extensions fail to load `libcudart`.
 | `CONNEXTE_PROFILE` / `CONNEXTE_PROFILE_EVERY` | `0` / `64` | per-phase timing logs |
 | `CONNEXTE_TRACE` | empty | directory for per-step send/recv traces |
 
+### PD KV transfer (`connex.pd`, vLLM connector and SGLang backend)
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CONNEX_PD_BACKEND` | `auto` | KV data plane: `auto` (connex-rs if installed and an RDMA device exists, else Mooncake), `connex-rs`, `mooncake`, `loopback` (tests) |
+| `CONNEX_PD_HOST_STAGING` | `auto` | `auto`: stage KV through a pinned host mirror when the host has no GPUDirect RDMA driver (`nvidia_peermem`) or the plane refuses GPU memory; `1`: always; `0`: never (fail instead). Costs one PCIe copy per side and pinned host memory the size of the registered KV cache |
+| `CONNEX_RS_NET_DEVICES` | `auto` | as above (`UCX_NET_DEVICES` for the KV plane) |
+| `CONNEX_RS_CUDA_IPC` | `0` | allow UCX CUDA IPC between instances on one host (off: a reader's mapping keeps a dead peer's GPU memory allocated) |
+
 ### Connex UCX data plane (`connex_communicator.py`, `connex.ucx_transport`)
 
 | Variable | Default | Meaning |
@@ -172,6 +181,7 @@ the fork's extensions fail to load `libcudart`.
 | `benchmarks/k8s/closed_loop.py` | closed-loop throughput |
 | `benchmarks/k8s/failover_correctness.py` | greedy-output correctness across a downstream kill |
 | `benchmarks/k8s/hop_profile.py` | per-hop communication cost per decode step |
+| `benchmarks/pd/local_pd.py`, `tp_experiments.py` | PD deployments (one host, or several with `--hosts`), steady state, correctness, kills, pool scaling (`scale`); `CONNEX_PD_PORT_OFFSET` shifts every port so two deployments can share hosts |
 
 None of them has a built-in address; pass endpoints with flags or
 `CONNEX_API_URL`, `CONNEX_R0_URL`/`CONNEX_R1_URL`, `CONNEX_STAGE_HOSTS`,

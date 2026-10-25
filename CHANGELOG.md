@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**Across hosts and mixed GPUs** ([`docs/results.md`](docs/results.md#12-across-hosts-and-mixed-gpus), [`docs/design/multi-host-validation.md`](docs/design/multi-host-validation.md))
+- PD (vLLM, SGLang), TP PD and EP validated with instances on different
+  nodes over 100 Gb InfiniBand: on par with NIXL / Mooncake, decode and
+  prefill kills, pool scaling and TP rank kills complete every request with
+  0 off-argmax tokens (one near-tie token in a request untouched by a kill).
+- PD host staging (`connex.pd.host_staging`, `CONNEX_PD_HOST_STAGING`,
+  default `auto`): on a host without GPUDirect RDMA the KV cache is mirrored
+  in pinned host memory and read with one-sided RDMA between host buffers
+  (before: UCX over TCP). RTX A6000 prefill -> A40 decode at QPS 4: TTFT p50
+  5.8 s -> 0.53 s, 414 -> 488 tok/s.
+- `connex.ep.groups.RankDeathWatcher`: fails an EP group when connex-rs
+  reports one of its ranks dead, wherever the rank runs (0.29 s across
+  nodes; the health probe alone never noticed); `EPGroup(on_rejoin=...)`.
+- EP/RL connex-rs transport defaults `UCX_ZCOPY_THRESH` to 4 KB: the first
+  cross-node expert move crashed the receiving rank in UCX wire-up.
+- `benchmarks/pd/local_pd.py --hosts` / `tp_experiments.py --hosts`: run
+  PD deployments across hosts through any shell prefix (`ssh`, `kubectl
+  exec`); `tp_experiments.py scale` (pool add/drain/stop under load) and
+  `kill --rank -1` (whole instance); `CONNEX_PD_PORT_OFFSET`; NIXL
+  side-channel host set for cross-host runs; pool files written atomically.
+
 **Expert parallelism (MoE) with recovery and elasticity: `connex.ep`**
 - `PlacementTable`: versioned expert placement (expert -> physical slots on
   EP ranks, replicas, rank states up / draining / down, routable masks),

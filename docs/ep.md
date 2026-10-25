@@ -140,11 +140,44 @@ request to install an external map); not implemented yet. Replica-level
 failover with the resume proxy and `EPGroupSupervisor` is engine neutral and
 applies to SGLang EP groups unchanged.
 
+## Across hosts
+
+An EP group may span nodes with vLLM's multi-node mode: rank 0 runs
+`vllm serve ... -tp 2 --enable-expert-parallel --nnodes 2 --node-rank 0
+--master-addr <rank-0 host>` and rank 1 the same with `--node-rank 1
+--headless` (plus the EPLB and worker-extension flags above; set
+`NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME` to the RDMA network). Expert
+moves between ranks on different hosts use connex-rs (CUDA IPC only between
+ranks of one host). Two things differ from one host:
+
+* **A dead rank on another host is invisible to the process watch** of
+  `EPGroupSupervisor`, and vLLM's API server on the rank-0 host keeps
+  answering `/health`. `RankDeathWatcher` links a connex-rs engine to every
+  rank's EP transport (the `url` of `connex_ep_init`'s reply) and fails the
+  group on the peer-death event:
+
+  ```python
+  from connex.ep.groups import EPGroup, EPGroupSupervisor, RankDeathWatcher
+  from connex.ep.vllm_ext import VLLMEPEngine
+  sup = EPGroupSupervisor([EPGroup("ep/a", url_a, restart_a, on_rejoin=rewatch), ...], eps_file)
+  w = RankDeathWatcher(sup)
+  w.watch("ep/a", [r["url"] for r in VLLMEPEngine(url_a).rpc("connex_ep_init", '{"group": 0}')])
+  w.start(); sup.start()
+  ```
+
+  Measured: rank 1 killed on the other node, group out in 0.29 s, 817 of
+  817 requests completed; with the health probe alone the group was never
+  removed in a 200 s run.
+* The all-to-all crosses the network: about 17 % lower throughput than one
+  host for vLLM's default EP and for Connex alike; a 12.9 GB rejoin copy
+  took 1.82 s between the nodes under load. Numbers:
+  [results section 12](results.md#12-across-hosts-and-mixed-gpus).
+
 ## Not covered yet
 
 * Placement-driven expert maps in SGLang (see above); SGLang elastic EP.
-* Cross-host EP groups (all numbers come from one 4-GPU host), DeepEP /
-  pplx all-to-all kernels, data parallel attention + EP.
+* DeepEP / pplx all-to-all kernels, data parallel attention + EP, more
+  than two nodes per group.
 * Checkpoint loading of an expert into a live vLLM rank (`ExpertStore`
   supports a loader; the vLLM glue does not wire one, since a vLLM rank that
   lost its copies is a dead rank and the group restarts anyway).

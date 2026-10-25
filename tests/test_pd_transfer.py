@@ -181,3 +181,70 @@ def test_block_size_mismatch_rejected():
         assert not r.ok and "block size" in r.why
     finally:
         cons.close(), prod.close()
+
+
+class _FakeStaging:
+    """HostStaging on CPU: the "device" is host memory, copies are memmoves."""
+
+    def __init__(self, spans, device=None):
+        import bisect
+        import ctypes
+        from connex.pd import host_staging as hs
+
+        self._bisect, self._mm, self._merge = bisect, ctypes.memmove, hs._merge
+        self.spans = sorted(spans)
+        self.mirrors = [torch.zeros(n, dtype=torch.uint8) for _, n in self.spans]
+        self.staged_in = 0
+
+    def _find(self, addr):
+        i = self._bisect.bisect_right([s for s, _ in self.spans], addr) - 1
+        return self.spans[i][0], self.mirrors[i]
+
+    def mirror(self, addr):
+        s, m = self._find(addr)
+        return m.data_ptr() + addr - s
+
+    def mirror_spans(self):
+        return [(m.data_ptr(), n) for m, (_, n) in zip(self.mirrors, self.spans)]
+
+    def translate(self, lo):
+        from dataclasses import replace
+        return replace(lo, base=self.mirror(lo.base))
+
+    def mirror_ops(self, ops):
+        return [(self.mirror(d), s, n) for d, s, n in ops]
+
+    def stage_out(self, ranges):
+        for a, n in self._merge(ranges):
+            self._mm(self.mirror(a), a, n)
+        return type("Ev", (), {"synchronize": lambda self: None})()
+
+    def stage_in(self, ranges):
+        self.staged_in += 1
+        for a, n in self._merge(ranges):
+            self._mm(a, self.mirror(a), n)
+
+
+def test_host_staging_reads_go_through_the_mirrors(monkeypatch):
+    from connex.pd import host_staging
+
+    monkeypatch.setenv("CONNEX_PD_HOST_STAGING", "1")
+    monkeypatch.setattr(host_staging, "HostStaging", _FakeStaging)
+    src, dst, prod, cons, addr = make_pair()
+    try:
+        assert prod._staging is not None and cons._staging is not None
+        # only the mirrors are registered with the data planes
+        assert prod.plane.regions == prod._staging.mirror_spans()
+        assert cons.plane.regions == cons._staging.mirror_spans()
+        want = [s[:, [9, 10]].clone() for s in src]
+        prod.hold("r1", "t1", [9, 10])            # staged out here
+        for s in src:
+            s.zero_()                             # the reader must not see the device copy
+        cons.pull("r1", addr, "t1", [3, 4], first_block=0)
+        (res,) = wait_done(cons)
+        assert res.ok, res
+        for w, d in zip(want, dst):
+            assert torch.equal(d[:, [3, 4]], w)
+        assert cons._staging.staged_in == 1
+    finally:
+        cons.close(), prod.close()

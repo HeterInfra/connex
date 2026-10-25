@@ -3,8 +3,9 @@
 This page collects the measurements behind Connex v0.1.0 on a vLLM pipeline
 (sections 1-6), prefill-decode disaggregation on upstream vLLM and SGLang
 (section 7), RL weight sync (section 8), agent session migration
-(section 9), expert parallelism (section 10) and tensor parallelism with
-group-level recovery (section 11). Sections 1-6 cover
+(section 9), expert parallelism (section 10), tensor parallelism with
+group-level recovery (section 11), and PD, TP and EP across hosts and with
+mixed GPUs (section 12). Sections 1-6 cover
 steady-state latency and throughput with one and four pipeline steps in
 flight, correctness and latency of in-flight request handover when a
 downstream stage dies, goodput while a replica churns (with and without the
@@ -351,8 +352,8 @@ then `pd_bench.py ref/check/load/score` against the router on port 8000 and
 editing the `prefill.txt` / `decode.txt` pool files (`--pool-files`) or with
 `POST /pd/drain`.
 
-Not covered for PD: instances on different hosts (RDMA across nodes), MLA or
-hybrid KV caches, and repeated runs for the steady-state table. Tensor
+Not covered for PD: MLA or hybrid KV caches, and repeated runs for the
+steady-state table. Instances on different hosts are in section 12. Tensor
 parallelism > 1 and front-router membership under real failures are in
 section 11.
 
@@ -587,7 +588,7 @@ controller now adopts the engine's epoch when it attaches, and an engine
 that rejects a view as stale raises instead of being silently skipped.
 
 Not covered: SGLang (no placement driving yet; its Mooncake elastic EP did
-not load in this environment), cross-host EP groups, DeepEP / pplx
+not load in this environment), DeepEP / pplx
 all-to-all, data-parallel attention with EP, sampling (greedy only), more
 than one repetition for most rows.
 ## 11. Tensor parallelism
@@ -715,6 +716,206 @@ which is why per-rank shards matter. The restarted stage came back and a
 follow-up batch of 16 requests completed; whether chain 0 routed to it
 again was not checked (sticky routing keeps the chain on chain 1's stage).
 
+## 12. Across hosts and mixed GPUs
+
+Sections 7, 10 and 11 ran on one host. This section repeats them with the
+instances on different hosts, and adds a node with a different GPU.
+
+**Setup.** Three nodes with 4x A40 (48 GB) and a ConnectX 100 Gb
+InfiniBand NIC each (`nvidia_peermem` loaded: GPUDirect RDMA), and one node
+with an RTX A6000 (48 GB) and the same NIC but **no** GPUDirect driver.
+Unless a row says otherwise every instance is on its own node and on a GPU
+next to the NIC; prefill and decode never share a node. Software as in
+section 7 (vLLM 0.32.0, SGLang 0.5.22, NIXL 1.5 in its own environment,
+HPC-X UCX 1.16 under connex-rs), Llama-3-8B bf16 and OLMoE-1B-7B, 0.6 memory
+fraction. The instances run in privileged host-network pods (one "agent"
+pod per node) started by `benchmarks/pd/local_pd.py --hosts` (the hosts file
+names the command that runs a shell on each node; see the script's header);
+routers, load generator and scoring run on a fifth host. Load, scoring and
+the definition of "stall" as in sections 7 and 11; single runs. Kill times
+are taken on the harness host around the remote `kill` (the round trip,
+0.15-0.3 s, bounds their error), so "group out" is accurate to about
+±0.15 s; stalls are measured at the client and are not affected.
+
+**PD steady state, 1P1D across two nodes.** Same load as section 7:
+
+| engine / transfer | load | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) | E2E mean / p99 (s) | tok/s |
+|---|---|---|---|---|---|
+| vLLM, Connex | QPS 1 | 354 / 564 | 31 / 33 | 4.31 / 4.55 | 130 |
+| vLLM, NIXL | QPS 1 | 356 / 562 | 31 / 33 | 4.31 / 4.55 | 130 |
+| vLLM, Connex | QPS 2 | 276 / 616 | 33 / 34 | 4.45 / 4.82 | 246 |
+| vLLM, NIXL | QPS 2 | 271 / 624 | 33 / 34 | 4.43 / 4.78 | 246 |
+| vLLM, Connex | QPS 4 | 475 / 1305 | 36 / 38 | 5.14 / 6.10 | 488 |
+| vLLM, NIXL | QPS 4 | 451 / 1275 | 36 / 38 | 5.11 / 6.05 | 488 |
+| vLLM, Connex | QPS 6 | 800 / 2557 | 38 / 39 | 5.77 / 7.55 | 708 |
+| vLLM, NIXL | QPS 6 | 746 / 2493 | 38 / 39 | 5.71 / 7.48 | 708 |
+| vLLM, Connex | 32 clients | 615 / 4899 | 37 / 38 | 5.83 / 9.65 | 640 |
+| vLLM, NIXL | 32 clients | 495 / 4830 | 38 / 38 | 5.75 / 9.60 | 649 |
+| SGLang, Connex | QPS 1 | 215 / 477 | 31 / 33 | 4.16 / 4.40 | 130 |
+| SGLang, Mooncake | QPS 1 | 217 / 475 | 31 / 32 | 4.16 / 4.39 | 130 |
+| SGLang, Connex | QPS 4 | 326 / 1688 | 36 / 38 | 5.07 / 6.54 | 489 |
+| SGLang, Mooncake | QPS 4 | 325 / 1683 | 36 / 38 | 5.05 / 6.49 | 489 |
+| SGLang, Connex | QPS 6 | 783 / 3300 | 38 / 41 | 5.93 / 8.33 | 710 |
+| SGLang, Mooncake | QPS 6 | 748 / 3276 | 38 / 41 | 5.91 / 8.31 | 709 |
+| SGLang, Connex | 32 clients | 866 / 5067 | 38 / 38 | 6.17 / 9.88 | 609 |
+| SGLang, Mooncake | 32 clients | 829 / 5033 | 38 / 38 | 6.10 / 9.84 | 614 |
+
+Across nodes the numbers are those of one host (section 7): the KV of a
+1024-token prompt (128 MB) moves in about 13 ms over the 100 Gb link, small
+next to a 300 ms prefill. Connex stays on par with NIXL (vLLM) and Mooncake
+(SGLang). With vLLM's NixlConnector across hosts, set
+`VLLM_NIXL_SIDE_CHANNEL_HOST` to the prefill's address (it defaults to
+localhost; the decode then fails every handshake with "connection reset").
+
+**PD 2P2D on three nodes** (prefills on nodes A and C, decodes on B and C,
+vLLM, Connex): QPS 2 / 4 / 8 / 12 gave TTFT p50 352 / 347 / 429 / 669 ms,
+TPOT p50 31 / 32 / 36 / 38 ms and 246 / 490 / 957 / 1,419 tok/s with every
+request completed; 32 closed-loop clients 754 tok/s.
+
+**Correctness across nodes** (48 natural-language prompts, 128 greedy
+tokens, concurrency 8, teacher-forced): vLLM 1P1D, SGLang 1P1D, vLLM 2P2D,
+vLLM TP 2 -> 2, 2 -> 1 and 1 -> 2, SGLang TP 2 -> 2, and the mixed-GPU pairs
+below: 0 of 6,144 tokens off argmax in every configuration.
+
+**Failures and scaling under load across nodes** (240 requests at QPS 2,
+1024-token prompts, 256 output tokens unless noted; every token scored):
+
+| scenario | completed | router actions | off argmax | group out | stall | TTFT p99 / E2E p99 |
+|---|---|---|---|---|---|---|
+| vLLM 1P2D, one decode SIGKILLed at 30 s (2 runs) | 240 / 240 each | 5 resumed by re-pulling the held KV, 0 extra prefills (each run) | 0 / 61,440 each | 0.27-0.28 s | 0.42 / 0.44 s | 0.68-0.71 s / 10.2 s |
+| SGLang 1P2D, one decode SIGKILLed | 240 / 240 | 6 resumed with a new prefill | 0 / 61,440 | 0.36 s | 0.45 s | 2.47 s / 10.7 s |
+| vLLM 2P1D, one prefill SIGKILLed (3000-token prompts, QPS 3, 128 tokens) | 240 / 240 | 1 prefill retried on the other prefill | 0 / 30,720 | 0.31 s | 0.15 s | 21.1 s / 25.8 s (one prefill left for QPS 3) |
+| vLLM 2P2D, one decode SIGKILLed (2048-token prompts) | 240 / 240 | 8 resumed | 0 / 61,440 | | 0.59 s | 0.88 s / 12.3 s |
+| vLLM 2P2D, one prefill SIGKILLed (2048-token prompts) | 240 / 240 | none needed | 1 / 61,440 (see below) | 0.79 s | 0.08 s | 1.30 s / 10.4 s |
+| vLLM prefill pool: add a prefill on a third node at 5 s, drain the original at 50 s, stop it at 80 s | 240 / 240 | none needed | 0 / 61,440 | | 0.06 s | 0.67 s / 10.2 s |
+| vLLM decode pool: the same for a decode | 240 / 240 | none needed | 0 / 61,440 | | 0.06 s | 0.69 s / 10.2 s |
+
+The one off-argmax token of the 2P2D prefill kill (0.75 nats below the
+argmax, tolerance 0.5) belongs to a request that started 6.5 s after the
+kill and never touched the killed instance (no router action in the run):
+a near-tie of batched decoding, not a transfer error. The first runs of the
+pool-scaling rows lost 3 of 240 requests each to a race in the benchmark
+harness (load started before the router had read its pool files, and a
+pool file rewritten in place was read empty once); the harness now waits
+for the pools and replaces the files atomically, and the reruns above lost
+nothing.
+
+**Tensor parallelism across nodes** (TP groups inside a node, prefill and
+decode groups on different nodes):
+
+| configuration | load | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) | E2E mean / p99 (s) | tok/s |
+|---|---|---|---|---|---|
+| vLLM TP 2 -> 2, Connex | QPS 1 | 221 / 384 | 16 / 16 | 2.25 / 2.41 | 134 |
+| vLLM TP 2 -> 2, Connex | QPS 4 | 229 / 473 | 17 / 19 | 2.44 / 2.83 | 506 |
+| vLLM TP 2 -> 2, Connex | 32 clients | 505 / 3324 | 22 / 23 | 3.62 / 6.15 | 1045 |
+| vLLM TP 2 -> 1, Connex | QPS 1 | 363 / 542 | 31 / 33 | 4.31 / 4.53 | 130 |
+| vLLM TP 2 -> 1, Connex | QPS 4 | 398 / 768 | 36 / 38 | 4.98 / 5.65 | 488 |
+| vLLM TP 2 -> 1, Connex | 32 clients | 692 / 3563 | 38 / 39 | 5.81 / 8.48 | 660 |
+| SGLang TP 2 -> 2, Connex | QPS 1 | 153 / 315 | 16 / 16 | 2.15 / 2.30 | 134 |
+| SGLang TP 2 -> 2, Mooncake | QPS 1 | 154 / 313 | 16 / 16 | 2.16 / 2.31 | 134 |
+| SGLang TP 2 -> 2, Connex | QPS 4 | 155 / 517 | 17 / 19 | 2.33 / 2.82 | 506 |
+| SGLang TP 2 -> 2, Mooncake | QPS 4 | 154 / 568 | 17 / 19 | 2.34 / 2.94 | 507 |
+| SGLang TP 2 -> 2, Connex | 32 clients | 943 / 3780 | 20 / 21 | 3.66 / 6.45 | 1026 |
+| SGLang TP 2 -> 2, Mooncake | 32 clients | 946 / 3766 | 20 / 21 | 3.67 / 6.44 | 1029 |
+
+Killing one rank of a TP-2 group under load (front-router membership, as
+in section 11; the TP-2 group on one node, the other instances on two
+others; the instance restarted at 75 s):
+
+| victim | completed | off argmax | group out | stall | TTFT p99 | rejoined |
+|---|---|---|---|---|---|---|
+| rank 1 of a TP-2 decode | 240 / 240 | 0 / 61,440 | 0.29 s | 0.41 s | 1.02 s | 49 s after restart |
+| rank 0 of a TP-2 decode | 240 / 240 | 0 / 61,440 | 0.40 s | 0.44 s | 0.99 s | 49 s |
+| rank 1 of a TP-2 prefill | 240 / 240 | 0 / 61,440 | 0.46 s | 0.07 s | 0.98 s | 48 s |
+
+The surviving peers on the other nodes saw the dead rank through their
+connex-rs data planes and reported it, as on one host; the engine itself
+took 6-10 s to exit. Resumed decode requests re-pulled the held KV (3 per
+decode kill); the prefill kill re-prefilled 3 requests.
+
+**Mixed GPUs: an RTX A6000 node without GPUDirect RDMA.** The A6000 node
+has no peer-memory driver, so its NIC cannot reach GPU memory: connex-rs
+GPU reads fail there (UCX accepts the registration through its CUDA memory
+domain, every read of it fails). Three ways to run PD with that node, vLLM,
+Llama-3-8B, prefill on the A6000, decode on an A40 node:
+
+| KV path | load | TTFT p50 / p99 (ms) | TPOT p50 (ms) | E2E mean / p99 (s) | tok/s |
+|---|---|---|---|---|---|
+| UCX over TCP (IPoIB), GPU memory staged by UCX | QPS 1 | 611 / 1072 | 31 | 4.61 / 5.00 | 130 |
+| UCX over TCP | QPS 4 | 5793 / 12464 | 35 | 11.55 / 16.83 | 414 |
+| UCX over TCP | 32 clients | 5297 / 10127 | 34 | 9.74 / 14.49 | 379 |
+| **host staging over RDMA** (new) | QPS 1 | 346 / 594 | 31 | 4.32 / 4.59 | 130 |
+| host staging over RDMA | QPS 4 | 531 / 1921 | 36 | 5.29 / 6.81 | 488 |
+| host staging over RDMA | QPS 6 | 933 / 2860 | 38 | 6.06 / 8.11 | 708 |
+| host staging over RDMA | 32 clients | 1000 / 5027 | 38 | 6.32 / 9.95 | 591 |
+| reference: A40 -> A40, both with GPUDirect | QPS 4 | 462 / 1285 | 36 | 5.14 / 6.10 | 488 |
+| reference: A40 -> A40, both with GPUDirect | 32 clients | 608 / 4849 | 37 | 5.81 / 9.61 | 641 |
+
+Correctness: A6000 prefill -> A40 decode and A40 prefill -> A6000 decode,
+over TCP and with host staging, 0 of 6,144 tokens off argmax each. Over TCP
+the KV transfer saturates at about QPS 3 (0.4-0.5 GB/s), and an A40 prefill
+on the same node crashed in UCX's TCP RMA emulation at QPS 4 (segfault in
+`ucp_request_try_send`; 162 of 245 requests failed). Host staging keeps the
+transfer one-sided RDMA between pinned host buffers and costs one PCIe copy
+on each side. An A40 on the same node with host staging gave 582 / 2139 ms
+TTFT at QPS 4 and 574 tok/s with 32 clients, so the remaining gap to the
+GPUDirect reference comes from the staging copies, not from the GPU type.
+See the performance pass below.
+
+**Expert parallelism across nodes.** vLLM's multi-node mode
+(`--nnodes 2 --node-rank r --master-addr`, rank 1 `--headless`) runs one
+TP 2 + EP 2 group with rank 0 on one A40 node and rank 1 on another;
+NCCL runs over InfiniBand (`NET/IB`). OLMoE-1B-7B, load as in section 10.
+
+| | across two nodes | one host (section 10) |
+|---|---|---|
+| vLLM default EP, tok/s (2 runs) | 1,945 / 1,948 (TPOT p50 15.5-15.7 ms) | 2,317 / 2,338 |
+| Connex placement, 64 redundant, `active_replicas=1`, tok/s | 1,928 / 1,932 (15.9 ms) | 2,299 / 2,307 |
+| drain rank 1 at 4 s: epoch cutover | 33 ms | 23-31 ms |
+| rejoin: copy 12.9 GB (1,024 expert-layer copies) rank 0 -> rank 1 in the background | 1.82 s over connex-rs between the nodes (7.1 GB/s under load) | 3.7 s connex-rs NIC loopback, 1.0-1.1 s CUDA IPC |
+| largest gap between two tokens during drain + rejoin | 0.057 s | 0.04-0.05 s |
+| migrate 8 experts under load: whole migration per expert | 0.15-0.16 s | 0.09-0.15 s |
+| requests completed, non-argmax tokens (steady, drain, migrate) | all, 0 | all, 0 |
+
+The cross-node group is about 17 % slower than the one-host group for
+vLLM's own EP and for Connex alike (all-to-all over the network instead of
+PCIe); Connex's placement control stays within 1 % of vLLM's default. In
+the migrate rows the controller picks a source on the destination rank
+when it has one (here every expert has a copy on both ranks), so those
+copies are local; the rejoin row is the cross-node move. The first
+cross-node rejoin crashed rank 1: without a UCX registration cache (vLLM
+workers) the zero-copy threshold collapses, and UCX sent connex-rs's 1-byte
+heartbeat (a read-only static buffer) zero-copy during wire-up, failed to
+register it and segfaulted. The EP/RL transport now pins
+`UCX_ZCOPY_THRESH` to 4 KB as the PD data plane already did.
+
+**Kill an EP rank across nodes.** Two EP groups (A and B), each with rank 0
+on node 1 and rank 1 on node 2, behind the resume proxy, Poisson load at
+4 requests/s for 200 s; rank 1 of group A (on the node without its API
+server) SIGKILLed at 25 s. `EPGroupSupervisor` cannot watch a remote rank's
+process; the new `RankDeathWatcher` links a connex-rs engine to every
+rank's EP transport and fails the group on the peer-death event.
+
+| | transport watch (`RankDeathWatcher`) | health probe only |
+|---|---|---|
+| requests completed | 817 / 817 | 817 / 817 |
+| in flight at the kill, completed | 3 / 3 | 3 / 3 |
+| failure detected (kill -> group removed) | 0.29 s ("rank 1 died (transport)") | not within the 200 s run: the API server on node 1 kept answering `/health` |
+| largest gap between two tokens of any request | 0.37 s | 2.60 s (proxy idle timeout) |
+| group rebuilt and back in the routing set | 53.7 s after the kill | |
+
+Not covered across hosts: TP groups that span nodes for PD (TP stays
+inside a node), SGLang with host staging (vLLM only), repeated runs, and
+node loss or link cuts (all failures here are process kills).
+
+**Performance pass** (profile first, then fix):
+
+| bottleneck found | change | before | after |
+|---|---|---|---|
+| a node without GPUDirect RDMA could only use UCX over TCP: 0.4-0.5 GB/s KV transfer, saturating at about QPS 3, and a UCX crash under load | host staging (`connex/pd/host_staging.py`): pinned host mirror of the KV cache registered instead of GPU memory, device -> mirror copy queued on the engine stream when a prefill is held, mirror -> device after the read; picked automatically when no peer-memory driver is loaded (`CONNEX_PD_HOST_STAGING=auto`) | A6000 -> A40 at QPS 4: TTFT p50 5.79 s, 414 tok/s; 32 clients 379 tok/s | 0.53 s, 488 tok/s; 591 tok/s (GPUDirect reference 0.46 s, 488, 641) |
+| EP rank failure on another node went unnoticed: process watch is local, `/health` stays up | `RankDeathWatcher` (connex-rs peer-death events of the ranks' EP transports) | not detected in 200 s; stall 2.6 s | 0.29 s; stall 0.37 s |
+| first cross-node expert move crashed the receiving rank (UCX zero-copy of a 1-byte read-only heartbeat) | `UCX_ZCOPY_THRESH=4096` default in the EP/RL connex-rs transport | rank 1 segfault, group lost | 12.9 GB moved in 1.82 s under load |
+
 ## How to reproduce
 
 Deploy (see `deploy/k8s/README.md`):
@@ -765,6 +966,10 @@ PROXY=local benchmarks/k8s/churn_matrix.sh hard out/hard-proxy "k4:CONNEX_PP_INF
 ```
 
 Proxy overhead (CPU only): `python benchmarks/proxy_overhead.py --concurrency 16`.
+
+Across hosts (section 12): `benchmarks/pd/tp_experiments.py --hosts hosts.json`
+with GPU specs `HOST:GPU`; the commands are in
+[`design/multi-host-validation.md`](design/multi-host-validation.md#reproducing).
 
 Before measuring, smoke-test every chain (a few requests to each replica's
 stage 0) and check per-GPU free memory on shared GPUs: a stage that cannot

@@ -38,6 +38,7 @@ import msgpack
 import zmq
 
 from connex.pd.dataplane import ZCOPY_THRESH
+from connex.pd.host_staging import block_ranges, register_with_staging
 from connex.pd.kv_layout import TPSource, TensorLayout, head_read_ops, read_ops, register_spans
 
 log = logging.getLogger("connex.pd")
@@ -60,6 +61,7 @@ class _Hold:
     deadline: float
     acquired: int = 0
     released_by: set = field(default_factory=set)
+    ready: object = None    # host staging: event of the device -> mirror copy
 
 
 class KVProducer:
@@ -79,11 +81,13 @@ class KVProducer:
         self._finished: set[str] = set()   # req ids whose blocks may be freed
         self._lock = threading.Lock()
         self.stats = {"holds": 0, "acquires": 0, "releases": 0, "expired": 0, "unknown": 0}
+        # GPUDirect when the plane can register the KV cache, else (or with
+        # CONNEX_PD_HOST_STAGING=1) a pinned host mirror (host_staging.py)
         if register:
-            for start, n in register_spans(self.layouts):
-                rc = plane.register(start, n)
-                if rc != 0:
-                    raise RuntimeError(f"{plane.name}: register_memory({start:#x}, {n}) = {rc}")
+            self._staging = register_with_staging(plane, register_spans(self.layouts),
+                                                  "KV producer")
+        else:
+            self._staging = getattr(plane, "_connex_staging", None)
         self._ctx = zmq.Context.instance()
         self._sock = self._ctx.socket(zmq.REP)
         self._sock.setsockopt(zmq.LINGER, 0)
@@ -103,7 +107,12 @@ class KVProducer:
                 self._released.discard(transfer_id)
                 self._finished.add(req_id)
                 return
-            self._holds[transfer_id] = _Hold(req_id, list(blocks), time.monotonic() + self.retain_s)
+        ready = None
+        if self._staging is not None:   # queued after the prefill on the engine stream
+            ready = self._staging.stage_out(block_ranges(self.layouts, blocks))
+        with self._lock:
+            self._holds[transfer_id] = _Hold(req_id, list(blocks), time.monotonic() + self.retain_s,
+                                             ready=ready)
             self.stats["holds"] += 1
 
     def drop(self, transfer_id: str) -> None:
@@ -135,7 +144,8 @@ class KVProducer:
             return {"ok": True, "v": PROTO_VERSION, "url": self.plane.local_url,
                     "backend": self.plane.name, "engine_id": self.engine_id,
                     "block_size": self.block_size, "device": self.device,
-                    "layouts": [lo.to_dict() for lo in self.layouts]}
+                    "layouts": [(self._staging.translate(lo) if self._staging else lo).to_dict()
+                                for lo in self.layouts]}
         tid = m.get("tid")
         with self._lock:
             h = self._holds.get(tid)
@@ -146,7 +156,7 @@ class KVProducer:
                 h.acquired += 1
                 h.deadline = time.monotonic() + self.retain_s
                 self.stats["acquires"] += 1
-                return {"ok": True, "blocks": h.blocks}
+                return {"ok": True, "blocks": h.blocks, "_wait": h.ready}
             if op == "release":
                 self.stats["releases"] += 1
                 # several decode TP ranks may read this rank (decode TP larger
@@ -177,6 +187,9 @@ class KVProducer:
             try:
                 msg = _unpack(self._sock.recv())
                 rep = self._handle(msg)
+                ev = rep.pop("_wait", None)
+                if ev is not None:
+                    ev.synchronize()   # staged copy done before the reader reads
             except Exception as e:  # noqa: BLE001
                 rep = {"ok": False, "why": f"error: {e}"}
             self._sock.send(_pack(rep))
@@ -227,10 +240,9 @@ class KVConsumer:
         self.release_after_pull = release_after_pull
         self._spans = register_spans(self.layouts)
         if register:
-            for start, n in self._spans:
-                rc = plane.register(start, n)
-                if rc != 0:
-                    raise RuntimeError(f"{plane.name}: register_memory({start:#x}, {n}) = {rc}")
+            self._staging = register_with_staging(plane, self._spans, "KV consumer")
+        else:
+            self._staging = getattr(plane, "_connex_staging", None)
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="connex-pd-pull")
         self._meta: dict[str, _PeerMeta] = {}
         self._lock = threading.Lock()
@@ -360,7 +372,12 @@ class KVConsumer:
         bad = self._outside(ops)
         if bad:
             return PullResult(req_id, False, f"read outside registered KV memory: {bad}")
-        rc = self.plane.read(meta.url, ops)
+        if self._staging is not None:
+            rc = self.plane.read(meta.url, self._staging.mirror_ops(ops))
+            if rc == 0:
+                self._staging.stage_in([(d, n) for d, _, n in ops])
+        else:
+            rc = self.plane.read(meta.url, ops)
         if rc != 0:
             self.forget_peer(addr)
             return PullResult(req_id, False, f"{self.plane.name} read returned {rc}")

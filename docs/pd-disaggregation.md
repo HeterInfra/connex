@@ -97,7 +97,7 @@ Admin endpoints of the router: `GET /pd/pools`, `POST /pd/drain` and
 ## Running the experiments
 
 `benchmarks/pd/local_pd.py` starts a deployment on one host (each instance on
-its own GPU), `benchmarks/pd/pd_bench.py` drives load (`load`), checks
+its own GPU) or on several (`--hosts`, GPU specs `HOST:GPU`), `benchmarks/pd/pd_bench.py` drives load (`load`), checks
 outputs against a non-disaggregated instance (`ref`, `check`) and scores them
 teacher-forced (`score`), and `benchmarks/pd/summarize.py` prints the tables
 in [`docs/results.md`](results.md#7-prefill-decode-disaggregation-on-upstream-vllm-and-sglang).
@@ -109,6 +109,16 @@ in [`docs/results.md`](results.md#7-prefill-decode-disaggregation-on-upstream-vl
   ranks that hold them; SGLang needs `SGLANG_DISAGG_STAGING_BUFFER=1` for
   different sizes), see [`tp.md`](tp.md). Full-attention KV only (no Mamba or
   sliding-window groups), no pipeline parallelism inside an instance.
+- Across hosts: validated with vLLM and SGLang over 100 Gb InfiniBand
+  (1P1D, 2P2D, TP, decode/prefill kills, pool scaling), on par with NIXL and
+  Mooncake ([results section 12](results.md#12-across-hosts-and-mixed-gpus)).
+  With vLLM's NixlConnector across hosts set `VLLM_NIXL_SIDE_CHANNEL_HOST`.
+- Hosts without GPUDirect RDMA (no `nvidia_peermem`): the vLLM connector
+  stages KV through a pinned host mirror automatically
+  (`CONNEX_PD_HOST_STAGING`, [`configuration.md`](configuration.md)); pinned
+  host memory the size of the KV cache, one PCIe copy per side. Validated
+  with an RTX A6000 node and A40 nodes in both directions. The SGLang
+  backend has no host staging yet.
 - connex-rs: prefill and decode on **different GPUs**, and KV block segments
   of at least 4 KB (UCX copies smaller reads with the CPU; see the design
   notes). SGLang needs `--page-size 16` or more.

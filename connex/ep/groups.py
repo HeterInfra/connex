@@ -60,8 +60,9 @@ class EPGroup:
     without waiting for the API server to notice (vLLM keeps answering
     /health for several seconds after a worker died)."""
 
-    def __init__(self, name, url, restart=None, proc=None, rank_pids=None):
+    def __init__(self, name, url, restart=None, proc=None, rank_pids=None, on_rejoin=None):
         self.name = name
+        self.on_rejoin = on_rejoin    # callable(group) after a rebuilt group serves again
         self.rank_pids = rank_pids
         self._pids = None
         self.url = url.rstrip("/")
@@ -152,6 +153,11 @@ class EPGroupSupervisor:
                     g._pids = None          # re-read the new rank processes
                     self.write_endpoints()
                 self._event("rejoin", g.name, rebuild_s=time.time() - t0)
+                if g.on_rejoin is not None:
+                    try:
+                        g.on_rejoin(g)
+                    except Exception as ex:  # noqa: BLE001
+                        self._event("rejoin-hook-failed", g.name, error=repr(ex))
                 return
             time.sleep(self.probe_s)
         self._event("rebuild-failed", g.name, error="timeout")
@@ -171,4 +177,79 @@ class EPGroupSupervisor:
             self._th.join(timeout=5)
 
 
-__all__ = ["EPGroup", "EPGroupSupervisor", "pid_alive"]
+class RankDeathWatcher:
+    """Group failure across hosts, from the transport.
+
+    The process watch of ``EPGroup.rank_pids`` only sees ranks on the
+    supervisor's own host. ``RankDeathWatcher`` links a connex-rs engine to
+    the EP transport of every rank (``ExpertStore.describe()["url"]``, one
+    identity ``("connex-ep", 0, rank, group)`` per rank) and fails the
+    rank's group in the supervisor as soon as connex-rs reports that peer
+    dead: the dead process's kernel resets its connections, wherever it ran.
+    Timeouts (hung or partitioned ranks) stay with the health probe.
+
+    ``engine``: a connex-rs ``Engine`` (duck-typed: ``connect``,
+    ``wait_event``); by default a new one pinned to this host's RDMA
+    device."""
+
+    def __init__(self, supervisor, engine=None):
+        from connex.pd.group import GroupFailureTracker
+
+        if engine is None:
+            from connex.rl.transport import ConnexRsTransport
+
+            self._transport = ConnexRsTransport(lid=("connex-ep-watch", 0, 0, 0))
+            engine = self._transport.e
+        self.sup = supervisor
+        self.engine = engine
+        self.tracker = GroupFailureTracker("connex-ep", [0])
+        self.groups: dict[tuple, str] = {}     # rank identity -> group name
+        self.reports: list[tuple[float, str, tuple]] = []
+        self._stop = threading.Event()
+        self._th = None
+
+    @staticmethod
+    def identity(url):
+        """``ip:port#model|stage|shard|replica`` -> (model, stage, shard, replica)."""
+        m, st, sh, r = url.split("#", 1)[1].split("|")
+        return (m, int(st), int(sh), int(r))
+
+    def watch(self, group_name, urls):
+        """Link to the ranks of ``group_name`` (call again after a rebuild:
+        the new incarnations have new addresses, the same identities)."""
+        for u in urls:
+            self.groups[self.identity(u)] = group_name
+            self.engine.connect(u)
+
+    def handle(self, ev):
+        lid = self.tracker.on_event(ev)
+        if lid is None:
+            return None
+        key = (lid.model_name, lid.stage_idx, lid.shard_idx, lid.replica_idx)
+        name = self.groups.get(key)
+        g = self.sup.groups.get(name) if name else None
+        if g is None or g.state != "up":
+            return None
+        self.reports.append((time.time(), name, key))
+        self.sup.on_failure(g, f"rank {lid.shard_idx} died (transport)")
+        return name
+
+    def start(self):
+        def loop():
+            while not self._stop.is_set():
+                try:
+                    ev = self.engine.wait_event(100)
+                except Exception:  # noqa: BLE001  (engine closed)
+                    return
+                if ev is not None:
+                    self.handle(ev)
+        self._th = threading.Thread(target=loop, daemon=True, name="connex-ep-rank-watch")
+        self._th.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._th:
+            self._th.join(timeout=2)
+
+
+__all__ = ["EPGroup", "EPGroupSupervisor", "RankDeathWatcher", "pid_alive"]
