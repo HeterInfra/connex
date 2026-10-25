@@ -12,6 +12,19 @@ Every instance is a subprocess with its own GPU(s), port and log file in
 on GPUs 1 and 2; ``Deployment.kill_rank`` kills one TP rank's process. The PD router (connex.serving.pd_router) runs in-process or as
 a subprocess; instances register in a Connex front-router when
 ``--front-router`` is on, else the router gets static URL lists.
+
+Several hosts: ``--hosts hosts.json`` names hosts and how to run a shell on
+each, and a GPU spec ``B:2+3`` starts the instance on host ``B``::
+
+    {"B": {"ip": "10.0.0.2", "exec": ["ssh", "node-b"]},
+     "C": {"ip": "10.0.0.3", "exec": ["kubectl", "exec", "agent-c", "--"],
+           "env": {"CONNEX_IB_DEVICE": "mlx5_1"}}}
+
+``ip`` is the address peers use (the RDMA NIC's IP); ``exec`` is a command
+prefix that runs its arguments on the host (``ssh``, ``kubectl exec`` into an
+agent pod, ...). The model path, ``--python`` and this repository must exist
+at the same paths there (``python``/``root`` override them per host). The
+routers run here and must be reachable from the hosts (``CONNEX_HOST_IP``).
 """
 from __future__ import annotations
 
@@ -58,6 +71,8 @@ def _rdma_ip():
 
 
 class Instance:
+    host = None
+
     def __init__(self, name, role, gpu, port, cmd, env, log):
         self.name, self.role, self.gpu, self.port = name, role, gpu, port
         self.url = f"http://127.0.0.1:{port}"
@@ -120,33 +135,158 @@ class Instance:
         return t
 
 
+class RemoteInstance(Instance):
+    """An instance on another host, started and killed through ``host["exec"]``.
+
+    The process runs in its own session there (``setsid``), so its pid is
+    also its process group; its log stays on the host until ``fetch_log``."""
+
+    def __init__(self, name, role, gpu, port, cmd, env, log, host, hostname):
+        super().__init__(name, role, gpu, port, cmd, env, log)
+        self.host, self.hostname = host, hostname
+        self.url = f"http://{host['ip']}:{port}"
+        self.remote_log = f"/tmp/connex-pd-{name}-{port}.log"
+        self.pid = None
+        self.kill_times = []      # (local time before, host time of the kill, local after)
+
+    def _sh(self, script, timeout=60):
+        r = subprocess.run([*self.host["exec"], "bash", "-c", script], capture_output=True,
+                           text=True, timeout=timeout)
+        return r.stdout
+
+    def start(self):
+        import shlex
+
+        envs = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in self.env.items())
+        cmd = " ".join(shlex.quote(c) for c in self.cmd)
+        pidf = f"{self.remote_log}.pid"
+        if not getattr(self, "_started", False):   # a fresh log per deployment
+            self._sh(f"rm -f {self.remote_log}")
+            self._started = True
+        inner = f"echo $$ > {pidf}; cd /tmp; exec env -i {envs} {cmd}"
+        out = self._sh(f"rm -f {pidf}; setsid -f bash -c {shlex.quote(inner)} >> {self.remote_log} "
+                       f"2>&1 < /dev/null; for i in $(seq 50); do [ -s {pidf} ] && break; "
+                       f"sleep 0.1; done; cat {pidf}")
+        self.pid = int(out.strip().splitlines()[-1])
+        return self
+
+    def kill(self, sig=signal.SIGKILL):
+        if self.pid is None:
+            return
+        n = int(sig)
+        self._sh(f"kill -{n} -{self.pid} 2>/dev/null; for i in $(seq 60); do "
+                 f"kill -0 -{self.pid} 2>/dev/null || exit 0; sleep 0.5; done; "
+                 f"kill -9 -{self.pid} 2>/dev/null", timeout=90)
+
+    def alive(self):
+        if self.pid is None:
+            return False
+        return self._sh(f"kill -0 {self.pid} 2>/dev/null && echo y").strip() == "y"
+
+    def rank_pids(self):
+        import re
+
+        out = {}
+        if self.pid is None:
+            return out
+        ps = self._sh(f"ps -o pid=,args= -g {self.pid}")
+        for line in ps.splitlines():
+            m = re.search(r"(?:Worker|scheduler)_TP(\d+)", line)
+            if m:
+                out[int(m.group(1))] = int(line.split()[0])
+        return out
+
+    def kill_rank(self, rank, sig=signal.SIGKILL):
+        pid = self.rank_pids().get(rank)
+        if pid is None:
+            return None
+        t0 = time.time()
+        out = self._sh(f"date +%s.%N; kill -{int(sig)} {pid}")
+        t1 = time.time()
+        th = float(out.split()[0])
+        self.kill_times.append((t0, th, t1))
+        # the host's clock may be off; the local midpoint of the round trip is
+        # within half of it of the kill
+        return (t0 + t1) / 2
+
+    def kill_group(self, sig=signal.SIGKILL):
+        """SIGKILL the whole instance at once; returns the local kill time."""
+        t0 = time.time()
+        self._sh(f"kill -{int(sig)} -{self.pid}")
+        t1 = time.time()
+        self.kill_times.append((t0, None, t1))
+        return (t0 + t1) / 2
+
+    def gpus_free(self, need_mib=30000):
+        out = self._sh("nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits")
+        free = dict(x.replace(" ", "").split(",") for x in out.strip().splitlines())
+        return all(int(free.get(g, 0)) >= need_mib for g in str(self.gpu).split("+"))
+
+    def fetch_log(self):
+        try:
+            data = subprocess.run([*self.host["exec"], "cat", self.remote_log],
+                                  capture_output=True, timeout=120).stdout
+            with open(self.logpath, "ab") as f:
+                f.write(data)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def split_spec(spec):
+    """``"B:2+3"`` -> ``("B", "2+3")``; ``"2+3"`` -> ``(None, "2+3")``."""
+    spec = str(spec)
+    if ":" in spec:
+        h, g = spec.split(":", 1)
+        return h, g
+    return None, spec
+
+
 class Deployment:
     """One host, one model, prefill and decode pools plus the PD router."""
 
     def __init__(self, engine, connector, model, logdir, python, gpu_mem=0.85,
                  max_model_len=4096, base_port=8100, router_port=8000, front_router=False,
-                 extra_args=(), retain_s=60.0):
+                 extra_args=(), retain_s=60.0, hosts=None):
         self.engine, self.connector, self.model = engine, connector, model
         self.logdir, self.python = logdir, python
         self.gpu_mem, self.max_model_len = gpu_mem, max_model_len
-        self.base_port, self.router_port = base_port, router_port
+        # CONNEX_PD_PORT_OFFSET shifts every port, so that two deployments can
+        # share hosts (instances, routers, control and data-plane ports)
+        self.po = int(os.getenv("CONNEX_PD_PORT_OFFSET", "0"))
+        self.base_port, self.router_port = base_port + self.po, router_port + self.po
         self.front_router = front_router
         self.extra_args = list(extra_args)
         self.retain_s = retain_s
+        self.hosts = hosts or {}
         self.instances: list[Instance] = []
         # data-plane address: the RDMA (IPoIB) interface if there is one; UCX
         # cannot reach 127.0.0.1 over an RDMA device
         self.host_ip = os.getenv("CONNEX_HOST_IP") or _rdma_ip() or "127.0.0.1"
+        # where the instances reach the routers: loopback unless some are remote
+        self.ctrl_ip = self.host_ip if self.hosts else "127.0.0.1"
         self.router = None
         self.fr = None
         self.n = 0
         os.makedirs(logdir, exist_ok=True)
 
     # -- instance commands -------------------------------------------------------
-    def _env(self, gpu):
-        env = dict(os.environ)
+    def _env(self, gpu, host=None):
+        if host is None:
+            env = dict(os.environ)
+            root = ROOT
+        else:   # a clean environment on the host: only what the instance needs
+            keep = ("HF_HOME", "HF_HUB_OFFLINE", "VLLM_LOGGING_LEVEL")
+            env = {k: os.environ[k] for k in keep if k in os.environ}
+            env["PATH"] = "/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            env["HOME"] = "/root"
+            env.update({k: v for k, v in os.environ.items()
+                        if k.startswith(("CONNEX_", "UCX_", "SGLANG_", "VLLM_", "NCCL_"))
+                        and k != "CONNEX_HOST_IP"})
+            env["CONNEX_HOST_IP"] = host["ip"]
+            env.update(host.get("env", {}))
+            root = host.get("root", ROOT)
         env["CUDA_VISIBLE_DEVICES"] = str(gpu).replace("+", ",")
-        env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = root + os.pathsep + env.get("PYTHONPATH", "")
         env.setdefault("CONNEX_HOST_IP", self.host_ip)
         # host nvcc may be older than the wheel's CUDA: avoid FlashInfer JIT kernels
         env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
@@ -154,13 +294,16 @@ class Deployment:
         env.pop("HTTP_PROXY", None), env.pop("HTTPS_PROXY", None)
         env["NO_PROXY"] = "*"
         if self.engine == "sglang":
-            env.setdefault("SGLANG_HOST_IP", self.host_ip)   # KV manager / bootstrap address
+            env.setdefault("SGLANG_HOST_IP", env["CONNEX_HOST_IP"])   # KV manager / bootstrap address
             # sglang 0.5.22 wheels pin flashinfer 0.7.1 but flashinfer-cubin 0.6.3
             env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
         return env
 
-    def _vllm_cmd(self, role, port, idx, tp=1):
-        cmd = [self.python, "-m", "vllm.entrypoints.openai.api_server", "--model", self.model,
+    def _ip(self, host):
+        return host["ip"] if host else "127.0.0.1"
+
+    def _vllm_cmd(self, role, port, idx, tp=1, host=None):
+        cmd = [(host or {}).get("python", self.python), "-m", "vllm.entrypoints.openai.api_server", "--model", self.model,
                "--served-model-name", "model", "--port", str(port),
                "--gpu-memory-utilization", str(self.gpu_mem),
                "--max-model-len", str(self.max_model_len),
@@ -170,10 +313,10 @@ class Deployment:
             return cmd
         kv_role = "kv_producer" if role == "prefill" else "kv_consumer"
         if self.connector == "connex":
-            extra = {"ctrl_port": 17100 + 10 * idx, "retain_s": self.retain_s,
-                     "replica": idx, "http_url": f"http://127.0.0.1:{port}"}
+            extra = {"ctrl_port": 17100 + self.po + 10 * idx, "retain_s": self.retain_s,
+                     "replica": idx, "http_url": f"http://{self._ip(host)}:{port}"}
             if self.front_router:
-                extra["front_router"] = "tcp://127.0.0.1:25555"
+                extra["front_router"] = f"tcp://{self.ctrl_ip}:{25555 + self.po}"
             cfg = {"kv_connector": "ConnexConnector",
                    "kv_connector_module_path": "connex.adapters.vllm.pd_connector",
                    "kv_role": kv_role, "kv_connector_extra_config": extra}
@@ -183,9 +326,10 @@ class Deployment:
             raise ValueError(self.connector)
         return cmd + ["--kv-transfer-config", json.dumps(cfg)]
 
-    def _sglang_cmd(self, role, port, idx, tp=1):
-        cmd = [self.python, "-m", "sglang.launch_server", "--model-path", self.model,
-               "--served-model-name", "model", "--port", str(port), "--host", "127.0.0.1",
+    def _sglang_cmd(self, role, port, idx, tp=1, host=None):
+        cmd = [(host or {}).get("python", self.python), "-m", "sglang.launch_server",
+               "--model-path", self.model,
+               "--served-model-name", "model", "--port", str(port), "--host", self._ip(host),
                "--mem-fraction-static", str(self.gpu_mem),
                "--context-length", str(self.max_model_len),
                "--attention-backend", "triton", "--sampling-backend", "pytorch",
@@ -197,30 +341,39 @@ class Deployment:
         cmd += ["--disaggregation-mode", role,
                 "--disaggregation-transfer-backend", self.connector]
         if role == "prefill":
-            cmd += ["--disaggregation-bootstrap-port", str(8998 + idx)]
+            cmd += ["--disaggregation-bootstrap-port", str(8998 + self.po + idx)]
         if self.connector == "mooncake":
-            cmd += ["--disaggregation-ib-device", os.getenv("CONNEX_IB_DEVICE", "mlx5_0")]
+            cmd += ["--disaggregation-ib-device", (host or {}).get("env", {}).get(
+                "CONNEX_IB_DEVICE", os.getenv("CONNEX_IB_DEVICE", "mlx5_0"))]
         return cmd
 
     def add(self, role, gpu, start=True):
         idx = self.n
         self.n += 1
         port = self.base_port + idx
+        hostname, gpu = split_spec(gpu)
+        host = self.hosts[hostname] if hostname else None
+        ip = self._ip(host)
         tp = len(str(gpu).split("+"))
-        cmd = (self._vllm_cmd if self.engine == "vllm" else self._sglang_cmd)(role, port, idx, tp)
-        env = self._env(gpu)
+        cmd = (self._vllm_cmd if self.engine == "vllm" else self._sglang_cmd)(
+            role, port, idx, tp, host)
+        env = self._env(gpu, host)
         if self.connector == "nixl":
-            env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(5600 + idx)
+            env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(5600 + self.po + idx)
+            env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = ip   # default localhost: no cross-host handshake
         if self.engine == "sglang":
             # fixed connex-rs ports: a random free port can later collide with
             # one SGLang hands to its own components
-            env.setdefault("CONNEX_RS_PORT", str(52000 + 10 * idx))
+            env.setdefault("CONNEX_RS_PORT", str(52000 + self.po + 10 * idx))
         if self.engine == "sglang" and self.front_router:
-            env.update(CONNEX_PD_FRONT_ROUTER="tcp://127.0.0.1:25555",
-                       CONNEX_PD_HTTP_URL=f"http://127.0.0.1:{port}", CONNEX_PD_MODEL="model",
-                       CONNEX_PD_REPLICA=str(idx), CONNEX_PD_BOOTSTRAP=f"127.0.0.1:{8998 + idx}")
-        inst = Instance(f"{role}{idx}", role, gpu, port, cmd, env,
-                        os.path.join(self.logdir, f"{role}{idx}.log"))
+            env.update(CONNEX_PD_FRONT_ROUTER=f"tcp://{self.ctrl_ip}:{25555 + self.po}",
+                       CONNEX_PD_HTTP_URL=f"http://{ip}:{port}", CONNEX_PD_MODEL="model",
+                       CONNEX_PD_REPLICA=str(idx), CONNEX_PD_BOOTSTRAP=f"{ip}:{8998 + self.po + idx}")
+        log = os.path.join(self.logdir, f"{role}{idx}.log")
+        if host is None:
+            inst = Instance(f"{role}{idx}", role, gpu, port, cmd, env, log)
+        else:
+            inst = RemoteInstance(f"{role}{idx}", role, gpu, port, cmd, env, log, host, hostname)
         self.instances.append(inst)
         if start:
             inst.start()
@@ -228,7 +381,8 @@ class Deployment:
 
     def start_front_router(self):
         self.fr = subprocess.Popen([sys.executable, "-m", "connex.front_router", "--api-address",
-                                    "tcp://*:25555", "--event-address", "tcp://*:25560"],
+                                    f"tcp://*:{25555 + self.po}", "--event-address",
+                                    f"tcp://*:{25560 + self.po}"],
                                    # members' lease as in production setups: 2 s
                                    env={**self._env(""), "CONNEX_HEARTBEAT_TIMEOUT_S":
                                         os.getenv("CONNEX_HEARTBEAT_TIMEOUT_S", "2")},
@@ -244,11 +398,12 @@ class Deployment:
                "--prefill-file", os.path.join(self.logdir, "prefill.txt"),
                "--decode-file", os.path.join(self.logdir, "decode.txt")]
         if self.engine == "sglang":
-            cmd += ["--bootstrap", ",".join(f"{i.url}=127.0.0.1:{8998 + int(i.name[len(i.role):])}"
-                                            for i in self.instances if i.role == "prefill")]
+            cmd += ["--bootstrap", ",".join(
+                f"{i.url}={self._ip(i.host)}:{8998 + self.po + int(i.name[len(i.role):])}"
+                for i in self.instances if i.role == "prefill")]
         if self.front_router:
-            cmd += ["--front-router", "tcp://127.0.0.1:25555", "--model", "model",
-                    "--front-router-events", "tcp://127.0.0.1:25560"]
+            cmd += ["--front-router", f"tcp://{self.ctrl_ip}:{25555 + self.po}", "--model", "model",
+                    "--front-router-events", f"tcp://{self.ctrl_ip}:{25560 + self.po}"]
         for f in ("prefill.txt", "decode.txt"):
             open(os.path.join(self.logdir, f), "a").close()   # keep files written before
         self.router = subprocess.Popen(cmd, env=self._env(""), start_new_session=True,
@@ -262,16 +417,29 @@ class Deployment:
             wait_http(i.url, timeout, i.proc)
 
     def set_pool_file(self, role, urls):
-        with open(os.path.join(self.logdir, f"{role}.txt"), "w") as f:
+        # atomic: the router re-reads the file every second and must never
+        # see it truncated (an empty pool fails requests)
+        path = os.path.join(self.logdir, f"{role}.txt")
+        with open(path + ".tmp", "w") as f:
             f.write("\n".join(urls) + "\n")
+        os.replace(path + ".tmp", path)
 
     def down(self):
         for i in self.instances:
             i.kill(signal.SIGTERM)
+            if isinstance(i, RemoteInstance):
+                i.fetch_log()
         for p in (self.router, self.fr):
             if p is not None and p.poll() is None:
                 os.killpg(p.pid, signal.SIGKILL)
                 p.wait()
+
+
+def load_hosts(path):
+    if not path:
+        return {}
+    with open(path) as f:
+        return json.load(f)
 
 
 def main():
@@ -294,17 +462,19 @@ def main():
                     help="router reads pools only from prefill.txt / decode.txt in --logdir "
                          "(initially the first prefill and decode instance); edit them to scale")
     ap.add_argument("--hold", action="store_true", help="stay up until Ctrl-C")
+    ap.add_argument("--hosts", default=None,
+                    help="JSON file of remote hosts; GPU specs HOST:GPUS start there")
     a = ap.parse_args()
     d = Deployment(a.engine, a.connector, a.model, a.logdir, a.python, gpu_mem=a.gpu_mem,
                    max_model_len=a.max_model_len, base_port=a.base_port,
                    router_port=a.router_port, front_router=a.front_router,
-                   extra_args=a.extra.split())
+                   extra_args=a.extra.split(), hosts=load_hosts(a.hosts))
     if a.front_router:
         d.start_front_router()
     gpus = [("prefill", g) for g in a.prefill_gpus.split(",")] + \
         [("decode", g) for g in a.decode_gpus.split(",")] + \
         ([("single", a.single)] if a.single is not None else [])
-    used = [x for _, g in gpus for x in str(g).split("+")]
+    used = [(split_spec(g)[0], x) for _, g in gpus for x in split_spec(g)[1].split("+")]
     shared = len(set(used)) < len(used)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # run the finally below
     try:
