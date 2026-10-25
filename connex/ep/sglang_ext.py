@@ -11,7 +11,8 @@ in place reroutes tokens, also inside captured CUDA graphs.
 
 Control path. The ``connex_ep`` ``sglang.srt.plugins`` entry point (opt-in
 with ``CONNEX_EP=1``) adds a small control endpoint to the scheduler of TP
-rank 0 (HTTP, ``CONNEX_EP_PORT``; default: server port + 1000). A command
+rank 0 (HTTP, ``CONNEX_EP_PORT``; default: a free port, advertised in the
+server log and in ``ctl_file(server_port)``). A command
 posted there is put into the list of requests that rank 0 broadcasts to the
 other TP ranks at the top of every scheduler iteration (the same broadcast
 that carries the timeout aborts), so every rank runs it between the same two
@@ -170,15 +171,42 @@ def _setup(sched):
         return
     sched._connex_ep_q = queue.Queue()
     sched._connex_ep_wait = {}
-    port = os.environ.get("CONNEX_EP_PORT")
-    if not port:
-        sa = getattr(sched, "server_args", None)
-        base = getattr(sa, "port", None)
-        if base is None:
+    port = int(os.environ.get("CONNEX_EP_PORT") or 0)    # 0: any free port
+    _serve(sched, port)
+    _advertise(sched)
+
+
+def _server_port(sched):
+    sa = getattr(sched, "server_args", None)
+    base = getattr(sa, "port", None)
+    if base is None:
+        try:
             from sglang.srt.runtime_context import get_serving
-            base = getattr(get_serving(), "port", 30000)
-        port = int(base) + 1000
-    _serve(sched, int(port))
+            base = getattr(get_serving(), "port", None)
+        except Exception:  # noqa: BLE001
+            base = None
+    return base
+
+
+def ctl_file(server_port):
+    """Where TP rank 0 advertises its control endpoint for ``server_port``
+    (``CONNEX_EP_CTL_FILE`` overrides)."""
+    import tempfile
+    return os.environ.get("CONNEX_EP_CTL_FILE") or os.path.join(
+        tempfile.gettempdir(), f"connex-ep-ctl-{server_port}.json")
+
+
+def _advertise(sched):
+    host, port = sched._connex_ep_srv.server_address[:2]
+    url = f"http://{host}:{port}"
+    info = {"url": url, "port": port, "server_port": _server_port(sched), "pid": os.getpid()}
+    path = ctl_file(info["server_port"])
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(info, f)
+    os.replace(tmp, path)
+    sched._connex_ep_ctl = info
+    log.info("connex.ep control endpoint %s (advertised in %s)", url, path)
 
 
 def _run_cmd(sched, cmd):
@@ -252,7 +280,6 @@ def _serve(sched, port):
     srv = ThreadingHTTPServer((os.environ.get("CONNEX_EP_HOST", "127.0.0.1"), port), H)
     srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True, name="connex-ep-ctl").start()
-    log.info("connex.ep control endpoint on port %d", port)
     sched._connex_ep_srv = srv
 
 
@@ -525,11 +552,20 @@ class SGLangEPWorker(ConnexEPWorker):
 class SGLangEPEngine(VLLMEPEngine):
     """``EPController`` engine handle for one SGLang server (all EP ranks).
 
-    ``ctrl_url`` is the control endpoint of TP rank 0 (``CONNEX_EP_PORT``;
-    default server port + 1000)."""
+    ``ctrl_url`` is the control endpoint of TP rank 0: ``CONNEX_EP_PORT`` when
+    set, else a free port advertised in :func:`ctl_file` (see
+    :meth:`from_server`)."""
 
     def __init__(self, ctrl_url, **kw):
         super().__init__(ctrl_url, **kw)
+
+    @classmethod
+    def from_server(cls, server_url, **kw):
+        """Handle for the SGLang server at ``server_url`` (same host): reads
+        the control endpoint its TP rank 0 advertised."""
+        port = int(server_url.rstrip("/").rsplit(":", 1)[1])
+        with open(ctl_file(port)) as f:
+            return cls(json.load(f)["url"], **kw)
 
     def describe(self, poll_s=0.02):
         """Every rank's ``ExpertStore.describe()``; registration runs in the

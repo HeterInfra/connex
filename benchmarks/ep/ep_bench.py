@@ -31,8 +31,8 @@ Events (``--event``):
 Request load, prompts and the score check reuse ``benchmarks/pd/pd_bench.py``.
 
 SGLang (``--engine sglang``): the server runs with ``CONNEX_EP=1`` and the
-controller talks to the control endpoint of TP rank 0 (``--ctrl``, default
-server port + 1000). Requests and the score use SGLang's native
+controller talks to the control endpoint of TP rank 0 (``--ctrl``, default: the
+one it advertised in ``connex.ep.sglang_ext.ctl_file``). Requests and the score use SGLang's native
 ``/generate`` with token ids (prompts tokenized locally with ``--tokenizer``)::
 
     ep_bench.py run --engine sglang --url http://127.0.0.1:8301 \
@@ -60,8 +60,9 @@ from connex.ep.vllm_ext import VLLMEPEngine  # noqa: E402
 def make_engine(a):
     if getattr(a, "engine", "vllm") == "sglang":
         from connex.ep.sglang_ext import SGLangEPEngine
-        ctrl = a.ctrl or "http://127.0.0.1:%d" % (int(a.url.rsplit(":", 1)[1]) + 1000)
-        return SGLangEPEngine(ctrl, async_moves=not a.sync_moves)
+        if a.ctrl:
+            return SGLangEPEngine(a.ctrl, async_moves=not a.sync_moves)
+        return SGLangEPEngine.from_server(a.url, async_moves=not a.sync_moves)
     return VLLMEPEngine(a.url, async_moves=not a.sync_moves)
 
 

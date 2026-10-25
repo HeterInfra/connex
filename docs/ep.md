@@ -138,7 +138,7 @@ all-to-all backend the `dynamic` dispatch picks replica
 tensors, in place, so captured CUDA graphs keep reading them:
 
 ```bash
-CONNEX_EP=1 CONNEX_EP_PORT=18301 python -m sglang.launch_server \
+CONNEX_EP=1 python -m sglang.launch_server \
     --model-path Qwen/Qwen1.5-MoE-A2.7B --tp 2 --ep 2 \
     --ep-num-redundant-experts 60 --ep-dispatch-algorithm dynamic
 ```
@@ -147,7 +147,7 @@ CONNEX_EP=1 CONNEX_EP_PORT=18301 python -m sglang.launch_server \
 from connex.ep import EPController
 from connex.ep.sglang_ext import SGLangEPEngine
 
-eng = SGLangEPEngine("http://127.0.0.1:18301")   # control endpoint of TP rank 0
+eng = SGLangEPEngine.from_server("http://127.0.0.1:30000")  # advertised control endpoint
 ctl = EPController(eng.table(), eng)
 ctl.table.active_replicas = 1                    # one routed replica, the other warm standby
 ctl.refresh_peers(); ctl.push()
@@ -156,8 +156,10 @@ ctl.drain_rank(1)
 
 * **Control path.** `CONNEX_EP=1` turns on the `connex_ep` entry point of
   `sglang.srt.plugins` (installed with connex-ai). It adds a small HTTP
-  endpoint to the scheduler of TP rank 0 (`CONNEX_EP_PORT`, default server
-  port + 1000). A command posted there joins the list of requests that
+  endpoint to the scheduler of TP rank 0: `CONNEX_EP_PORT`, or by default a
+  free port, logged and advertised in `ctl_file(server_port)`
+  (`$TMPDIR/connex-ep-ctl-<server port>.json`, `CONNEX_EP_CTL_FILE`
+  overrides), which `SGLangEPEngine.from_server()` reads. A command posted there joins the list of requests that
   rank 0 broadcasts to the other TP ranks at the top of every scheduler
   iteration (the broadcast that already carries the timeout aborts), so all
   ranks run it between the same two forward steps; per-rank results are
@@ -198,9 +200,12 @@ ctl.drain_rank(1)
   server, as in vLLM, so a hard failure is handled by the resume proxy and
   `EPGroupSupervisor` (`ep_failover.py --worker-needle sglang::scheduler
   --kill-needle scheduler_TP1`). SGLang's `/health` runs a one-token
-  generate and answers after at least one second; the supervisor's probe
-  needs `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0` (liveness only; a dead
-  rank is seen by the process watch).
+  generate and answers after at least one second. The supervisor's probe
+  timeout and path are configurable (`EPGroupSupervisor(probe_timeout=,
+  probe_path=)`, `CONNEX_EP_PROBE_TIMEOUT`, `CONNEX_EP_PROBE_PATH`,
+  `ep_failover.py --probe-timeout/--probe-path`; default 3 s, `/health`).
+  Alternatively run SGLang with `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0`
+  (liveness only; a dead rank is seen by the process watch).
 * SGLang's elastic EP (`--elastic-ep-backend mooncake`) masks failed ranks
   out of the all-to-all inside a group; it needs the Mooncake EP kernels,
   which do not load in the tested environment (`Mooncake PG was not built

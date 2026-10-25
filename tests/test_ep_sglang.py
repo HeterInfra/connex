@@ -185,3 +185,53 @@ def test_init_registers_in_the_background_and_polls():
         out = w.connex_ep_init(json.dumps({"transport": "local"}))
     assert out["rank"] == 0 and len(out["layers"]) == L
     assert w.connex_ep_init("{}") == out                 # registered once
+
+
+def test_free_port_is_advertised_and_found(tmp_path, monkeypatch):
+    import queue
+    monkeypatch.setenv("CONNEX_EP_CTL_FILE", str(tmp_path / "ctl.json"))
+    md = FakeMD(linear_rows())
+    sched = FakeScheduler(FakeWorker(md, 0, []))
+    sched._connex_ep_q, sched._connex_ep_wait = queue.Queue(), {}
+    sched.server_args = type("A", (), {"port": 30000})()
+    sglang_ext._serve(sched, 0)                      # any free port
+    sglang_ext._advertise(sched)
+    th = threading.Thread(target=sched.loop, daemon=True)
+    th.start()
+    try:
+        info = json.load(open(tmp_path / "ctl.json"))
+        assert info["server_port"] == 30000 and info["port"] > 0
+        eng = sglang_ext.SGLangEPEngine.from_server("http://127.0.0.1:30000", timeout=10)
+        assert eng.info()[0]["num_experts"] == E
+    finally:
+        sched.stop = True
+        sched._connex_ep_srv.shutdown()
+
+
+def test_supervisor_probe_timeout_and_path(tmp_path):
+    """A /health that answers after 1.2 s (SGLang's) fails a 1 s probe and
+    passes the default 3 s one; the path is configurable."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from connex.ep.groups import EPGroup, EPGroupSupervisor
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            if self.path == "/health":
+                time.sleep(1.2)
+            self.send_response(200 if self.path in ("/health", "/live") else 404)
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        mk = lambda **kw: EPGroupSupervisor([EPGroup("g", url)], str(tmp_path / "ep"), **kw)
+        assert not mk(probe_timeout=1.0).probe(url)
+        assert mk().probe(url)
+        assert mk(probe_timeout=0.5, probe_path="/live").probe(url)
+        assert not mk(probe_path="/nope").probe(url)
+    finally:
+        srv.shutdown()

@@ -95,6 +95,10 @@ def main():
                     help="health: /health probes only; process: also watch the rank "
                          "processes (a dead rank is seen within --probe-s)")
     ap.add_argument("--probe-s", type=float, default=0.1)
+    ap.add_argument("--probe-timeout", type=float, default=None,
+                    help="health probe timeout in s (default CONNEX_EP_PROBE_TIMEOUT or 3)")
+    ap.add_argument("--probe-path", default=None,
+                    help="health probe path (default CONNEX_EP_PROBE_PATH or /health)")
     ap.add_argument("--reload-interval", type=float, default=0.2,
                     help="how often the proxy re-reads the endpoints file")
     ap.add_argument("--out", required=True)
@@ -125,7 +129,8 @@ def main():
 
         sup = EPGroupSupervisor([EPGroup("ep-group/a", ua, restart_a, procs["a"], pids("a")),
                                  EPGroup("ep-group/b", ub, None, procs["b"], pids("b"))], epf,
-                                probe_s=a.probe_s, fail_after=2)
+                                probe_s=a.probe_s, fail_after=2,
+                                probe_timeout=a.probe_timeout, probe_path=a.probe_path)
         proxy = subprocess.Popen([sys.executable, "-m", "connex.serving.proxy", "--port",
                                   str(a.proxy_port), "--endpoints-file", epf,
                                   "--probe-interval", "0.5", "--reload-interval",

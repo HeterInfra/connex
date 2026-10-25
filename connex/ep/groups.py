@@ -30,9 +30,19 @@ import urllib.request
 log = logging.getLogger("connex.ep")
 
 
-def _healthy(url, timeout=1.0):
+DEFAULT_PROBE_TIMEOUT = 3.0     # SGLang's /health answers after >= 1 s
+
+
+def _healthy(url, timeout=None, path=None):
+    """GET ``url + path`` answers 200 within ``timeout`` seconds. Defaults:
+    ``CONNEX_EP_PROBE_TIMEOUT`` (3 s) and ``CONNEX_EP_PROBE_PATH``
+    (``/health``)."""
+    if timeout is None:
+        timeout = float(os.environ.get("CONNEX_EP_PROBE_TIMEOUT", DEFAULT_PROBE_TIMEOUT))
+    if path is None:
+        path = os.environ.get("CONNEX_EP_PROBE_PATH", "/health")
     try:
-        req = urllib.request.Request(url.rstrip("/") + "/health")
+        req = urllib.request.Request(url.rstrip("/") + "/" + path.lstrip("/"))
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open(req, timeout=timeout) as r:
             return r.status == 200
@@ -73,7 +83,12 @@ class EPGroup:
 
 class EPGroupSupervisor:
     def __init__(self, groups, endpoints_file, probe_s=0.5, fail_after=2,
-                 start_timeout=600.0, probe=_healthy):
+                 start_timeout=600.0, probe=None, probe_timeout=None, probe_path=None):
+        """``probe(url) -> bool`` checks one group; by default an HTTP GET of
+        ``probe_path`` with ``probe_timeout`` (see :func:`_healthy`)."""
+        if probe is None:
+            def probe(url, _t=probe_timeout, _p=probe_path):
+                return _healthy(url, _t, _p)
         self.groups = {g.name: g for g in groups}
         self.file = endpoints_file
         self.probe_s = probe_s
