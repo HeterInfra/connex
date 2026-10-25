@@ -196,6 +196,30 @@ def test_stall_midstream_idle_timeout():
     run(go())
 
 
+def test_endpoint_removed_from_file_cuts_its_streams_at_once(tmp_path):
+    """A supervisor removing a dead endpoint from the endpoints file moves its
+    in-flight streams now, not after the idle timeout."""
+    async def go():
+        async with Rig(idle=30.0) as rig:
+            f = tmp_path / "eps"
+            f.write_text("\n".join(rig.proxy.pool.order) + "\n")
+            rig.proxy.pool.file = str(f)
+            for b in rig.backends:
+                b.fail, b.fail_count = ("stall", 4), 1
+            task = asyncio.create_task(rig.stream("/v1/completions", comp_body()))
+            await asyncio.sleep(0.3)
+            busy = [e for e in rig.proxy.pool.eps.values() if e.inflight][0]
+            for b in rig.backends:
+                b.fail = None                                  # the other replica is fine
+            f.write_text("\n".join(u for u in rig.proxy.pool.order if u != busy.url) + "\n")
+            t0 = time.time()
+            rig.proxy.pool.reload()
+            st, chunks = await asyncio.wait_for(task, 5)
+            check_completion(chunks)
+            assert time.time() - t0 < 1.0 and rig.proxy.stats["resumes"] == 1
+    run(go())
+
+
 def test_slow_prefill_not_cut():
     async def go():
         async with Rig(idle=0.2, ttft_ms=800) as rig:
