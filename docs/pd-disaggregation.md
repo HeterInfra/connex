@@ -104,8 +104,10 @@ in [`docs/results.md`](results.md#7-prefill-decode-disaggregation-on-upstream-vl
 
 ## Requirements and limits
 
-- Prefill and decode use the same model, tensor-parallel size and block size
-  (vLLM rank r pulls from rank r). Full-attention KV only (no Mamba or
+- Prefill and decode use the same model and block size. Tensor-parallel
+  sizes may differ (each decode rank pulls its KV heads from the prefill
+  ranks that hold them; SGLang needs `SGLANG_DISAGG_STAGING_BUFFER=1` for
+  different sizes), see [`tp.md`](tp.md). Full-attention KV only (no Mamba or
   sliding-window groups), no pipeline parallelism inside an instance.
 - connex-rs: prefill and decode on **different GPUs**, and KV block segments
   of at least 4 KB (UCX copies smaller reads with the CPU; see the design

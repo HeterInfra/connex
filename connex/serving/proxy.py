@@ -451,22 +451,26 @@ class Proxy:
             ep.inflight -= 1
 
     async def _watchdog(self, r, last, fired, dead=None):
-        """Close the stream when no line arrived for idle_timeout, or at once
-        when the endpoint is declared dead (probe, removal, other stream)."""
+        """Close the response when no line arrived for idle_timeout, or at
+        once when the replica is declared dead meanwhile (``dead``, e.g. a
+        failure event from the control plane): the pending readline fails and
+        the request resumes elsewhere without waiting out the idle timeout."""
         loop = asyncio.get_running_loop()
-        while True:
-            wait = last[0] + self.idle_timeout - loop.time()
-            if wait <= 0 or (dead is not None and dead.is_set()):
-                fired[0] = True
-                r.close()
-                return
-            if dead is None:
-                await asyncio.sleep(max(wait, 0.01))
-            else:
-                try:
-                    await asyncio.wait_for(dead.wait(), timeout=max(wait, 0.01))
-                except asyncio.TimeoutError:
-                    pass
+        dw = asyncio.ensure_future(dead.wait()) if dead is not None else None
+        try:
+            while True:
+                wait = last[0] + self.idle_timeout - loop.time()
+                if wait <= 0 or (dw is not None and dw.done()):
+                    fired[0] = True
+                    r.close()
+                    return
+                if dw is not None:
+                    await asyncio.wait({dw}, timeout=max(wait, 0.01))
+                else:
+                    await asyncio.sleep(max(wait, 0.01))
+        finally:
+            if dw is not None and not dw.done():
+                dw.cancel()
 
     async def _wait_first(self, content, ep, abort=None):
         """Wait for the next line before the first token, without a fixed idle

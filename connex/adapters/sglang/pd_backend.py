@@ -160,12 +160,17 @@ class ConnexRsTransferEngine:
         except Exception as e:  # noqa: BLE001
             log.warning("connex-rs: posting writes to %s failed: %s", session_id, e)
             rc = -2
+        err = None
         for h in handles:  # drain everything posted before reporting
             try:
                 if not h.wait(self.timeout_ms + 1000):
                     rc = rc or -3
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                err = err or e
                 rc = rc or -2
+        if rc:
+            log.warning("connex-rs: %d writes to %s failed (rc=%d): %s", len(handles),
+                        session_id, rc, err)
         return rc
 
     # -- misc --------------------------------------------------------------------
@@ -197,6 +202,7 @@ def _free_port(host: str) -> int:
 _ENGINE = None
 _ENGINE_LOCK = threading.Lock()
 _MEMBER = None
+_REPORTER = None
 
 
 def get_engine(hostname: str, role: str, gpu_id: int) -> ConnexRsTransferEngine:
@@ -207,20 +213,33 @@ def get_engine(hostname: str, role: str, gpu_id: int) -> ConnexRsTransferEngine:
         return _ENGINE
 
 
-def _maybe_register_member(role: str, rank: int) -> None:
-    """Register this instance in the front-router PD pools (rank 0 only)."""
+def _maybe_register_member(role: str, rank: int, tp_size: int = 1, engine=None) -> None:
+    """Register this TP rank in the front-router PD pools as shard ``rank``
+    of a group of ``tp_size``: the instance is listed only while every rank
+    is registered, and one rank missing its lease fails the whole group."""
     global _MEMBER
     fr = os.getenv("CONNEX_PD_FRONT_ROUTER")
     url = os.getenv("CONNEX_PD_HTTP_URL")
-    if not fr or not url or rank != 0 or _MEMBER is not None:
+    if not fr or not url or _MEMBER is not None:
         return
     from connex.pd.membership import PDMember
 
     bootstrap = os.getenv("CONNEX_PD_BOOTSTRAP")   # host:port, advertised for prefill
-    _MEMBER = PDMember(fr, os.getenv("CONNEX_PD_MODEL", "default"), role,
-                       int(os.getenv("CONNEX_PD_REPLICA", "0")), url,
-                       kv_addr=bootstrap if role == "prefill" else None)
+    model = os.getenv("CONNEX_PD_MODEL", "default")
+    rs = [f"rs={engine.session_id}"] if engine is not None else []
+    _MEMBER = PDMember(fr, model, role, int(os.getenv("CONNEX_PD_REPLICA", "0")), url,
+                       kv_addr=bootstrap if role == "prefill" else None,
+                       shard=rank, group_size=max(1, tp_size), extra_addresses=rs)
     _MEMBER.start()
+    if engine is not None and hasattr(engine.engine, "wait_event"):
+        # a peer rank's death (connex-rs event) fails its whole group now;
+        # SGLang names connex-rs endpoints by port, resolved via rs=host:port
+        from connex.pd.group import PeerDeathReporter, rs_port_resolver
+
+        global _REPORTER
+        _REPORTER = PeerDeathReporter(engine.engine, fr, "sglang-pd",
+                                      resolve=rs_port_resolver(fr, model))
+        _REPORTER.start()
 
 
 def _classes():
@@ -239,7 +258,9 @@ def _classes():
                     else "decode")
             self.engine = get_engine(self.local_ip, role, int(self.kv_args.gpu_id))
             try:
-                _maybe_register_member(role, int(self.kv_args.engine_rank))
+                tp = int(getattr(self, "attn_tp_size", 1) or 1)
+                _maybe_register_member(role, int(self.kv_args.engine_rank) % tp, tp,
+                                       engine=self.engine)
             except Exception as e:  # noqa: BLE001  membership is optional
                 log.warning("front-router registration failed: %s", e)
 
@@ -285,6 +306,39 @@ def _native_backend(du) -> bool:
         return False
 
 
+def _allow_staging_buffer() -> None:
+    """Heterogeneous TP (prefill and decode attention TP sizes differ) needs
+    SGLang's staging buffer (``SGLANG_DISAGG_STAGING_BUFFER=1``): KV head
+    slices are gathered into contiguous GPU memory and written in bulk, where
+    the per-token head-slice writes would be ~1 KB each, below connex-rs'
+    zero-copy threshold. The ``connex`` backend *is* the Mooncake manager
+    (staging included), but SGLang's argument check names only mooncake and
+    nixl; let ``connex`` through it."""
+    try:
+        import sglang.srt.arg_groups.pd_disaggregation_hook as hook
+        from sglang.srt.environ import envs
+    except ImportError:
+        return
+    orig = hook.handle_pd_disaggregation
+    if getattr(orig, "_connex", False):
+        return
+
+    def handle_pd_disaggregation(server_args):
+        backend = getattr(server_args, "disaggregation_transfer_backend", None)
+        flag = envs.SGLANG_DISAGG_STAGING_BUFFER
+        if backend != BACKEND or not flag.get():
+            return orig(server_args)
+        get = flag.get
+        flag.get = lambda *a, **k: False      # only for the backend-name check
+        try:
+            return orig(server_args)
+        finally:
+            flag.get = get
+
+    handle_pd_disaggregation._connex = True
+    hook.handle_pd_disaggregation = handle_pd_disaggregation
+
+
 def register() -> None:
     """``sglang.srt.plugins`` entry point: make ``connex`` a transfer backend."""
     import sglang.srt.disaggregation.utils as du
@@ -302,6 +356,7 @@ def register() -> None:
             add_disagg_transfer_backend_choices([BACKEND])
     except ImportError:  # older layout: choices live elsewhere
         log.warning("could not extend --disaggregation-transfer-backend choices")
+    _allow_staging_buffer()
     member = _extend_enum(du.TransferBackend, "CONNEX", BACKEND)
     if getattr(du.get_kv_class, "_connex", False):
         return

@@ -19,6 +19,9 @@
 #   BASE_PORT      Connex pipeline router port [25500 + 10*REPLICA]
 #   HOST_IP        address peers use to reach this stage [first `hostname -I`]
 #   GPU_MEM_UTIL   --gpu-memory-utilization [0.6]
+#   TP             tensor-parallel size of this stage [1]; TP rank 0 is the
+#                  stage's pipeline endpoint (needs CONNEX_PP_INFLIGHT=1 and
+#                  TP GPUs in CUDA_VISIBLE_DEVICES, e.g. GPU_SELECT=none)
 #   EXTRA_ARGS     extra arguments for the vLLM API server
 # GPU selection (GPU_SELECT):
 #   none       keep CUDA_VISIBLE_DEVICES as given (docker --gpus / k8s device plugin)
@@ -109,5 +112,5 @@ python3 -c "import connex; print('connex', connex.__file__)" || true
 exec python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL_PATH" --served-model-name "$MODEL_NAME" --pipeline-stage-mode external \
   --pipeline-stage-idx "$STAGE" --pipeline-total-stages "$NUM_STAGES" --pipeline-layer-range "$range" \
-  --tensor-parallel-size 1 --pipeline-comm-backend "$BACKEND" --gpu-memory-utilization "${GPU_MEM_UTIL:-0.6}" \
+  --tensor-parallel-size "${TP:-1}" --pipeline-comm-backend "$BACKEND" --gpu-memory-utilization "${GPU_MEM_UTIL:-0.6}" \
   --pipeline-router-port "$BASE_PORT" --pipeline-front-router-addr "$ROUTER_ADDR" "${role[@]}" ${EXTRA_ARGS:-}

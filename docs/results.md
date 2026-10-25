@@ -3,7 +3,8 @@
 This page collects the measurements behind Connex v0.1.0 on a vLLM pipeline
 (sections 1-6), prefill-decode disaggregation on upstream vLLM and SGLang
 (section 7), RL weight sync (section 8), agent session migration
-(section 9) and expert parallelism (section 10). Sections 1-6 cover
+(section 9), expert parallelism (section 10) and tensor parallelism with
+group-level recovery (section 11). Sections 1-6 cover
 steady-state latency and throughput with one and four pipeline steps in
 flight, correctness and latency of in-flight request handover when a
 downstream stage dies, goodput while a replica churns (with and without the
@@ -350,9 +351,10 @@ then `pd_bench.py ref/check/load/score` against the router on port 8000 and
 editing the `prefill.txt` / `decode.txt` pool files (`--pool-files`) or with
 `POST /pd/drain`.
 
-Not covered for PD: instances on different hosts (RDMA across nodes), tensor
-parallelism > 1, MLA or hybrid KV caches, front-router membership under real
-failures (unit-tested only), and repeated runs for the steady-state table.
+Not covered for PD: instances on different hosts (RDMA across nodes), MLA or
+hybrid KV caches, and repeated runs for the steady-state table. Tensor
+parallelism > 1 and front-router membership under real failures are in
+section 11.
 
 ## 8. RL weight sync
 
@@ -588,6 +590,130 @@ Not covered: SGLang (no placement driving yet; its Mooncake elastic EP did
 not load in this environment), cross-host EP groups, DeepEP / pplx
 all-to-all, data-parallel attention with EP, sampling (greedy only), more
 than one repetition for most rows.
+## 11. Tensor parallelism
+
+[`tp.md`](tp.md) describes the design: a TP group is one endpoint, KV head
+re-layout between different TP sizes, group-level failure. Setup as in
+section 7 (one host, 4x A40, ConnectX InfiniBand loopback, Llama-3-8B bf16,
+8 KV heads), GPU specs `a+b` are one TP group. GPU 0 carries about 8 GB of
+another tenant's memory; GPUs 0 and 1 are on the socket away from the NIC.
+Single runs. Load and scoring as in section 7 (token-id prompts of 1024
+tokens, 128 greedy tokens; every token of the correctness and kill runs is
+scored teacher-forced on a non-disaggregated vLLM instance, 0.5 nats).
+
+**Correctness, PD** (48 natural-language prompts, concurrency 8):
+
+| engine | prefill TP -> decode TP | GPUs | tokens | off argmax |
+|---|---|---|---|---|
+| vLLM 0.32, ConnexConnector | 2 -> 1 (head re-layout) | 1,2 -> 3 | 6,144 | 0 |
+| vLLM 0.32, ConnexConnector | 1 -> 2 (head re-layout) | 3 -> 1,2 | 6,144 | 0 |
+| vLLM 0.32, ConnexConnector | 2 -> 2 | 0,1 -> 2,3 | 6,144 | 0 |
+| SGLang 0.5.22, connex backend | 2 -> 2 | 2,3 -> 0,1 | 6,144 | 0 |
+| SGLang 0.5.22, connex backend + staging buffer | 2 -> 1 | 2,3 -> 1 | 6,144 | 0 |
+| SGLang 0.5.22, connex backend + staging buffer | 1 -> 2 | 3 -> 0,1 | 6,144 | 0 |
+
+**Steady state, PD 1P1D** (Poisson load for 60 s per QPS, then 128 requests
+from 32 closed-loop clients):
+
+| configuration | load | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) | E2E mean / p99 (s) | tok/s |
+|---|---|---|---|---|---|
+| vLLM TP 1 -> 1, Connex | QPS 1 | 350 / 607 | 31 / 33 | 4.31 / 4.54 | 130 |
+| vLLM TP 1 -> 1, NIXL | QPS 1 | 354 / 585 | 31 / 33 | 4.33 / 4.59 | 130 |
+| vLLM TP 1 -> 1, Connex | QPS 4 | 452 / 1271 | 36 / 38 | 5.12 / 6.08 | 488 |
+| vLLM TP 1 -> 1, NIXL | QPS 4 | 436 / 1167 | 36 / 38 | 5.10 / 5.96 | 488 |
+| vLLM TP 1 -> 1, Connex | 32 clients | 573 / 4741 | 37 / 38 | 5.79 / 9.51 | 643 |
+| vLLM TP 1 -> 1, NIXL | 32 clients | 531 / 4716 | 37 / 38 | 5.74 / 9.47 | 649 |
+| vLLM TP 2 -> 2, Connex | QPS 1 | 224 / 387 | 16 / 16 | 2.25 / 2.41 | 134 |
+| vLLM TP 2 -> 2, Connex | QPS 4 | 213 / 509 | 17 / 19 | 2.41 / 2.82 | 505 |
+| vLLM TP 2 -> 2, Connex | 32 clients | 524 / 3395 | 21 / 22 | 3.56 / 6.10 | 1061 |
+| vLLM TP 2 -> 1, Connex | QPS 1 | 380 / 625 | 31 / 33 | 4.33 / 4.56 | 130 |
+| vLLM TP 2 -> 1, Connex | QPS 4 | 368 / 831 | 36 / 38 | 5.01 / 5.67 | 488 |
+| vLLM TP 2 -> 1, Connex | 32 clients | 642 / 4102 | 38 / 39 | 5.83 / 8.95 | 651 |
+| SGLang TP 1 -> 1, Connex | QPS 1 | 219 / 461 | 31 / 32 | 4.15 / 4.37 | 130 |
+| SGLang TP 1 -> 1, Connex | 32 clients | 936 / 4833 | 38 / 38 | 6.15 / 9.64 | 603 |
+| SGLang TP 2 -> 2, Connex | QPS 1 | 153 / 314 | 16 / 16 | 2.16 / 2.32 | 134 |
+| SGLang TP 2 -> 2, Mooncake | QPS 1 | 153 / 303 | 16 / 16 | 2.16 / 2.30 | 134 |
+| SGLang TP 2 -> 2, Connex | QPS 4 | 144 / 472 | 17 / 19 | 2.30 / 2.84 | 506 |
+| SGLang TP 2 -> 2, Mooncake | QPS 4 | 143 / 525 | 17 / 19 | 2.30 / 2.87 | 506 |
+| SGLang TP 2 -> 2, Connex | 32 clients | 839 / 3766 | 20 / 21 | 3.67 / 6.46 | 1026 |
+| SGLang TP 2 -> 2, Mooncake | 32 clients | 917 / 3748 | 20 / 21 | 3.63 / 6.45 | 1035 |
+
+TP 2 halves TPOT and, with 32 clients, raises throughput from 643 to 1061
+tok/s (vLLM). Connex is on par with NIXL at TP 1 and with SGLang's Mooncake
+backend at TP 2. With a TP-2 prefill feeding a TP-1 decode, TPOT stays at
+the TP-1 decode's level while the faster prefill lowers TTFT under load
+(QPS 4 p99 831 vs 1271 ms); the head re-layout costs about 30 ms of TTFT p50
+at QPS 1 (380 vs 350 ms: the decode rank reads 4,096 ranges of 32 KB instead
+of 32 of 2 MB per 1024-token request). NIXL could not run at TP 2 here (its
+UCX aborts at start-up with two visible GPUs, see [`tp.md`](tp.md#limits)).
+
+**Killing one rank of a TP group under load** (front-router membership, QPS
+2, 240 requests of 1024 + 256 tokens, the rank SIGKILLed at 30 s, the
+instance restarted at 75 s; "group out" is kill to the PD router dropping
+the instance, "stall" the longest gap between two tokens of any request):
+
+| engine, victim | completed | off argmax | group out | stall | TTFT p99 | rejoined |
+|---|---|---|---|---|---|---|
+| vLLM, rank 1 of a TP-2 decode (TP-1 prefill, TP-1 second decode) | 240 / 240 | 0 / 61,440 | 0.57 s | 0.37 s | 1.25 s | 55 s after restart |
+| vLLM, rank 0 of a TP-2 decode | 240 / 240 | 0 / 61,440 | 0.16 s | 0.40 s | 0.66 s | 56 s |
+| vLLM, rank 1 of a TP-2 prefill (TP-1 second prefill) | 240 / 240 | 0 / 61,440 | 0.16 s | 0.06 s | 0.93 s | 54 s |
+| SGLang, rank 1 of a TP-2 decode (TP-1 prefill, staging buffer) | 240 / 240 | 0 / 61,440 | 0.47 s | 2.73 s | 0.57 s | 42 s |
+
+Resumed decode requests re-pulled the held prompt KV from the TP-1 prefill
+into the other decode instance (3 re-pulls and 1 re-prefill per vLLM run);
+SGLang pushes KV, so its 4 resumed requests were prefilled again, which is
+most of its 2.7 s stall. The engine itself took 4-10 s to exit after losing
+a rank; the group left the pools within 0.2-0.6 s because the surviving
+peers' connex-rs data planes reported the dead rank.
+
+**Performance pass** (profile first, then fix):
+
+| bottleneck found | change | before | after |
+|---|---|---|---|
+| streams of a failed group waited for the engine to exit or the idle timeout although the group failure was known in < 0.6 s | PD router subscribes to front-router failure events; the stream watchdog closes the responses of a dead instance | stall 4.19 s / 4.06 s (decode rank 1 / rank 0), prefill-kill TTFT p99 3.34 s | 0.37 s / 0.40 s, 1.35 s |
+| SGLang connex-rs endpoints are named by port, so their peer-death events were not mapped to the group: the group left only when SGLang exited | members advertise `rs=host:port`, the reporter resolves it | group out 4.76 s, stall 6.06 s | 0.47 s, 2.73 s |
+| a killed prefill's GPU memory stayed allocated (> 10 min) while the decode that had read it through UCX cuda_ipc lived, so the prefill could not restart | connex-rs PD plane excludes cuda_ipc (RDMA loopback instead) | restart failed (3 of 3) | restart and rejoin in 54 s; steady state unchanged (1P1D on GPUs 2,3: TTFT p50 at QPS 1 364 vs 362 ms, 640 tok/s with 32 clients either way) |
+| in-group broadcast of pipeline steps | measured, no change: rank 0 spends 0.4-1.0 ms per step broadcasting a 46-61 ms step | | |
+| KV head re-layout op generation | measured, no change: 2.7 ms of CPU per 1024-token request (4,096 reads) vs 0.06 ms for equal TP; both TP sources share one NIC, so reading them in parallel would not help | | |
+
+**Pipeline stages with TP 2** (external-PP fork with engine patch 16,
+Mooncake TE, `CONNEX_PP_INFLIGHT=1`, 2 stages of 16 layers):
+
+| configuration | load | TTFT p50 / p99 (ms) | TPOT p50 / p99 (ms) | E2E mean / p99 (s) | tok/s |
+|---|---|---|---|---|---|
+| 1 chain, TP 1 per stage, TCP | QPS 1 | 245 / 583 | 50 / 62 | 6.68 / 8.06 | 127 |
+| 1 chain, TP 2 per stage, TCP | QPS 1 | 211 / 448 | 53 / 59 | 6.95 / 7.71 | 127 |
+| 1 chain, TP 1 per stage, TCP | 16 clients | 835 / 3032 | 62 / 67 | 8.85 / 10.98 | 230 |
+| 1 chain, TP 2 per stage, TCP | 16 clients | 673 / 2395 | 67 / 72 | 9.32 / 10.97 | 218 |
+| 1 chain, TP 1 per stage, RDMA | QPS 1 | 209 / 493 | 48 / 57 | 6.46 / 7.56 | 127 |
+| 1 chain, TP 2 per stage, RDMA | QPS 1 | 186 / 348 | 54 / 59 | 7.00 / 7.69 | 126 |
+| 1 chain, TP 1 per stage, RDMA | 16 clients | 655 / 2477 | 59 / 62 | 8.19 / 10.00 | 249 |
+| 1 chain, TP 2 per stage, RDMA | 16 clients | 530 / 1851 | 58 / 63 | 7.99 / 9.08 | 254 |
+
+Correctness: 1 chain x 2 stages x TP 2, 16 prompts, 0 of 2,048 tokens off
+argmax. TP 2 lowers TTFT (prefill compute is split) but not TPOT: a decode
+step here is dominated by the per-step path between stages and stage 0's
+scheduling, not by the 16 layers each stage computes; the in-group
+broadcast adds 0.4-1.0 ms per step.
+
+Failover, 2 chains x 2 stages x TP 2 (the stage-0 groups of both chains
+share GPUs 0,1 and the stage-1 groups GPUs 2,3, 0.33 memory fraction each),
+QPS 1, 120 requests of 1024 + 256 tokens to chain 0, one rank of chain 0's
+stage 1 SIGKILLed at 30 s and the stage restarted at 75 s:
+
+| victim | group failure detected by | completed | off argmax | stall |
+|---|---|---|---|---|
+| none | | 120 / 120 | 0 / 30,720 | 0.31 s |
+| rank 1, stage only registered by rank 0 (before group shards) | data-path timeout + probe, 6 s | 120 / 120 | 0 / 30,720 | 8.88 s |
+| rank 1, with group shards | rank 1's lease, 2.4 s | 120 / 120 | 0 / 30,720 | 6.83 s |
+| rank 0, with group shards | rank 0's lease | 120 / 120 | 0 / 30,720 | 5.37 s |
+
+After the failover stage 0 re-prefilled the 16 requests whose KV was on the
+dead stage on chain 1's stage 1; the stall is mostly that re-prefill
+(16 x 1024 tokens). The killed stage's other rank hung instead of exiting,
+which is why per-rank shards matter. The restarted stage came back and a
+follow-up batch of 16 requests completed; whether chain 0 routed to it
+again was not checked (sticky routing keeps the chain on chain 1's stage).
 
 ## How to reproduce
 
@@ -668,7 +794,8 @@ CUDA_VISIBLE_DEVICES=2,3 python benchmarks/ep/link_bw.py
 * Soft churn only at QPS 8 and without the proxy.
 * The proxy was run on the client host (`PROXY=local`), not as an in-cluster
   pod (`deploy/k8s/manifests.py proxy`).
-* Tensor parallelism > 1 on any stage, speculative decoding, structured
+* Tensor parallelism > 1 in the multi-host k8s setup of sections 1-6 (TP is
+  covered on one host in section 11), speculative decoding, structured
   output, and more than 8 failovers of a single request (it is aborted with
   an error).
 * The KV handover covers decoding; a request still in its first prefill step

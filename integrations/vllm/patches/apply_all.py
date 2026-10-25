@@ -16,7 +16,9 @@ chunked-prefill metadata (needs 8), finished_req_ids piggybacking, host
 logits_indices (see their docstrings); re-prefill on failover (14,
 runner + ../core/sched/scheduler.py, CONNEX_PP_REPREFILL=0 disables it) also
 runs before 10, as does the logprobs compile warm-up (15,
-CONNEX_WARMUP_LOGPROBS=0 disables it). Each patch is
+CONNEX_WARMUP_LOGPROBS=0 disables it), and tensor parallelism per stage (16,
+../../config/parallel.py + ../../distributed/parallel_state.py; TP rank 0 is
+the stage's pipeline endpoint). Each patch is
 idempotent. Exits 1 if any selected patch failed (later ones still run, a
 dependent patch then reports its own anchor failure).
 Patches can also be skipped via CONNEX_PP_SKIP_PATCHES="name1,name2".
@@ -42,6 +44,7 @@ ORDER = [
     "patch_external_pp_host_logits_idx.py",
     "patch_external_pp_reprefill.py",
     "patch_external_pp_warmup_logprobs.py",
+    "patch_external_pp_tp.py",
     "patch_external_pp_downstream_graphs.py",
 ]
 

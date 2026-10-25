@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -170,7 +171,8 @@ class PDRouter(Proxy):
 
     def __init__(self, prefill: ElasticPool, decode: ElasticPool, front_router=None,
                  model=None, membership_interval=0.5, prefill_timeout=None,
-                 engine="vllm", bootstrap=None, bootstrap_port=8998, **kw):
+                 engine="vllm", bootstrap=None, bootstrap_port=8998, front_router_events=None,
+                 **kw):
         super().__init__(decode, **kw)
         if engine not in ("vllm", "sglang"):
             raise ValueError(f"engine must be vllm or sglang, got {engine!r}")
@@ -182,8 +184,12 @@ class PDRouter(Proxy):
         self.model = model
         self.membership_interval = membership_interval
         self.prefill_timeout = prefill_timeout
+        if front_router and not front_router_events:
+            front_router_events = front_router.rsplit(":", 1)[0] + ":15560"
+        self.front_router_events = front_router_events
+        self._members: dict[tuple, str] = {}     # (role, replica) -> url, from fetch_pools
         self.stats.update({"prefills": 0, "prefill_retries": 0, "kv_reprefills": 0,
-                           "kv_repulls": 0, "membership_errors": 0})
+                           "kv_repulls": 0, "membership_errors": 0, "failure_events": 0})
 
     # -- lifecycle --------------------------------------------------------------
     def app(self):
@@ -199,6 +205,8 @@ class PDRouter(Proxy):
             self._bg.append(asyncio.create_task(self._reload_prefill_loop()))
         if self.front_router:
             self._bg.append(asyncio.create_task(self._membership_loop()))
+            if self.front_router_events:
+                self._bg.append(asyncio.create_task(self._failure_events_loop()))
 
     async def _reload_prefill_loop(self):
         while True:
@@ -218,9 +226,55 @@ class PDRouter(Proxy):
                 for m in pools[PDRole.PREFILL]:
                     if m.kv_addr:
                         self.bootstrap[m.url] = m.kv_addr
+                for role in (PDRole.PREFILL, PDRole.DECODE):
+                    for m in pools[role]:
+                        self._members[(role, m.replica)] = m.url
                 self.prefill_pool.set_dynamic([m.url for m in pools[PDRole.PREFILL]])
                 self.pool.set_dynamic([m.url for m in pools[PDRole.DECODE]])
             await asyncio.sleep(self.membership_interval)
+
+    async def _failure_events_loop(self):
+        """Front-router failure events -> mark the instance dead at once.
+
+        A failed group (a TP rank's lease lapsed, or a peer's data plane saw a
+        rank die) is announced as deregistered with a failure reason. The
+        instance's in-flight streams and prefills are cut and resume on
+        another instance right away, instead of waiting for the engine to
+        exit or the idle timeout. A graceful leave (no reason, or
+        ``group_left``) is not a failure: its requests finish."""
+        import zmq
+        import zmq.asyncio
+
+        from connex.pd.membership import STAGE_ROLE
+
+        ctx = zmq.asyncio.Context.instance()
+        sub = ctx.socket(zmq.SUB)
+        sub.setsockopt(zmq.LINGER, 0)
+        sub.setsockopt(zmq.SUBSCRIBE, b"connex.endpoint_deregistered")
+        sub.connect(self.front_router_events)
+        try:
+            while True:
+                try:
+                    _, data = await sub.recv_multipart()
+                    ev = json.loads(data)
+                except (ValueError, zmq.ZMQError):
+                    continue
+                payload = ev.get("payload") or {}
+                reason = payload.get("reason")
+                if not reason or reason in ("group_left", "expired"):
+                    continue
+                lid = payload.get("lid") or {}
+                role = STAGE_ROLE.get(lid.get("stage_idx"))
+                url = self._members.get((role, lid.get("replica_idx")))
+                if url is None:
+                    continue
+                pool = self.prefill_pool if role == "prefill" else self.pool
+                ep = pool.eps.get(url)
+                if ep is not None and ep.healthy(time.monotonic()):
+                    self.stats["failure_events"] += 1
+                    pool.mark_bad(ep, f"front-router: {reason}")
+        finally:
+            sub.close(0)
 
     async def _probe_loop(self):
         while True:
@@ -435,6 +489,9 @@ def main():
     ap.add_argument("--front-router", default=None,
                     help="tcp://host:port of the Connex front-router (PD pool membership)")
     ap.add_argument("--model", default=None, help="model name the instances register under")
+    ap.add_argument("--front-router-events", default=None,
+                    help="tcp://host:port of the front-router's event feed (default: the "
+                         "front-router host, port 15560); failure events cut streams at once")
     ap.add_argument("--engine", choices=["vllm", "sglang"], default="vllm",
                     help="vllm: prefill then decode with kv_transfer_params; sglang: prefill "
                          "and decode concurrently, paired by a bootstrap room")
@@ -460,6 +517,7 @@ def main():
     router = PDRouter(pre, dec, front_router=a.front_router, model=a.model,
                       membership_interval=a.membership_interval, prefill_timeout=a.prefill_timeout,
                       engine=a.engine, bootstrap_port=a.bootstrap_port,
+                      front_router_events=a.front_router_events,
                       bootstrap=dict(x.rsplit("=", 1) for x in a.bootstrap.split(",") if x),
                       idle_timeout=a.idle_timeout, connect_timeout=a.connect_timeout,
                       max_attempts=a.max_attempts, probe_interval=a.probe_interval,

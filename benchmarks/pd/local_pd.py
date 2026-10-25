@@ -7,8 +7,9 @@ Used by run_pd_experiments.py; also handy by hand:
     python benchmarks/pd/local_pd.py --engine vllm --connector connex \\
         --model /models/llama3-8b --prefill-gpus 1 --decode-gpus 2 --hold
 
-Every instance is a subprocess with its own GPU, port and log file in
-``--logdir``. The PD router (connex.serving.pd_router) runs in-process or as
+Every instance is a subprocess with its own GPU(s), port and log file in
+``--logdir``. A GPU spec of ``1+2`` starts a tensor-parallel instance (TP 2)
+on GPUs 1 and 2; ``Deployment.kill_rank`` kills one TP rank's process. The PD router (connex.serving.pd_router) runs in-process or as
 a subprocess; instances register in a Connex front-router when
 ``--front-router`` is on, else the router gets static URL lists.
 """
@@ -81,6 +82,43 @@ class Instance:
     def alive(self):
         return self.proc is not None and self.proc.poll() is None
 
+    @property
+    def tp(self):
+        return len(str(self.gpu).split("+"))
+
+    def rank_pids(self):
+        """{TP rank: pid} of this instance's worker processes (vLLM names
+        them ``VLLM::Worker_TP<r>``, SGLang ``sglang::scheduler_TP<r>``)."""
+        import re
+
+        out = {}
+        if not self.alive():
+            return out
+        for d in os.listdir("/proc"):
+            if not d.isdigit():
+                continue
+            try:
+                if os.getpgid(int(d)) != self.proc.pid:
+                    continue
+                with open(f"/proc/{d}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\0", b" ").decode(errors="replace")
+            except (OSError, ProcessLookupError):
+                continue
+            m = re.search(r"(?:Worker|scheduler)_TP(\d+)", cmd)
+            if m:
+                out[int(m.group(1))] = int(d)
+        return out
+
+    def kill_rank(self, rank, sig=signal.SIGKILL):
+        """Kill one TP rank's process (not the rest of the group); returns the
+        time of the kill or None if the rank was not found."""
+        pid = self.rank_pids().get(rank)
+        if pid is None:
+            return None
+        t = time.time()
+        os.kill(pid, sig)
+        return t
+
 
 class Deployment:
     """One host, one model, prefill and decode pools plus the PD router."""
@@ -107,7 +145,7 @@ class Deployment:
     # -- instance commands -------------------------------------------------------
     def _env(self, gpu):
         env = dict(os.environ)
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu).replace("+", ",")
         env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
         env.setdefault("CONNEX_HOST_IP", self.host_ip)
         # host nvcc may be older than the wheel's CUDA: avoid FlashInfer JIT kernels
@@ -121,11 +159,12 @@ class Deployment:
             env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
         return env
 
-    def _vllm_cmd(self, role, port, idx):
+    def _vllm_cmd(self, role, port, idx, tp=1):
         cmd = [self.python, "-m", "vllm.entrypoints.openai.api_server", "--model", self.model,
                "--served-model-name", "model", "--port", str(port),
                "--gpu-memory-utilization", str(self.gpu_mem),
                "--max-model-len", str(self.max_model_len),
+               *(["--tensor-parallel-size", str(tp)] if tp > 1 else []),
                *self.extra_args]
         if role == "single":
             return cmd
@@ -144,13 +183,14 @@ class Deployment:
             raise ValueError(self.connector)
         return cmd + ["--kv-transfer-config", json.dumps(cfg)]
 
-    def _sglang_cmd(self, role, port, idx):
+    def _sglang_cmd(self, role, port, idx, tp=1):
         cmd = [self.python, "-m", "sglang.launch_server", "--model-path", self.model,
                "--served-model-name", "model", "--port", str(port), "--host", "127.0.0.1",
                "--mem-fraction-static", str(self.gpu_mem),
                "--context-length", str(self.max_model_len),
                "--attention-backend", "triton", "--sampling-backend", "pytorch",
                "--page-size", "16",
+               *(["--tp-size", str(tp)] if tp > 1 else []),
                *self.extra_args]
         if role == "single":
             return cmd
@@ -166,7 +206,8 @@ class Deployment:
         idx = self.n
         self.n += 1
         port = self.base_port + idx
-        cmd = (self._vllm_cmd if self.engine == "vllm" else self._sglang_cmd)(role, port, idx)
+        tp = len(str(gpu).split("+"))
+        cmd = (self._vllm_cmd if self.engine == "vllm" else self._sglang_cmd)(role, port, idx, tp)
         env = self._env(gpu)
         if self.connector == "nixl":
             env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(5600 + idx)
@@ -188,7 +229,10 @@ class Deployment:
     def start_front_router(self):
         self.fr = subprocess.Popen([sys.executable, "-m", "connex.front_router", "--api-address",
                                     "tcp://*:25555", "--event-address", "tcp://*:25560"],
-                                   env=self._env(""), start_new_session=True,
+                                   # members' lease as in production setups: 2 s
+                                   env={**self._env(""), "CONNEX_HEARTBEAT_TIMEOUT_S":
+                                        os.getenv("CONNEX_HEARTBEAT_TIMEOUT_S", "2")},
+                                   start_new_session=True,
                                    stdout=open(os.path.join(self.logdir, "front_router.log"), "ab"),
                                    stderr=subprocess.STDOUT)
 
@@ -203,7 +247,8 @@ class Deployment:
             cmd += ["--bootstrap", ",".join(f"{i.url}=127.0.0.1:{8998 + int(i.name[len(i.role):])}"
                                             for i in self.instances if i.role == "prefill")]
         if self.front_router:
-            cmd += ["--front-router", "tcp://127.0.0.1:25555", "--model", "model"]
+            cmd += ["--front-router", "tcp://127.0.0.1:25555", "--model", "model",
+                    "--front-router-events", "tcp://127.0.0.1:25560"]
         for f in ("prefill.txt", "decode.txt"):
             open(os.path.join(self.logdir, f), "a").close()   # keep files written before
         self.router = subprocess.Popen(cmd, env=self._env(""), start_new_session=True,
@@ -259,7 +304,8 @@ def main():
     gpus = [("prefill", g) for g in a.prefill_gpus.split(",")] + \
         [("decode", g) for g in a.decode_gpus.split(",")] + \
         ([("single", a.single)] if a.single is not None else [])
-    shared = len({g for _, g in gpus}) < len(gpus)
+    used = [x for _, g in gpus for x in str(g).split("+")]
+    shared = len(set(used)) < len(used)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))   # run the finally below
     try:
         for role, g in gpus:

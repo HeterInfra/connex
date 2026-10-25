@@ -24,6 +24,39 @@
 - `ConnexRsTransport.read_many` / `LocalTransport.read_many`: reads into
   several destination tensors in one wave.
 
+**Tensor parallelism: a TP group is one mobile endpoint** ([`docs/tp.md`](docs/tp.md))
+- PD with TP > 1 on vLLM 0.32 and SGLang 0.5.22. vLLM: decode TP rank r
+  pulls its KV heads from every prefill rank that holds some of them
+  (`connex.pd.kv_layout.tp_plan` / `head_read_ops`), so prefill and decode
+  may use different TP sizes (KV head re-layout); the connector asks vLLM
+  for the head-major `LBHNC` layout so a head range of a block is one read.
+  A prefill rank read by several decode ranks frees its hold after all of
+  them released it. SGLang: equal TP sizes need nothing new; different
+  sizes use SGLang's staging buffer, which the `connex` backend is now
+  allowed to use.
+- Group-level failure: every TP rank registers as one shard of its
+  instance or stage (`group_size`). The front-router fails the whole group
+  when any shard misses its lease, leaves, or is reported dead
+  (`report_failure`, fed by connex-rs peer-death events through
+  `connex.pd.group.PeerDeathReporter`; SGLang endpoints resolved through
+  their `rs=` address). Peers only see complete groups; a restarted group
+  rejoins under the same identity.
+- PD router: subscribes to front-router failure events and cuts a failed
+  instance's in-flight streams and prefills at once (stall after killing a
+  TP-2 decode rank: 4.1 s -> 0.4 s).
+- Pipeline stages with TP > 1 on the external-PP fork (engine patch 16,
+  `patch_external_pp_tp.py`): TP rank 0 is the stage's endpoint, steps are
+  broadcast in the TP group, other ranks register liveness shards
+  (`connex.pp.group.TPShardMember`), so one dead rank fails the stage over
+  to another chain. `docker/launch_stage.sh` takes `TP`.
+- connex-rs PD plane excludes UCX `cuda_ipc` by default
+  (`CONNEX_RS_CUDA_IPC=1` restores it): a decode instance on the same host
+  kept a dead prefill instance's KV memory mapped, so the prefill could not
+  restart.
+- `benchmarks/pd/tp_experiments.py`, `benchmarks/pp/local_pp.py`,
+  `benchmarks/pp/tp_pp_experiments.py`; results in `docs/results.md`
+  section 11.
+
 ## 0.1.1
 
 **Prefill-decode disaggregation on upstream vLLM and SGLang (no fork)**

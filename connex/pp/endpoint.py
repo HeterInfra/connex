@@ -485,6 +485,10 @@ class ConnexTEEndpoint(ZmqStageBase):
                 local_addresses=addresses,
                 capabilities=[TransportCapability.ZEROMQ, TransportCapability.MOONCAKE_TE],
                 mooncake_enabled=True,
+                # a tensor-parallel stage is one endpoint: TP rank 0 (this
+                # endpoint) is shard 0 of a group whose other ranks register
+                # for liveness only (connex.pp.group.TPShardMember)
+                group_size=max(1, int(os.getenv("CONNEX_PP_TP_SIZE", "1") or "1")),
             )
             self._epc_client = EPCV2Client(config)
             self._register_event_handlers(self._epc_client)
