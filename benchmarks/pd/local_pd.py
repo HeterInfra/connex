@@ -244,7 +244,8 @@ class Deployment:
             cmd += ["--bootstrap", ",".join(f"{i.url}=127.0.0.1:{8998 + int(i.name[len(i.role):])}"
                                             for i in self.instances if i.role == "prefill")]
         if self.front_router:
-            cmd += ["--front-router", "tcp://127.0.0.1:25555", "--model", "model"]
+            cmd += ["--front-router", "tcp://127.0.0.1:25555", "--model", "model",
+                    "--front-router-events", "tcp://127.0.0.1:25560"]
         for f in ("prefill.txt", "decode.txt"):
             open(os.path.join(self.logdir, f), "a").close()   # keep files written before
         self.router = subprocess.Popen(cmd, env=self._env(""), start_new_session=True,

@@ -239,3 +239,79 @@ def test_tp_shard_member_fails_pipeline_stage_group(fr):
     finally:
         for c in (ep, peer):
             c.stop()
+
+
+def test_router_cuts_streams_of_a_failed_group_at_once(fr):
+    """A decode TP group hangs after 3 tokens (a dead rank leaves the engine
+    stuck). The front-router failing the group must resume the request on the
+    other decode instance well before the router's idle timeout."""
+    import asyncio
+    import json as _json
+
+    import aiohttp
+    from aiohttp import web
+
+    from connex.serving import fake_backend as fb
+    from connex.serving.pd_router import ElasticPool, PDRouter
+
+    async def go():
+        kv = {}
+        pre = fb.FakePDBackend("prefill", kv)
+        d0 = fb.FakePDBackend("decode", kv, tpot_ms=20)
+        d1 = fb.FakePDBackend("decode", kv, tpot_ms=20)
+        urls = [await b.start() for b in (pre, d0, d1)]
+        d0.fail = ("stall", 3)
+        loop = asyncio.get_running_loop()
+        ms = []
+        for role, rep, shard, n, url in ((PDRole.PREFILL, 0, 0, 1, urls[0]),
+                                         (PDRole.DECODE, 0, 0, 2, urls[1]),
+                                         (PDRole.DECODE, 0, 1, 2, urls[1]),
+                                         (PDRole.DECODE, 1, 0, 1, urls[2])):
+            m = PDMember(fr.api, "m", role, rep, url, kv_addr="h:1" if role == PDRole.PREFILL
+                         else None, events=fr.events, heartbeat_interval_s=0.1, shard=shard,
+                         group_size=n)
+            await loop.run_in_executor(None, m.start)
+            ms.append(m)
+        router = PDRouter(ElasticPool([]), ElasticPool([]), front_router=fr.api, model="m",
+                          front_router_events=fr.events, membership_interval=0.1,
+                          idle_timeout=10.0, probe_interval=0.05, max_attempts=4)
+        runner = web.AppRunner(router.app(), shutdown_timeout=0.1)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        rurl = f"http://127.0.0.1:{site._server.sockets[0].getsockname()[1]}"
+        try:
+            for _ in range(100):
+                if len(router.pool.healthy_urls()) == 2 and router.prefill_pool.healthy_urls():
+                    break
+                await asyncio.sleep(0.05)
+            router.pool.rr = 1     # next pick: d0 (the group that will hang)
+            body = {"model": "m", "prompt": "w5 w9 w13", "max_tokens": 12, "stream": True}
+            toks, t0 = 0, loop.time()
+
+            async def fail_later():
+                while not d0.requests:
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(0.3)
+                await loop.run_in_executor(
+                    None, fr.fail_group, pd_lid("m", PDRole.DECODE, 0, 1), "peer died (test)")
+
+            killer = asyncio.ensure_future(fail_later())
+            async with aiohttp.ClientSession(trust_env=False) as s:
+                async with s.post(rurl + "/v1/completions", json=body) as r:
+                    async for line in r.content:
+                        if line.startswith(b"data: {"):
+                            toks += len(_json.loads(line[6:])["choices"])
+            await killer
+            return toks, loop.time() - t0, router.stats, len(d0.requests), len(d1.requests)
+        finally:
+            await runner.cleanup()
+            for m in ms:
+                await loop.run_in_executor(None, m.stop)
+            for b in (pre, d0, d1):
+                await b.stop()
+
+    toks, dt, stats, n0, n1 = asyncio.run(go())
+    assert toks == 12 and n0 == 1 and n1 == 1
+    assert stats["failure_events"] >= 1
+    assert dt < 3.0, dt          # far below the 10 s idle timeout

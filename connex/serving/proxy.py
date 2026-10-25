@@ -407,7 +407,8 @@ class Proxy:
                     while True:
                         if got_first or base_k > 0:
                             if watchdog is None and self.idle_timeout:
-                                watchdog = asyncio.ensure_future(self._watchdog(r, last, fired))
+                                watchdog = asyncio.ensure_future(
+                                    self._watchdog(r, last, fired, ep.dead))
                             try:
                                 line = await content.readline()
                             except RETRYABLE:
@@ -443,15 +444,27 @@ class Proxy:
             st.resp = None
             ep.inflight -= 1
 
-    async def _watchdog(self, r, last, fired):
+    async def _watchdog(self, r, last, fired, dead=None):
+        """Close the response when no line arrived for idle_timeout, or at
+        once when the replica is declared dead meanwhile (``dead``, e.g. a
+        failure event from the control plane): the pending readline fails and
+        the request resumes elsewhere without waiting out the idle timeout."""
         loop = asyncio.get_running_loop()
-        while True:
-            wait = last[0] + self.idle_timeout - loop.time()
-            if wait <= 0:
-                fired[0] = True
-                r.close()
-                return
-            await asyncio.sleep(max(wait, 0.01))
+        dw = asyncio.ensure_future(dead.wait()) if dead is not None else None
+        try:
+            while True:
+                wait = last[0] + self.idle_timeout - loop.time()
+                if wait <= 0 or (dw is not None and dw.done()):
+                    fired[0] = True
+                    r.close()
+                    return
+                if dw is not None:
+                    await asyncio.wait({dw}, timeout=max(wait, 0.01))
+                else:
+                    await asyncio.sleep(max(wait, 0.01))
+        finally:
+            if dw is not None and not dw.done():
+                dw.cancel()
 
     async def _wait_first(self, content, ep, abort=None):
         """Wait for the next line before the first token, without a fixed idle
