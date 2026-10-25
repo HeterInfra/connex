@@ -13,8 +13,10 @@ events, and kill timestamp.
 
     ep_failover.py --serve ./serve.sh --gpus-a 2,3 --gpus-b 0,1 --out fo.json
 
-``--serve`` is a script ``serve.sh GPUS PORT LOG [vllm args]`` that execs
-``vllm serve`` (see docs/ep.md).
+``--serve`` is a script ``serve.sh GPUS PORT LOG [args]`` that execs
+``vllm serve`` (see docs/ep.md). For SGLang groups pass
+``--worker-needle sglang::scheduler --kill-needle scheduler_TP1`` (SGLang
+also stops the whole server when one scheduler process dies).
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ import threading
 import time
 import urllib.request
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pd"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "pd"))
 import pd_bench  # noqa: E402
 
 from connex.ep.groups import EPGroup, EPGroupSupervisor  # noqa: E402
@@ -83,6 +85,8 @@ def main():
     ap.add_argument("--kill-at", type=float, default=20.0)
     ap.add_argument("--kill-needle", default="Worker_TP1",
                     help="substring of the process title of the rank to kill")
+    ap.add_argument("--worker-needle", default="VLLM::Worker",
+                    help="substring of the process titles of all ranks (process watch)")
     ap.add_argument("--qps", type=float, default=4.0)
     ap.add_argument("--duration", type=float, default=180.0)
     ap.add_argument("--n", type=int, default=2000)
@@ -91,6 +95,10 @@ def main():
                     help="health: /health probes only; process: also watch the rank "
                          "processes (a dead rank is seen within --probe-s)")
     ap.add_argument("--probe-s", type=float, default=0.1)
+    ap.add_argument("--probe-timeout", type=float, default=None,
+                    help="health probe timeout in s (default CONNEX_EP_PROBE_TIMEOUT or 3)")
+    ap.add_argument("--probe-path", default=None,
+                    help="health probe path (default CONNEX_EP_PROBE_PATH or /health)")
     ap.add_argument("--reload-interval", type=float, default=0.2,
                     help="how often the proxy re-reads the endpoints file")
     ap.add_argument("--out", required=True)
@@ -117,11 +125,12 @@ def main():
         def pids(k):
             if a.detect != "process":
                 return None
-            return lambda: workers(procs[k].pid, "VLLM::Worker")
+            return lambda: workers(procs[k].pid, a.worker_needle)
 
         sup = EPGroupSupervisor([EPGroup("ep-group/a", ua, restart_a, procs["a"], pids("a")),
                                  EPGroup("ep-group/b", ub, None, procs["b"], pids("b"))], epf,
-                                probe_s=a.probe_s, fail_after=2)
+                                probe_s=a.probe_s, fail_after=2,
+                                probe_timeout=a.probe_timeout, probe_path=a.probe_path)
         proxy = subprocess.Popen([sys.executable, "-m", "connex.serving.proxy", "--port",
                                   str(a.proxy_port), "--endpoints-file", epf,
                                   "--probe-interval", "0.5", "--reload-interval",

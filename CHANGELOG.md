@@ -19,8 +19,29 @@
 - vLLM 0.32 (upstream, no fork): worker extension
   `connex.ep.vllm_ext.ConnexEPWorker` drives vLLM's EPLB expert maps from the
   placement table through `collective_rpc`; EPLB support for OLMoE.
-- `benchmarks/ep/`: load + events (`ep_bench.py`), EP-group kill under load
-  (`ep_failover.py`), link bandwidth reference (`link_bw.py`).
+- SGLang 0.5.22 (upstream, no fork, no Mooncake kernels): the `connex_ep`
+  `sglang.srt.plugins` entry point (`CONNEX_EP=1`) adds a control endpoint
+  to TP rank 0's scheduler; commands ride SGLang's per-iteration request
+  broadcast, so every TP rank installs a placement epoch into SGLang's
+  `ExpertLocationMetadata` between the same two steps.
+  `connex.ep.sglang_ext.SGLangEPEngine` is the controller's engine handle.
+  The plugin also makes `TopK` apply the expert location dispatch on MoE
+  paths that skip it (SGLang's Qwen2-MoE without an all-to-all backend sent
+  every token to EP rank 0 when replicas existed). Epoch writes are ordered
+  on the GPU behind the overlapped batch instead of a device sync (apply
+  round trip 48 -> 23 ms, scheduler blocked 22 -> 1.7 ms), and the connex-rs
+  endpoint is created at server start with registration in the background
+  (attaching a controller under load no longer stalls serving for 0.3-2.3 s).
+  The control endpoint binds a free port unless `CONNEX_EP_PORT` is set and
+  advertises it in the log and in `$TMPDIR/connex-ep-ctl-<server port>.json`
+  (`SGLangEPEngine.from_server`).
+- `EPGroupSupervisor`: probe timeout and path configurable
+  (`probe_timeout` / `probe_path`, `CONNEX_EP_PROBE_TIMEOUT` /
+  `CONNEX_EP_PROBE_PATH`, `ep_failover.py --probe-timeout/--probe-path`);
+  the default timeout is 3 s (was 1 s), long enough for SGLang's `/health`.
+- `benchmarks/ep/`: load + events (`ep_bench.py`, `--engine sglang`), EP-group
+  kill under load (`ep_failover.py`, `--worker-needle` for SGLang), link
+  bandwidth reference (`link_bw.py`).
 - `ConnexRsTransport.read_many` / `LocalTransport.read_many`: reads into
   several destination tensors in one wave.
 

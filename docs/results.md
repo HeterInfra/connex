@@ -499,7 +499,8 @@ benchmark), text resume with tokenizations that do not round-trip.
 
 ## 10. Expert parallelism (MoE)
 
-`connex.ep` ([`ep.md`](ep.md)), `benchmarks/ep/`. vLLM 0.32.0, OLMoE-1B-7B
+`connex.ep` ([`ep.md`](ep.md)), `benchmarks/ep/`. SGLang: see the end of
+this section. vLLM 0.32.0, OLMoE-1B-7B
 (64 experts, top-8, 16 MoE layers, bf16), one EP group = tensor and expert
 parallel over two A40s of one host (PCIe, no NVLink), 0.6 memory fraction,
 CUDA graphs on. Connex runs vLLM with `--enable-eplb`, 64 redundant experts
@@ -586,10 +587,114 @@ never took effect, and the NaN slots produced 418 non-argmax tokens. A
 controller now adopts the engine's epoch when it attaches, and an engine
 that rejects a view as stale raises instead of being silently skipped.
 
-Not covered: SGLang (no placement driving yet; its Mooncake elastic EP did
-not load in this environment), cross-host EP groups, DeepEP / pplx
-all-to-all, data-parallel attention with EP, sampling (greedy only), more
-than one repetition for most rows.
+### SGLang 0.5.22
+
+SGLang 0.5.22 (upstream; the `connex_ep` plugin, no Mooncake kernels),
+Qwen1.5-MoE-A2.7B (60 routed experts, top-4, plus a shared expert; 24 MoE
+layers, bf16; SGLang's OLMoE has no EPLB support and fails at TP 2). One EP
+group = `--tp 2 --ep 2` over two A40s of one host (GPUs 1 and 3, PCIe),
+triton attention, 0.8 memory fraction, CUDA graphs on, overlap scheduler
+on. Connex runs SGLang with 60 redundant experts (every expert on both
+ranks; 24.9 GB of expert weights per rank) and `--ep-dispatch-algorithm
+dynamic`; SGLang's own EPLB stays off. Load as above: 256 text prompts,
+128 greedy tokens each, 32 concurrent, SGLang's native `/generate` with
+token ids.
+
+**Steady state:**
+
+| configuration | tokens/s | TPOT p50 |
+|---|---|---|
+| SGLang default EP (`--ep 2`, no redundancy) | 1,141 / 1,269 | 24.1 / 24.2 ms |
+| 60 redundant, every replica routed | 1,044 | 30.0 ms |
+| 60 redundant, Connex `active_replicas=1` (four runs) | 1,323-1,330 | 23.0-23.2 ms |
+
+As on vLLM, routing every replica costs decode throughput and one routed
+replica per expert (the other warm standby) does not. Before the routing
+fix of the plugin (see [`ep.md`](ep.md#sglang-0522-upstream-no-fork)) all
+three redundant configurations ran at 821-830 tok/s, TPOT 38 ms: SGLang's
+Qwen2-MoE ignored the replicas without an all-to-all backend and EP rank 0
+computed every expert (profile of 30 decode steps: `fused_moe_kernel`
+1,027 ms on rank 0, 14 ms on rank 1).
+
+**Drain a rank under load, rejoin it, migrate experts** (events as for
+vLLM: drain rank 1 at t = 4 s, overwrite its 60 slots with NaN, rejoin 6 s
+later by copying all of them back from rank 0; or migrate 8 experts, 415 MB
+each over 24 layers, then stage out their other replicas). 256 requests
+per run, all completed:
+
+| | drain + rejoin (2 runs) | migrate 8 experts |
+|---|---|---|
+| drain cutover (controller round trip) | 44 / 202 ms | |
+| worker-side apply of one epoch | 1.7-20 ms | |
+| rejoin: copy of 24.9 GB (1,440 expert-layers) | 1.86 / 1.86 s in the background (CUDA IPC) | |
+| per expert: cutover / copy / commit | | 39-62 / 47-53 / 47-71 ms |
+| whole migration per expert | | 0.17-0.20 s |
+| largest gap between two tokens | 0.22 / 0.17 s | 0.06 s |
+
+**Correctness.** Scored teacher-forced on a freshly started default-EP
+server, the drain, migrate and all-replica runs have 0-2 non-argmax tokens
+of 32,768 each (worst gap 0.6-1.1 nats); event-free `active_replicas=1`
+runs scored on a Connex server have 0. None of the off-argmax tokens was
+generated inside an event window (one at t = 1.5 s, before the drain at
+t = 4 s): they are near-ties that flip with batch composition (SGLang's
+kernels are not batch invariant). With `--enable-deterministic-inference`
+on both the runs and the reference (which slows decode to TPOT 32-33 ms),
+drain with NaN-poisoned slots, migration and the all-replica run all score
+**0 non-argmax tokens** of 32,768 each, worst gap 0.25-0.5 nats.
+
+**Kill an EP rank under load.** Group A = the Connex EP group on GPUs 2-3,
+group B = one SGLang server on GPU 0 (TP 1: GPU 0 carries 8 GB of another
+tenant, and SGLang refuses a TP group with unbalanced free memory), behind
+the resume proxy; Poisson load at 4 requests/s for 200 s; scheduler
+process `TP1` of group A SIGKILLed at t = 25 s. SGLang stops the whole
+server (as vLLM does), so recovery is group level:
+
+| | |
+|---|---|
+| requests completed | 817 / 817 |
+| in flight at the kill, completed | 13 / 13 |
+| failure detected (kill -> group removed) | 0.04 s (rank process watch) |
+| largest gap between two tokens of any request (p99) | 0.35 s (0.17 s) |
+| group rebuilt and back in the routing set | 43.5 s after the kill |
+| non-argmax tokens | 2 of 104,576 (gap 0.75 nats; both at token 89 of two requests with the same prompt topic, started about two minutes after the kill) |
+
+**Performance pass (SGLang control path).** A microbenchmark under the same
+load (512 requests, 32 concurrent) attaches a controller, applies 20
+epochs and migrates an expert 10 times; medians:
+
+| | first version | after |
+|---|---|---|
+| attach (register 24.9 GB per rank with connex-rs) | scheduler blocked 0.28 s; the batch in flight stalled 0.3-2.3 s | 1 ms on the scheduler; 0.29 s in the background; no stall (largest gap 0.06 s) |
+| epoch apply: controller round trip | 48-50 ms | 23 ms |
+| epoch apply: scheduler blocked per rank | 22 ms (device sync waits out the overlapped batch) | 1.5-1.8 ms |
+| migrate one expert (cutover + copy + commit) | 172-178 ms | 96-123 ms |
+| drain cutover in the drain run (2 runs) | 44 / 202 ms | 23 / 24 ms |
+| migrate per expert in the migrate run | 0.17-0.20 s | 0.10-0.14 s |
+| steady state, `active_replicas=1` | 1,323-1,330 tok/s | 1,310-1,325 tok/s |
+
+Two causes. Applying an epoch synchronized the device to wait out the batch
+the overlap scheduler still had on the GPU, blocking the scheduler for one
+decode step; the writes are now ordered on the GPU (schedule stream waits
+for the forward stream) and moves wait for an event. Attaching created the
+connex-rs endpoint inside the scheduler (0.2 s on rank 0, 1.1 s on rank 1,
+holding the interpreter); the endpoint is now created at server start and
+registration runs in a background thread. What remains of the round trip
+is waiting for the next scheduler iteration (8-15 ms). The rerun events
+(drain twice, migrate, steady) completed every request; in deterministic
+mode drain (NaN slots) and migration again score 0 non-argmax tokens, and
+with default kernels 0-1 (the same near-tie token as before the change,
+generated after the rejoin).
+
+`/health` of SGLang runs a one-token generate and answers after at least
+1 s, longer than the supervisor's probe timeout: the first attempt marked
+both groups down at once. The servers ran with
+`SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0` (liveness only).
+
+Not covered: SGLang's elastic EP (in-group survival of a dead rank; its
+Mooncake kernels did not load in this environment), an all-to-all backend
+(DeepEP) on SGLang, cross-host EP groups, DeepEP / pplx all-to-all on vLLM,
+data-parallel attention with EP, sampling (greedy only), more than one or
+two repetitions for most rows.
 ## 11. Tensor parallelism
 
 [`tp.md`](tp.md) describes the design: a TP group is one endpoint, KV head

@@ -220,6 +220,9 @@ class ConnexEPWorker:
         moves = [Move.from_dict(m) for m in req["moves"]]
         peers = {int(k): v for k, v in req["peers"].items()}
         t0 = time.perf_counter()
+        pre = getattr(self, "_connex_ep_before_move", None)
+        if pre is not None:
+            pre()
         res = store.apply_moves(moves, peers, req["slots_per_rank"],
                                 timeout_ms=req.get("timeout_ms"))
         return {"rank": self._ep_rank(), "seconds": time.perf_counter() - t0,
@@ -249,6 +252,9 @@ class ConnexEPWorker:
             t0 = time.perf_counter()
             try:
                 torch.cuda.set_device(dev)
+                pre = getattr(self, "_connex_ep_before_move", None)
+                if pre is not None:          # engine hook (SGLang: epoch in effect)
+                    pre()
                 side = torch.cuda.Stream(dev)
                 with torch.cuda.stream(side):
                     res = store.apply_moves(moves, peers, req["slots_per_rank"],

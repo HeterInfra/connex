@@ -18,6 +18,7 @@ the per-layer all-to-all stays on the engine's fast path. Numbers:
 | `EPController` | runs every change through two epochs, re-plans moves whose source fails | `connex/ep/controller.py` |
 | `EPGroupSupervisor` | replica-level recovery when the engine cannot survive a rank loss: health probes, drop the group from the routing set, rebuild, rejoin | `connex/ep/groups.py` |
 | vLLM glue | worker extension (`collective_rpc` methods), engine handle for the controller, EPLB support for OLMoE | `connex/ep/vllm_ext.py` |
+| SGLang glue | scheduler plugin (control endpoint, commands at a step boundary on every TP rank), engine handle, replica routing on MoE paths that skip it | `connex/ep/sglang_ext.py` |
 
 **Epochs and the cutover point.** Every change becomes visible as a new
 epoch of the table. An engine installs a view only at a step boundary and
@@ -125,24 +126,95 @@ For a hard failure, recovery is one level up:
 
 `benchmarks/ep/ep_failover.py` measures this end to end.
 
-## SGLang (0.5.22)
+## SGLang (0.5.22, upstream, no fork)
 
-SGLang has EP (`--ep-size`), EPLB with redundant experts
-(`--enable-eplb`, `--ep-num-redundant-experts`) and an expert location
-updater that moves expert weights with NCCL P2P during a rebalance. Its
-elastic EP (`--elastic-ep-backend mooncake`) masks failed ranks out of the
-all-to-all and rebalances onto the survivors, which is the in-group rank
-failover vLLM lacks; it needs the Mooncake EP kernels, and the Mooncake
-build in the tested environment does not load (`Mooncake PG was not built
-against torch==2.14.1`), so it was not run. Driving SGLang's expert location
-from the Connex placement table needs a scheduler hook (SGLang exposes no
-request to install an external map); not implemented yet. Replica-level
-failover with the resume proxy and `EPGroupSupervisor` is engine neutral and
-applies to SGLang EP groups unchanged.
+SGLang keeps the placement of an EP deployment in one
+`ExpertLocationMetadata` per process: `physical_to_logical_map`
+`[layers, slots]`, `logical_to_all_physical_map` `[layers, experts, X]`
+(-1 padded) and `logical_to_all_physical_map_num_valid`. Each MoE layer's
+top-k reads views of these tensors (`ExpertLocationDispatchInfo`); with no
+all-to-all backend the `dynamic` dispatch picks replica
+`row % num_valid`, the same on every rank. Connex writes exactly these
+tensors, in place, so captured CUDA graphs keep reading them:
+
+```bash
+CONNEX_EP=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen1.5-MoE-A2.7B --tp 2 --ep 2 \
+    --ep-num-redundant-experts 60 --ep-dispatch-algorithm dynamic
+```
+
+```python
+from connex.ep import EPController
+from connex.ep.sglang_ext import SGLangEPEngine
+
+eng = SGLangEPEngine.from_server("http://127.0.0.1:30000")  # advertised control endpoint
+ctl = EPController(eng.table(), eng)
+ctl.table.active_replicas = 1                    # one routed replica, the other warm standby
+ctl.refresh_peers(); ctl.push()
+ctl.drain_rank(1)
+```
+
+* **Control path.** `CONNEX_EP=1` turns on the `connex_ep` entry point of
+  `sglang.srt.plugins` (installed with connex-ai). It adds a small HTTP
+  endpoint to the scheduler of TP rank 0: `CONNEX_EP_PORT`, or by default a
+  free port, logged and advertised in `ctl_file(server_port)`
+  (`$TMPDIR/connex-ep-ctl-<server port>.json`, `CONNEX_EP_CTL_FILE`
+  overrides), which `SGLangEPEngine.from_server()` reads. A command posted there joins the list of requests that
+  rank 0 broadcasts to the other TP ranks at the top of every scheduler
+  iteration (the broadcast that already carries the timeout aborts), so all
+  ranks run it between the same two forward steps; per-rank results are
+  gathered over the TP CPU group. The commands are the vLLM worker
+  extension's (`connex_ep_info`, `_init`, `_apply`, `_move_start`,
+  `_move_poll`, `_load`), so `EPController` drives both engines the same way.
+* **Overlap scheduler.** SGLang prepares batch N+1 while batch N still runs
+  on the GPU. `apply` orders the map writes on the GPU instead of blocking:
+  the scheduler's stream waits for the forward stream (batch N), writes the
+  maps from pinned memory, and batch N+1 waits for the scheduler's stream
+  as it always does. Batch N runs entirely on the old epoch, N+1 on the new
+  one, and the scheduler thread never waits for the GPU. A background move
+  waits for an event recorded after the writes before it touches a slot
+  the epoch staged out. `CONNEX_EP_APPLY_SYNC=1` restores the blocking
+  variant (device synchronize before and after).
+* **Attach.** The connex-rs endpoint of each rank is created when the
+  scheduler starts (`CONNEX_EP_TRANSPORT`, default `connex-rs`; `none`
+  skips it): creating it takes 0.2-1.1 s and holds the interpreter, which
+  stalled serving when a controller attached under load. Registering the
+  expert weights runs in a background thread; `SGLangEPEngine.describe()`
+  polls until every rank is ready.
+* **Replica routing fix.** SGLang 0.5.22's Qwen2-MoE passes the dispatch
+  info to `TopK` only on its DeepEP path. Without an all-to-all backend the
+  top-k ids stay logical and are used as physical slot ids, so with
+  redundant experts every token goes to EP rank 0's slots and rank 1 idles
+  (profile: 1,027 ms of `fused_moe_kernel` on rank 0 against 14 ms on rank 1
+  for 30 decode steps). The plugin makes `TopK` build the dispatch info from
+  its layer id when the caller passed none; then replicas are used.
+* **No EPLB of its own.** Do not pass `--enable-eplb`: Connex owns the map.
+  No Mooncake elastic-EP kernels are involved; weights move with
+  `ExpertStore` (CUDA IPC on one host, connex-rs otherwise) in a background
+  thread of each scheduler.
+* **Models.** Any model with SGLang EPLB support (Qwen2/3-MoE,
+  DeepSeek-V2/V3, ...). SGLang's OLMoE has none, and its OLMoE attention
+  also fails at TP 2 (`q_norm` over the full hidden size on a TP-sharded
+  `q`), so the SGLang numbers use Qwen1.5-MoE-A2.7B.
+* **Group-level failover.** One dead scheduler process stops the SGLang
+  server, as in vLLM, so a hard failure is handled by the resume proxy and
+  `EPGroupSupervisor` (`ep_failover.py --worker-needle sglang::scheduler
+  --kill-needle scheduler_TP1`). SGLang's `/health` runs a one-token
+  generate and answers after at least one second. The supervisor's probe
+  timeout and path are configurable (`EPGroupSupervisor(probe_timeout=,
+  probe_path=)`, `CONNEX_EP_PROBE_TIMEOUT`, `CONNEX_EP_PROBE_PATH`,
+  `ep_failover.py --probe-timeout/--probe-path`; default 3 s, `/health`).
+  Alternatively run SGLang with `SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=0`
+  (liveness only; a dead rank is seen by the process watch).
+* SGLang's elastic EP (`--elastic-ep-backend mooncake`) masks failed ranks
+  out of the all-to-all inside a group; it needs the Mooncake EP kernels,
+  which do not load in the tested environment (`Mooncake PG was not built
+  against torch==2.14.1`), so in-group survival of a dead rank was not run.
 
 ## Not covered yet
 
-* Placement-driven expert maps in SGLang (see above); SGLang elastic EP.
+* SGLang elastic EP (in-group survival of a dead rank); SGLang with an
+  all-to-all backend (DeepEP), where the dispatch is per rank (`static`).
 * Cross-host EP groups (all numbers come from one 4-GPU host), DeepEP /
   pplx all-to-all kernels, data parallel attention + EP.
 * Checkpoint loading of an expert into a live vLLM rank (`ExpertStore`

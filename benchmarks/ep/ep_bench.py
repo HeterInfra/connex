@@ -29,6 +29,16 @@ Events (``--event``):
   moved weights.
 
 Request load, prompts and the score check reuse ``benchmarks/pd/pd_bench.py``.
+
+SGLang (``--engine sglang``): the server runs with ``CONNEX_EP=1`` and the
+controller talks to the control endpoint of TP rank 0 (``--ctrl``, default: the
+one it advertised in ``connex.ep.sglang_ext.ctl_file``). Requests and the score use SGLang's native
+``/generate`` with token ids (prompts tokenized locally with ``--tokenizer``)::
+
+    ep_bench.py run --engine sglang --url http://127.0.0.1:8301 \
+        --tokenizer <model dir> --event drain --out drain.json
+    ep_bench.py score --engine sglang --url http://127.0.0.1:8302 \
+        --tokenizer <model dir> --file drain.json
 """
 from __future__ import annotations
 
@@ -40,15 +50,121 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "pd"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "pd"))
 import pd_bench  # noqa: E402
 
 from connex.ep import EPController  # noqa: E402
 from connex.ep.vllm_ext import VLLMEPEngine  # noqa: E402
 
 
-def controller(url, active_replicas=None, async_moves=True):
-    eng = VLLMEPEngine(url, async_moves=async_moves)
+def make_engine(a):
+    if getattr(a, "engine", "vllm") == "sglang":
+        from connex.ep.sglang_ext import SGLangEPEngine
+        if a.ctrl:
+            return SGLangEPEngine(a.ctrl, async_moves=not a.sync_moves)
+        return SGLangEPEngine.from_server(a.url, async_moves=not a.sync_moves)
+    return VLLMEPEngine(a.url, async_moves=not a.sync_moves)
+
+
+# -- SGLang native API ----------------------------------------------------------
+_tok = {}
+
+
+def sglang_prompt_ids(a):
+    """Prompts as token ids (tokenized here, so load and score agree)."""
+    if "ids" not in _tok:
+        from transformers import AutoTokenizer
+        tk = AutoTokenizer.from_pretrained(a.tokenizer)
+        ps = pd_bench.prompts(a.n, a.prompt_len, a.seed, text=a.text)
+        _tok["ids"] = [tk(p)["input_ids"] if isinstance(p, str) else p for p in ps]
+    return _tok["ids"]
+
+
+async def one_sglang(session, url, model, prompt, max_tokens, timeout):
+    """``pd_bench.one`` for SGLang's ``/generate`` (streaming, greedy)."""
+    body = {"input_ids": prompt, "stream": True,
+            "sampling_params": {"max_new_tokens": max_tokens, "temperature": 0,
+                                "ignore_eos": True}}
+    t0 = time.perf_counter()
+    first, ids, times, err = None, [], [], None
+    try:
+        async with session.post(url + "/generate", json=body,
+                                timeout=pd_bench.aiohttp.ClientTimeout(total=timeout)) as r:
+            if r.status != 200:
+                err = f"HTTP {r.status}: {(await r.text())[:200]}"
+            else:
+                async for line in r.content:
+                    if not line.startswith(b"data: ") or line.startswith(b"data: [DONE]"):
+                        continue
+                    c = json.loads(line[6:])
+                    if "error" in c:
+                        err = str(c["error"])[:200]
+                        break
+                    out = c.get("output_ids") or []
+                    n = (c.get("meta_info") or {}).get("completion_tokens", len(ids) + len(out))
+                    new = out[len(ids):] if len(out) >= n else out    # cumulative or delta
+                    now = time.perf_counter()
+                    for t in new:
+                        ids.append(t)
+                        times.append(now)
+                    if new and first is None:
+                        first = now
+    except Exception as e:  # noqa: BLE001
+        err = f"{type(e).__name__}: {e}"
+    t1 = time.perf_counter()
+    return {"ok": err is None and len(ids) == max_tokens, "err": err, "n": len(ids), "ids": ids,
+            "ttft": (first - t0) if first else None, "e2e": t1 - t0,
+            "tpot": ((times[-1] - first) / (len(ids) - 1)) if first and len(ids) > 1 else None,
+            "max_gap": max((b - a for a, b in zip(times, times[1:])), default=None),
+            "start": t0}
+
+
+async def score_sglang(a):
+    """Teacher-forced check on SGLang: every generated token must be the
+    argmax (within ``tol`` nats) given its own prefix."""
+    d = json.load(open(a.file))
+    ra = argparse.Namespace(**d["args"])
+    ra.tokenizer = a.tokenizer
+    ps = sglang_prompt_ids(ra)
+    sem = asyncio.Semaphore(8)
+    async with pd_bench.aiohttp.ClientSession(trust_env=False) as s:
+        async def go(r):
+            p, gen = ps[r["i"]], r.get("ids") or []
+            body = {"input_ids": p + gen, "return_logprob": True, "top_logprobs_num": 1,
+                    "logprob_start_len": len(p) - 1,
+                    "sampling_params": {"max_new_tokens": 1, "temperature": 0}}
+            async with sem:
+                async with s.post(a.url + "/generate", json=body) as resp:
+                    return r, gen, (await resp.json())["meta_info"]
+        out = await asyncio.gather(*(go(r) for r in d["requests"] if r.get("ok")))
+    tot = bad = bad_reqs = 0
+    worst, per = 0.0, []
+    for r, gen, mi in out:
+        lps, tops = mi["input_token_logprobs"], mi["input_top_logprobs"]
+        # entries start at token len(p) - 1; the first generated token is next
+        off = len(lps) - len(gen)
+        nb, first = 0, None
+        for k, t in enumerate(gen):
+            lp, tid = lps[off + k][0], lps[off + k][1]
+            assert tid == t, (tid, t)
+            gap = max(x[0] for x in tops[off + k]) - lp
+            worst = max(worst, gap)
+            if gap > a.tol:
+                nb += 1
+                first = k if first is None else first
+        tot += len(gen)
+        bad += nb
+        bad_reqs += nb > 0
+        if nb:
+            per.append((r["i"], nb, first))
+    return {"file": a.file, "requests": len(out), "tokens": tot, "non_argmax_tokens": bad,
+            "requests_with_non_argmax": bad_reqs, "worst_gap": round(worst, 3), "tol": a.tol,
+            "detail": per[:20]}
+
+
+def controller(a):
+    active_replicas = a.active_replicas
+    eng = make_engine(a)
     ctl = EPController(eng.table(), eng)
     ctl.table.active_replicas = active_replicas
     t0 = time.perf_counter()
@@ -118,7 +234,7 @@ def run(a):
 
     eng = ctl = None
     if a.event or a.active_replicas:
-        eng, ctl, init_s = controller(a.url, a.active_replicas, not a.sync_moves)
+        eng, ctl, init_s = controller(a)
         events.append({"t": 0, "kind": "init", "report": {"init_s": init_s}})
     t_start = time.perf_counter()
     th = None
@@ -131,6 +247,10 @@ def run(a):
                 log("event-error", {"error": repr(ex)})
         th = threading.Thread(target=fire, daemon=True)
         th.start()
+    if a.engine == "sglang":
+        ids = sglang_prompt_ids(a)
+        pd_bench.prompts = lambda n, *_, **__: ids[:n]
+        pd_bench.one = one_sglang
     res, wall = asyncio.run(pd_bench.run_load(a))
     if th:
         th.join(timeout=600)
@@ -167,7 +287,10 @@ def main():
                    help="copy weights inside the RPC (blocks the engine) instead of in "
                         "a background thread")
     r.add_argument("--out", required=True)
-    s = sub.add_parser("score")
+    for x in (r, (s := sub.add_parser("score"))):
+        x.add_argument("--engine", choices=["vllm", "sglang"], default="vllm")
+        x.add_argument("--tokenizer", default=None, help="sglang: model dir for prompt ids")
+    r.add_argument("--ctrl", default=None, help="sglang: control endpoint of TP rank 0")
     s.add_argument("--url", default="http://127.0.0.1:8301")
     s.add_argument("--model", default="olmoe")
     s.add_argument("--file", required=True)
@@ -176,7 +299,8 @@ def main():
     if a.cmd == "run":
         run(a)
     else:
-        print(json.dumps(asyncio.run(pd_bench.run_score(a))))
+        fn = score_sglang if a.engine == "sglang" else pd_bench.run_score
+        print(json.dumps(asyncio.run(fn(a))))
 
 
 if __name__ == "__main__":
