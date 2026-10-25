@@ -34,7 +34,7 @@ SIGCOMM 2026 paper ([Citation](#citation)).
 | 📈 Elastic scale up / down | vLLM | ✅ validated |
 | 🔀 [Prefill-decode disaggregation](docs/pd-disaggregation.md), elastic P/D pools | vLLM 0.32, SGLang 0.5.22 | ✅ validated, one host |
 | 🧩 [Tensor parallelism](docs/tp.md): a TP group is one endpoint | vLLM, SGLang | ✅ validated, one host |
-| 🧠 [Expert parallelism](docs/ep.md) (MoE): expert placement, migration, failover | vLLM 0.32 | ✅ validated, one host |
+| 🧠 [Expert parallelism](docs/ep.md) (MoE): expert placement, migration, failover | vLLM 0.32, SGLang 0.5.22 | ✅ validated, one host |
 | 🎯 [RL post-training](docs/rl.md): elastic weight sync | vLLM, SGLang | ✅ validated |
 | 🤖 [Agent session migration](docs/agent-migration.md) | vLLM, SGLang | ✅ validated (re-prefill) |
 | 🧬 Heterogeneous transports: RDMA, TCP, GPUDirect | any | ✅ validated |

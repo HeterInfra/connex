@@ -62,13 +62,16 @@ setup(
         ],
         # Upstream engines, no fork: vLLM finds the ConnexConnector by name and
         # the "connex" weight-transfer backend; SGLang gets the "connex"
-        # disaggregation transfer backend.
+        # disaggregation transfer backend and the connex.ep control path (CONNEX_EP=1).
         "vllm.general_plugins": [
             "connex_pd = connex.adapters.vllm.plugin:register",
             "connex_rl = connex.rl.vllm_plugin:register",
             "connex_ep = connex.ep.vllm_ext:register",
         ],
-        "sglang.srt.plugins": ["connex = connex.adapters.sglang.pd_backend:register"],
+        "sglang.srt.plugins": [
+            "connex = connex.adapters.sglang.pd_backend:register",
+            "connex_ep = connex.ep.sglang_ext:register",
+        ],
     },
     classifiers=[
         "License :: OSI Approved :: Apache Software License",
