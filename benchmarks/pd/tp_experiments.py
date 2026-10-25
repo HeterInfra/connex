@@ -49,17 +49,21 @@ def deploy(a, logdir):
     d = Deployment(a.engine, a.connector, a.model, logdir, a.python, gpu_mem=a.gpu_mem,
                    max_model_len=a.max_model_len, front_router=a.front_router,
                    extra_args=a.extra.split(), retain_s=a.retain_s)
-    if a.front_router:
-        d.start_front_router()
-        time.sleep(1)
-    for role, specs in (("prefill", a.prefill), ("decode", a.decode)):
-        for g in specs.split(","):
-            inst = d.add(role, g)
-            d.wait([inst])      # one at a time: vLLM memory profiling, NCCL ports
-    d.start_router(static=not a.front_router)
-    wait_http(d.router_url, 60)
-    if a.front_router:   # every group registered and probed
-        _wait_pools(d, len(a.prefill.split(",")), len(a.decode.split(",")))
+    try:
+        if a.front_router:
+            d.start_front_router()
+            time.sleep(1)
+        for role, specs in (("prefill", a.prefill), ("decode", a.decode)):
+            for g in specs.split(","):
+                inst = d.add(role, g)
+                d.wait([inst])      # one at a time: vLLM memory profiling, NCCL ports
+        d.start_router(static=not a.front_router)
+        wait_http(d.router_url, 60)
+        if a.front_router:   # every group registered and probed
+            _wait_pools(d, len(a.prefill.split(",")), len(a.decode.split(",")))
+    except BaseException:
+        d.down()            # no stray instances or routers after a failed start
+        raise
     return d
 
 
@@ -168,7 +172,16 @@ def cmd_kill(a, d):
         if a.restart_at:
             time.sleep(max(0.0, t_start + a.restart_at - time.time()))
             victim.kill(signal.SIGKILL)          # rest of the group, if still up
-            _wait_gpus_free(victim.gpu)          # the dead group's memory is released late
+            tw = time.time()
+            ok = _wait_gpus_free(victim.gpu)     # the dead group's memory is released late
+            timeline["gpu_free_wait"] = time.time() - tw
+            if not ok:
+                timeline["gpu_not_free"] = subprocess.run(
+                    ["nvidia-smi", "--query-compute-apps=pid,used_memory,gpu_bus_id",
+                     "--format=csv,noheader"], capture_output=True, text=True).stdout[-2000:]
+                timeline["victim_procs"] = subprocess.run(
+                    ["ps", "-o", "pid,stat,etime,args", "-g", str(victim.proc.pid)],
+                    capture_output=True, text=True).stdout[-2000:]
             t2 = time.time()
             victim.start()
             try:
@@ -195,7 +208,7 @@ def cmd_kill(a, d):
             "kill_offset_s": (timeline.get("kill") or t_start) - t_start, "files": [f]}
 
 
-def _wait_gpus_free(spec, need_mib=30000, timeout=120):
+def _wait_gpus_free(spec, need_mib=30000, timeout=600):
     gpus = str(spec).split("+")
     t0 = time.time()
     while time.time() - t0 < timeout:
@@ -203,8 +216,9 @@ def _wait_gpus_free(spec, need_mib=30000, timeout=120):
                               "--format=csv,noheader,nounits"], capture_output=True, text=True)
         free = dict(x.replace(" ", "").split(",") for x in out.stdout.strip().splitlines())
         if all(int(free.get(g, 0)) >= need_mib for g in gpus):
-            return
+            return True
         time.sleep(1)
+    return False
 
 
 def _router_stats(d):

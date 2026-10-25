@@ -94,13 +94,26 @@ PS_RECV_NEW = """        def recv_tensor_dict(self, src=None, **kwargs):
                 # device is 0: received tensors must land on this rank's GPU
                 if tp.device.type == "cuda":
                     torch.cuda.set_device(tp.device)
+                t0 = time.perf_counter()
                 if self.tp_rank == 0:
                     td = self.zeromq_comm.recv_tensor_dict(src)
+                    t1 = time.perf_counter()
                     tp.broadcast_tensor_dict(
                         td if td is not None else {"__cx_none__": True}, src=0)
-                    return td
-                td = tp.broadcast_tensor_dict(None, src=0)
-                return None if td is None or td.get("__cx_none__") else td
+                else:
+                    td = tp.broadcast_tensor_dict(None, src=0)
+                    t1 = t0
+                    td = None if td is None or td.get("__cx_none__") else td
+                if _CX_TP_PROFILE and td is not None:
+                    st = self.__dict__.setdefault("_cx_prof", [0, 0.0, 0.0])
+                    st[0] += 1
+                    st[1] += t1 - t0
+                    st[2] += time.perf_counter() - t1
+                    if st[0] % 200 == 0:
+                        logger.info("TP rank %d: %d steps, recv %.2f ms/step, in-group "
+                                    "broadcast %.2f ms/step", self.tp_rank, st[0],
+                                    st[1] / st[0] * 1e3, st[2] / st[0] * 1e3)
+                return td
             if self.zeromq_comm is not None:
                 return self.zeromq_comm.recv_tensor_dict(src)
             raise RuntimeError("ZeroMQ communicator not initialized")
@@ -152,6 +165,12 @@ PS_COMM_NEW = f"""    {MARK}: one pipeline endpoint per TP group (rank 0)
 """
 
 
+PS_IMPORT_OLD = "import vllm.envs as envs\n"
+PS_IMPORT_NEW = (PS_IMPORT_OLD + MARK + " (profiling: CONNEX_PP_TP_PROFILE=1)\n"
+                 "import os as _cx_os\nimport time\n"
+                 "_CX_TP_PROFILE = _cx_os.environ.get(\"CONNEX_PP_TP_PROFILE\", \"0\") == \"1\"\n")
+
+
 def _edit(path, edits, need_os=False):
     src = open(path).read()
     if MARK in src:
@@ -173,8 +192,8 @@ def main(argv):
     cfg = os.path.join(root, "config", "parallel.py")
     ps = os.path.join(root, "distributed", "parallel_state.py")
     r1 = _edit(cfg, [(CONFIG_OLD, CONFIG_NEW)], need_os=True)
-    r2 = _edit(ps, [(PS_SEND_OLD, PS_SEND_NEW), (PS_RECV_OLD, PS_RECV_NEW),
-                  (PS_COMM_OLD, PS_COMM_NEW)], need_os=True)
+    r2 = _edit(ps, [(PS_IMPORT_OLD, PS_IMPORT_NEW), (PS_SEND_OLD, PS_SEND_NEW),
+                    (PS_RECV_OLD, PS_RECV_NEW), (PS_COMM_OLD, PS_COMM_NEW)], need_os=True)
     print(f"config/parallel.py: {r1}; distributed/parallel_state.py: {r2}")
     return 0
 

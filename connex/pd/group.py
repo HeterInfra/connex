@@ -79,7 +79,9 @@ class PeerDeathReporter:
 
     def __init__(self, engine, front_router_api: str, model: Optional[str],
                  stages: Optional[Iterable[int]] = None,
-                 report: Optional[Callable[[LogicalEndpointID, str], object]] = None):
+                 report: Optional[Callable[[LogicalEndpointID, str], object]] = None,
+                 resolve: Optional[Callable[[LogicalEndpointID],
+                                            Optional[LogicalEndpointID]]] = None):
         if stages is None:
             from connex.pd.membership import PD_STAGE
 
@@ -93,6 +95,9 @@ class PeerDeathReporter:
             def report(lid, reason):
                 return report_failure(front_router_api, lid, reason)
         self._report = report
+        # transport identity -> registered LID, when they differ (SGLang names
+        # connex-rs endpoints by port, see rs_port_resolver)
+        self._resolve = resolve
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.reports: list[tuple[float, LogicalEndpointID, object]] = []
@@ -115,6 +120,13 @@ class PeerDeathReporter:
         lid = self.tracker.on_event(ev)
         if lid is None:
             return None
+        if self._resolve is not None:
+            try:
+                lid = self._resolve(lid)
+            except Exception:  # noqa: BLE001
+                lid = None
+            if lid is None:
+                return None
         reason = f"peer died ({ev.get('reason', 'transport event')})"
         log.warning("connex-rs: %s rank %d of replica %d died: reporting its group",
                     lid.model_name, lid.shard_idx, lid.replica_idx)
@@ -127,3 +139,41 @@ class PeerDeathReporter:
 
     def stop(self) -> None:
         self._stop.set()
+
+
+def rs_port_resolver(front_router_api: str, model: str, timeout_ms: int = 1000):
+    """Resolver for transports that name a peer by its connex-rs port (the
+    SGLang backend: ``(sglang-pd, stage, 0, port)``): find the PD member
+    whose registration advertises ``rs=<host>:<port>`` and return its LID
+    (with the rank as shard). None when no or several members match."""
+    import zmq
+
+    from connex.pd.membership import PD_STAGE
+
+    def resolve(lid: LogicalEndpointID) -> Optional[LogicalEndpointID]:
+        port = str(lid.replica_idx)
+        ctx = zmq.Context.instance()
+        s = ctx.socket(zmq.REQ)
+        s.setsockopt(zmq.LINGER, 0)
+        s.setsockopt(zmq.RCVTIMEO, timeout_ms)
+        s.setsockopt(zmq.SNDTIMEO, timeout_ms)
+        try:
+            s.connect(front_router_api)
+            s.send_json({"method": "get_routes", "params": {
+                "model_name": model, "stage_idx": list(PD_STAGE.values()), "compact": True}})
+            rep = s.recv_json()
+        except zmq.ZMQError:
+            return None
+        finally:
+            s.close(0)
+        hits = []
+        for r in rep.get("routes", []):
+            if any(a.startswith("rs=") and a.rsplit(":", 1)[-1] == port
+                   for a in r.get("addresses") or []):
+                d = r["lid"]
+                hits.append(LogicalEndpointID(d["model_name"], int(d["stage_idx"]),
+                                              int(d.get("shard_idx", 0)),
+                                              int(d.get("replica_idx", 0))))
+        return hits[0] if len(hits) == 1 else None
+
+    return resolve

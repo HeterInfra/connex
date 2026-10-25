@@ -95,6 +95,14 @@ class ConnexRsPlane:
         # into GPU memory then segfault. Pin the threshold below block size;
         # control messages (< 4 KB) stay bcopy.
         os.environ.setdefault("UCX_ZCOPY_THRESH", str(ZCOPY_THRESH))
+        # No CUDA IPC between instances on one host: a reader that mapped a
+        # peer's KV cache through cuda_ipc keeps that GPU memory allocated
+        # after the peer dies (the mapping outlives the exporting process),
+        # so a killed prefill instance cannot be restarted on its GPUs until
+        # every decode instance that read from it exits. RDMA (GPUDirect,
+        # NIC loopback on one host) has no such tie and measured the same.
+        if os.getenv("CONNEX_RS_CUDA_IPC", "0") != "1" and not os.getenv("UCX_TLS"):
+            os.environ["UCX_TLS"] = "^cuda_ipc"
         if not os.getenv("UCX_NET_DEVICES"):
             from connex.pp.transports import ucx_net_devices_for_ip
 

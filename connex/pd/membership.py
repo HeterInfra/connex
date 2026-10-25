@@ -165,10 +165,11 @@ class PDMember:
     def __init__(self, front_router_api: str, model: str, role: str, replica: int,
                  http_url: str, kv_addr: Optional[str] = None,
                  heartbeat_interval_s: float = 1.0, events: Optional[str] = None,
-                 shard: int = 0, group_size: int = 1):
+                 shard: int = 0, group_size: int = 1, extra_addresses=()):
         from connex.epc_client import EPCV2Client, EPCV2ClientConfig
 
-        addrs = [http_url.rstrip("/")] + ([f"kv={kv_addr}"] if kv_addr else [])
+        addrs = [http_url.rstrip("/")] + ([f"kv={kv_addr}"] if kv_addr else []) + \
+            list(extra_addresses)
         cfg = EPCV2ClientConfig(
             front_router_api=front_router_api,
             front_router_events=events or front_router_api.rsplit(":", 1)[0] + ":15560",

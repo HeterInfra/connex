@@ -229,7 +229,10 @@ class Deployment:
     def start_front_router(self):
         self.fr = subprocess.Popen([sys.executable, "-m", "connex.front_router", "--api-address",
                                     "tcp://*:25555", "--event-address", "tcp://*:25560"],
-                                   env=self._env(""), start_new_session=True,
+                                   # members' lease as in production setups: 2 s
+                                   env={**self._env(""), "CONNEX_HEARTBEAT_TIMEOUT_S":
+                                        os.getenv("CONNEX_HEARTBEAT_TIMEOUT_S", "2")},
+                                   start_new_session=True,
                                    stdout=open(os.path.join(self.logdir, "front_router.log"), "ab"),
                                    stderr=subprocess.STDOUT)
 

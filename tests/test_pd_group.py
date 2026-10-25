@@ -315,3 +315,30 @@ def test_router_cuts_streams_of_a_failed_group_at_once(fr):
     assert toks == 12 and n0 == 1 and n1 == 1
     assert stats["failure_events"] >= 1
     assert dt < 3.0, dt          # far below the 10 s idle timeout
+
+
+def test_rs_port_resolver_maps_sglang_transport_identity(fr):
+    from connex.pd.group import PeerDeathReporter, rs_port_resolver
+
+    ms = [PDMember(fr.api, "m", PDRole.DECODE, 4, "http://d4:80", events=fr.events,
+                   heartbeat_interval_s=0.1, shard=s, group_size=2,
+                   extra_addresses=[f"rs=10.0.0.1:{52010 + s}"]) for s in (0, 1)]
+    try:
+        for m in ms:
+            assert m.start()
+        resolve = rs_port_resolver(fr.api, "m")
+        lid = resolve(pd_lid("sglang-pd", PDRole.DECODE, 52011))
+        assert (lid.model_name, lid.shard_idx, lid.replica_idx) == ("m", 1, 4)
+        assert resolve(pd_lid("sglang-pd", PDRole.DECODE, 9)) is None
+        peer = ("sglang-pd", DEC, 0, 52011)
+        rep = PeerDeathReporter(FakeEngine([{"type": "up", "peer": peer},
+                                            {"type": "failed", "peer": peer, "reason": "reset"}]),
+                                fr.api, "sglang-pd", resolve=resolve)
+        ms[1].client._running = False
+        rep.start()
+        assert wait_for(lambda: rep.reports, timeout=3)
+        assert decode_urls(fr) == []
+        rep.stop()
+    finally:
+        for m in ms:
+            m.stop()

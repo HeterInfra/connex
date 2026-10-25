@@ -29,7 +29,7 @@ def fork_tree(tmp_path, m):
     (root / "v1" / "worker" / "gpu_model_runner.py").write_text("")
     (root / "config" / "parallel.py").write_text(
         "class P:\n    def check(self):\n        if True:\n" + m.CONFIG_OLD + "        return 1\n")
-    ps = ("_TP = None\n\ndef get_tp_group():\n    return _TP\n\n"
+    ps = ("import vllm.envs as envs\n_TP = None\n\ndef get_tp_group():\n    return _TP\n\n"
           "def init_external_pp_group(stage_idx, CommunicatorClass, num_stages=2, router_port=1,\n"
           "                           front_router_addr='x', device='cpu', logger=None):\n"
           "    class ExternalPPGroupCoordinator:\n"
@@ -82,6 +82,10 @@ def test_patch_applies_once_and_routes_through_rank0(tmp_path, monkeypatch):
         def start(self):
             return True
 
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.envs = types.ModuleType("vllm.envs")
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.envs", fake_vllm.envs)
     monkeypatch.setitem(sys.modules, "connex.pp.group",
                         types.SimpleNamespace(TPShardMember=FakeMember))
     monkeypatch.setenv("CONNEX_PP_TP_SIZE", "1")   # restored after the test
