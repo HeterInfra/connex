@@ -38,7 +38,7 @@ import msgpack
 import zmq
 
 from connex.pd.dataplane import ZCOPY_THRESH
-from connex.pd.kv_layout import TensorLayout, read_ops, register_spans
+from connex.pd.kv_layout import TPSource, TensorLayout, head_read_ops, read_ops, register_spans
 
 log = logging.getLogger("connex.pd")
 
@@ -59,6 +59,7 @@ class _Hold:
     blocks: list[int]
     deadline: float
     acquired: int = 0
+    released_by: set = field(default_factory=set)
 
 
 class KVProducer:
@@ -148,6 +149,13 @@ class KVProducer:
                 return {"ok": True, "blocks": h.blocks}
             if op == "release":
                 self.stats["releases"] += 1
+                # several decode TP ranks may read this rank (decode TP larger
+                # than prefill TP): free once all `of` of them released
+                of = int(m.get("of") or 1)
+                if h is not None and of > 1:
+                    h.released_by.add(m.get("who"))
+                    if len(h.released_by) < of:
+                        return {"ok": True, "pending": of - len(h.released_by)}
                 if h is None:
                     self._released.add(tid)   # hold not seen yet (or already gone)
                     if len(self._released) > 100000:
@@ -205,9 +213,10 @@ class KVConsumer:
     def __init__(self, plane, layouts: Sequence[TensorLayout], block_size: int = 0,
                  workers: int = 4, ctrl_timeout_ms: int = 1000, register: bool = True,
                  release_after_pull: bool = False, acquire_wait_s: float = 2.0,
-                 device: str = ""):
+                 device: str = "", who: str = ""):
         self.plane = plane
         self.device = device
+        self.who = who or f"{os.getpid()}@{id(self):x}"   # identifies this rank in releases
         # CONNEX_PD_INJECT_PULL_DELAY_S: test-only delay before each pull, to
         # kill a prefill instance while a transfer is pending
         self.inject_delay_s = float(os.getenv("CONNEX_PD_INJECT_PULL_DELAY_S", "0") or 0)
@@ -261,17 +270,26 @@ class KVConsumer:
             self._meta.pop(addr, None)
 
     def pull(self, req_id: str, addr: str, transfer_id: str, local_blocks: Sequence[int],
-             first_block: int = 0) -> None:
+             first_block: int = 0,
+             sources: Optional[Sequence[tuple[str, TPSource]]] = None) -> None:
         """Start pulling remote blocks [first_block, first_block + len(local))
         of ``transfer_id`` from the producer at ``addr`` (host:port) into
-        ``local_blocks``. The result shows up in ``take_done()``."""
-        self._pool.submit(self._pull, req_id, addr, transfer_id, list(local_blocks), first_block)
+        ``local_blocks``. The result shows up in ``take_done()``.
 
-    def _pull(self, req_id, addr, tid, local, first) -> None:
+        ``sources`` (heterogeneous TP): (producer address, ``TPSource``) per
+        remote TP rank this rank reads its KV heads from; ``addr`` is then
+        ignored. The request succeeds only if every source was read."""
+        self._pool.submit(self._pull, req_id, addr, transfer_id, list(local_blocks), first_block,
+                          list(sources) if sources else None)
+
+    def _pull(self, req_id, addr, tid, local, first, sources=None) -> None:
         t0 = time.monotonic()
         res = PullResult(req_id, False, failed_blocks=local)
         try:
-            res = self._pull_inner(req_id, addr, tid, local, first, t0)
+            if sources:
+                res = self._pull_sources(req_id, sources, tid, local, first, t0)
+            else:
+                res = self._pull_inner(req_id, addr, tid, local, first, t0)
         except Exception as e:  # noqa: BLE001
             res.why = f"error: {e}"
             log.exception("KV pull of %s failed", req_id)
@@ -285,8 +303,21 @@ class KVConsumer:
             self.stats["seconds"] += res.seconds
             self._done.append(res)
 
-    def _pull_inner(self, req_id, addr, tid, local, first, t0) -> PullResult:
-        if self.inject_delay_s:   # fault injection: widen the transfer window
+    def _pull_sources(self, req_id, sources, tid, local, first, t0) -> PullResult:
+        if self.inject_delay_s:
+            time.sleep(self.inject_delay_s)
+        nbytes = 0
+        for addr, src in sources:
+            r = self._pull_inner(req_id, addr, tid, local, first, t0, src=src, delay=False)
+            if not r.ok:
+                r.why = f"TP rank {src.remote_rank} ({addr}): {r.why}"
+                return r
+            nbytes += r.nbytes
+        return PullResult(req_id, True, nbytes=nbytes, seconds=time.monotonic() - t0)
+
+    def _pull_inner(self, req_id, addr, tid, local, first, t0, src: Optional[TPSource] = None,
+                    delay: bool = True) -> PullResult:
+        if self.inject_delay_s and delay:   # fault injection: widen the transfer window
             time.sleep(self.inject_delay_s)
         # The decode request can overtake the prefill engine handing the hold
         # to its worker (that happens on its next scheduler step): "unknown"
@@ -322,7 +353,7 @@ class KVConsumer:
             # memory: the decode process segfaults. Refuse instead.
             return PullResult(req_id, False, "prefill and decode share a GPU; connex-rs "
                                              "needs them on different GPUs")
-        ops = read_ops(self.layouts, meta.layouts, local, remote)
+        ops = self._ops(meta, local, remote, src)
         if self.plane.name == "connex-rs" and ops and min(n for _, _, n in ops) < ZCOPY_THRESH:
             return PullResult(req_id, False, f"KV segment of {min(n for _, _, n in ops)} B is below "
                                              f"the {ZCOPY_THRESH} B zero-copy threshold of connex-rs")
@@ -334,9 +365,25 @@ class KVConsumer:
             self.forget_peer(addr)
             return PullResult(req_id, False, f"{self.plane.name} read returned {rc}")
         if self.release_after_pull:
-            self._call(addr, {"op": "release", "tid": tid})
+            self._call(addr, self._release_msg(tid, src))
         n = sum(x[2] for x in ops)
         return PullResult(req_id, True, nbytes=n, seconds=time.monotonic() - t0)
+
+    def _ops(self, meta: _PeerMeta, local, remote, src: Optional[TPSource]):
+        if src is not None:
+            lo, ro = self.layouts[0], meta.layouts[0]
+            whole = (src.nheads == lo.heads == ro.heads and lo.seg_bytes == ro.seg_bytes
+                     and lo.head_stride == ro.head_stride and lo.token_stride == ro.token_stride)
+            if not whole:
+                return head_read_ops(self.layouts, meta.layouts, local, remote,
+                                     src.local_head0, src.remote_head0, src.nheads)
+        return read_ops(self.layouts, meta.layouts, local, remote)
+
+    def _release_msg(self, tid: str, src: Optional[TPSource] = None) -> dict:
+        m = {"op": "release", "tid": tid}
+        if src is not None and src.readers > 1:
+            m.update(of=src.readers, who=f"{self.who}")
+        return m
 
     def _outside(self, ops) -> Optional[tuple]:
         """First op whose destination is not inside registered local memory (a
@@ -347,9 +394,11 @@ class KVConsumer:
                 return (hex(dst), n)
         return None
 
-    def release(self, addr: str, transfer_id: str) -> None:
-        """Tell the producer it may free the blocks (fire and forget)."""
-        self._pool.submit(self._call, addr, {"op": "release", "tid": transfer_id})
+    def release(self, addr: str, transfer_id: str, src: Optional[TPSource] = None) -> None:
+        """Tell the producer it may free the blocks (fire and forget). With a
+        ``TPSource`` read by several local ranks, the producer frees once all
+        of them released."""
+        self._pool.submit(self._call, addr, self._release_msg(transfer_id, src))
 
     def take_done(self) -> list[PullResult]:
         with self._lock:

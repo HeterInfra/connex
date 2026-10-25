@@ -51,10 +51,17 @@ Protocol (pull based, see ``connex.pd.transfer``):
 ``replica``        replica index of this instance in its pool
 =================  =============================================================
 
+Tensor parallelism: decode TP rank r reads the KV heads of its shard from
+every prefill TP rank that holds some of them (``connex.pd.kv_layout.tp_plan``),
+so prefill and decode may use different TP sizes (KV head re-layout; the
+connector asks vLLM for head-major ``LBHNC`` blocks, where one head of one
+block is a single contiguous read). With equal TP sizes rank r reads whole
+blocks from rank r.
+
 Scope: attention KV caches whose per-block slice is contiguous (vLLM's
-FlashAttention/FlashInfer layouts); equal tensor-parallel size and block size
-on prefill and decode (rank r pulls from rank r); no hybrid (Mamba/sliding
-window) groups, no pipeline parallelism inside an instance.
+FlashAttention/FlashInfer layouts); equal block size on prefill and decode;
+KV heads divisible by both TP sizes (no replicated KV heads); no hybrid
+(Mamba/sliding window) groups, no pipeline parallelism inside an instance.
 """
 from __future__ import annotations
 
@@ -72,7 +79,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 
 from connex.pd.dataplane import make_plane
-from connex.pd.kv_layout import tensor_layout
+from connex.pd.kv_layout import find_heads_dims, tensor_layout, tp_plan
 from connex.pd.membership import PD_STAGE, PDMember
 from connex.pd.transfer import KVConsumer, KVProducer
 from connex.protocol import PDRole
@@ -96,6 +103,7 @@ class _Pull:
     transfer_id: str
     local_blocks: list[int]
     first_block: int
+    remote_tp: int = 0   # 0: unknown (older producer), read rank r from rank r
 
 
 @dataclass
@@ -103,7 +111,7 @@ class ConnexConnectorMetadata(KVConnectorMetadata):
     holds: list[tuple[str, str, list[int]]] = field(default_factory=list)   # (req, tid, blocks)
     drops: list[str] = field(default_factory=list)                          # tids
     pulls: list[_Pull] = field(default_factory=list)
-    releases: list[tuple[str, str]] = field(default_factory=list)           # (ctrl, tid)
+    releases: list[tuple[str, str, int]] = field(default_factory=list)      # (ctrl, tid, remote tp)
 
 
 def _host(extra: dict) -> str:
@@ -155,21 +163,30 @@ class ConnexConnector(KVConnectorBase_V1):
         else:
             self._init_worker(vllm_config)
 
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: "VllmConfig") -> Optional[str]:
+        """Head-major blocks (HND): one KV head of a block is one contiguous
+        run, so a decode rank can read just its heads from a prefill rank of
+        a different tensor-parallel size with reads of block_size x head_dim
+        elements (4 KB for 16-token blocks of 128-dim bf16 heads) instead of
+        one small read per token. ``kv_layout`` in the extra config overrides
+        it (``"none"`` keeps vLLM's default)."""
+        mc = getattr(vllm_config, "model_config", None)
+        if mc is None or getattr(mc, "use_mla", False):
+            return None
+        ktc = vllm_config.kv_transfer_config
+        extra = (ktc.kv_connector_extra_config or {}) if ktc is not None else {}
+        layout = str(extra.get("kv_layout", "LBHNC"))
+        return None if layout.lower() == "none" else layout
+
     # ======================================================================
     # Scheduler side
     # ======================================================================
     def _init_scheduler(self) -> None:
         self._meta = ConnexConnectorMetadata()
         self._local_hit: dict[str, int] = {}          # req -> locally computed tokens
-        self._remote: dict[str, tuple[str, str]] = {}  # decode req -> (ctrl, tid)
-        self._member: Optional[PDMember] = None
-        fr = self.extra.get("front_router")
-        if fr:
-            role = PDRole.PREFILL if self.is_producer and not self.is_consumer else PDRole.DECODE
-            url = self.extra.get("http_url") or f"http://{self.host}:{os.getenv('VLLM_PORT', '8000')}"
-            self._member = PDMember(fr, self.model, role, self.replica, url,
-                                    kv_addr=f"{self.host}:{self.ctrl_base}" if self.is_producer else None)
-            self._member.start()
+        self._remote: dict[str, tuple[str, str, int]] = {}  # decode req -> (ctrl, tid, remote tp)
+        # membership is registered by the workers, one shard per TP rank
 
     def get_num_new_matched_tokens(self, request: "Request",
                                    num_computed_tokens: int) -> tuple[int, bool]:
@@ -197,7 +214,8 @@ class ConnexConnector(KVConnectorBase_V1):
             log.warning("request %s: kv_transfer_params without remote_ctrl/transfer_id: %s",
                         request.request_id, p)
             return
-        self._remote[request.request_id] = (ctrl, tid)
+        rtp = int(p.get("remote_tp_size") or 0)
+        self._remote[request.request_id] = (ctrl, tid, rtp)
         local: list[int] = []
         first = 0
         if num_external_tokens > 0:
@@ -207,7 +225,7 @@ class ConnexConnector(KVConnectorBase_V1):
             local = list(blocks.get_block_ids()[0][first:last])
         # an empty pull still acquires: the router learns nothing is lost, and
         # the hold is renewed until this request releases it
-        self._meta.pulls.append(_Pull(request.request_id, ctrl, tid, local, first))
+        self._meta.pulls.append(_Pull(request.request_id, ctrl, tid, local, first, rtp))
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> KVConnectorMetadata:
         meta, self._meta = self._meta, ConnexConnectorMetadata()
@@ -223,9 +241,10 @@ class ConnexConnector(KVConnectorBase_V1):
         if not p:
             return False, None
         if rid in self._remote or p.get("do_remote_prefill"):
-            ctrl, tid = self._remote.pop(rid, (p.get("remote_ctrl"), p.get("transfer_id")))
+            ctrl, tid, rtp = self._remote.pop(rid, (p.get("remote_ctrl"), p.get("transfer_id"),
+                                                    int(p.get("remote_tp_size") or 0)))
             if ctrl and tid and not self.release_after_pull:
-                self._meta.releases.append((ctrl, tid))
+                self._meta.releases.append((ctrl, tid, rtp))
             return False, None
         if not p.get("do_remote_decode") or not self.is_producer:
             return False, None
@@ -254,6 +273,13 @@ class ConnexConnector(KVConnectorBase_V1):
             self.rank = get_tensor_model_parallel_rank()
         except Exception:  # noqa: BLE001  (not initialised in some unit setups)
             self.rank = 0
+        pc = vllm_config.parallel_config
+        self.tp_size = int(getattr(pc, "tensor_parallel_size", 1) or 1)
+        try:
+            self.kv_heads = int(vllm_config.model_config.get_num_kv_heads(pc))   # per rank
+        except Exception:  # noqa: BLE001
+            self.kv_heads = 0
+        self._plans: dict[int, list] = {}
         self.producer: Optional[KVProducer] = None
         self.consumer: Optional[KVConsumer] = None
         self._errors: set[int] = set()
@@ -261,8 +287,10 @@ class ConnexConnector(KVConnectorBase_V1):
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
         num_blocks = self._kv_cache_config.num_blocks
-        layouts = [tensor_layout(t, num_blocks) for t in kv_caches.values()]
         t0 = next(iter(kv_caches.values()))
+        heads_dims = find_heads_dims(tuple(t0.shape), num_blocks, self.kv_heads, self.block_size,
+                                 getattr(self._vllm_config.cache_config, "kv_cache_layout", None))
+        layouts = [tensor_layout(t, num_blocks, heads_dims) for t in kv_caches.values()]
         log.info("ConnexConnector: %d KV tensors, first %s %s stride %s, %s",
                  len(layouts), t0.dtype, tuple(t0.shape), t0.stride(), layouts[0])
         role = PDRole.PREFILL if self.is_producer and not self.is_consumer else PDRole.DECODE
@@ -283,11 +311,47 @@ class ConnexConnector(KVConnectorBase_V1):
             self.consumer = KVConsumer(plane, layouts, block_size=self.block_size,
                                        register=self.producer is None,
                                        release_after_pull=self.release_after_pull,
-                                       device=dev)
+                                       device=dev, who=f"{self.engine_id}/{self.rank}")
+        self.has_heads = heads_dims is not None
+        self._start_membership(role, plane)
 
-    def _rank_addr(self, ctrl: str) -> str:
+    def _start_membership(self, role: str, plane) -> None:
+        """Register this TP rank as shard ``rank`` of the instance's group and
+        report peers that the data plane sees die. A group (one instance) is
+        one endpoint: when any rank dies the front-router fails all of it,
+        and the PD router stops using the instance."""
+        self._member = None
+        fr = self.extra.get("front_router")
+        if not fr:
+            return
+        url = self.extra.get("http_url") or f"http://{self.host}:{os.getenv('VLLM_PORT', '8000')}"
+        self._member = PDMember(fr, self.model, role, self.replica, url,
+                                kv_addr=f"{self.host}:{self.ctrl_base}" if self.is_producer else None,
+                                shard=self.rank, group_size=self.tp_size)
+        self._member.start()
+        if hasattr(getattr(plane, "e", None), "wait_event"):
+            from connex.pd.group import PeerDeathReporter
+
+            self._reporter = PeerDeathReporter(plane.e, fr, self.model)
+            self._reporter.start()
+
+    def _rank_addr(self, ctrl: str, rank: Optional[int] = None) -> str:
         h, p = _split(ctrl)
-        return f"{h}:{p + self.rank}"
+        return f"{h}:{p + (self.rank if rank is None else rank)}"
+
+    def _sources(self, ctrl: str, remote_tp: int):
+        """(producer address, TPSource) per prefill rank this rank reads, or
+        None for the plain rank-r-from-rank-r pull (equal TP, or unknown)."""
+        if remote_tp <= 0 or not self.kv_heads or not getattr(self, "has_heads", False):
+            if remote_tp > 0 and remote_tp != self.tp_size:
+                raise ValueError(f"prefill TP {remote_tp} != decode TP {self.tp_size} and the KV "
+                                 "head geometry is unknown")
+            return None
+        plan = self._plans.get(remote_tp)
+        if plan is None:
+            plan = tp_plan(self.rank, self.tp_size, remote_tp, self.kv_heads * self.tp_size)
+            self._plans[remote_tp] = plan
+        return [(self._rank_addr(ctrl, s.remote_rank), s) for s in plan]
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
         meta = self._get_connector_metadata()
@@ -298,10 +362,31 @@ class ConnexConnector(KVConnectorBase_V1):
         if self.consumer is not None:
             for pl in meta.pulls:
                 self._recving.add(pl.req_id)
+                try:
+                    srcs = self._sources(pl.ctrl, pl.remote_tp)
+                except ValueError as e:
+                    log.warning("request %s: %s", pl.req_id, e)
+                    self._fail_now(pl)
+                    continue
                 self.consumer.pull(pl.req_id, self._rank_addr(pl.ctrl), pl.transfer_id,
-                                   pl.local_blocks, pl.first_block)
-            for ctrl, tid in meta.releases:
-                self.consumer.release(self._rank_addr(ctrl), tid)
+                                   pl.local_blocks, pl.first_block, sources=srcs)
+            for ctrl, tid, rtp in meta.releases:
+                try:
+                    srcs = self._sources(ctrl, rtp)
+                except ValueError:
+                    srcs = None
+                if srcs is None:
+                    self.consumer.release(self._rank_addr(ctrl), tid)
+                else:
+                    for addr, src in srcs:
+                        self.consumer.release(addr, tid, src)
+
+    def _fail_now(self, pl: _Pull) -> None:
+        from connex.pd.transfer import PullResult
+
+        with self.consumer._lock:
+            self.consumer._done.append(PullResult(pl.req_id, False, "TP mismatch",
+                                                  failed_blocks=list(pl.local_blocks)))
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return
@@ -333,6 +418,9 @@ class ConnexConnector(KVConnectorBase_V1):
         member = getattr(self, "_member", None)
         if member is not None:
             member.stop()
+        rep = getattr(self, "_reporter", None)
+        if rep is not None:
+            rep.stop()
         for x in (getattr(self, "consumer", None), getattr(self, "producer", None)):
             if x is not None:
                 x.close()

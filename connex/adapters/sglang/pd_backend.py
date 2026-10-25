@@ -207,19 +207,22 @@ def get_engine(hostname: str, role: str, gpu_id: int) -> ConnexRsTransferEngine:
         return _ENGINE
 
 
-def _maybe_register_member(role: str, rank: int) -> None:
-    """Register this instance in the front-router PD pools (rank 0 only)."""
+def _maybe_register_member(role: str, rank: int, tp_size: int = 1) -> None:
+    """Register this TP rank in the front-router PD pools as shard ``rank``
+    of a group of ``tp_size``: the instance is listed only while every rank
+    is registered, and one rank missing its lease fails the whole group."""
     global _MEMBER
     fr = os.getenv("CONNEX_PD_FRONT_ROUTER")
     url = os.getenv("CONNEX_PD_HTTP_URL")
-    if not fr or not url or rank != 0 or _MEMBER is not None:
+    if not fr or not url or _MEMBER is not None:
         return
     from connex.pd.membership import PDMember
 
     bootstrap = os.getenv("CONNEX_PD_BOOTSTRAP")   # host:port, advertised for prefill
     _MEMBER = PDMember(fr, os.getenv("CONNEX_PD_MODEL", "default"), role,
                        int(os.getenv("CONNEX_PD_REPLICA", "0")), url,
-                       kv_addr=bootstrap if role == "prefill" else None)
+                       kv_addr=bootstrap if role == "prefill" else None,
+                       shard=rank, group_size=max(1, tp_size))
     _MEMBER.start()
 
 
@@ -239,7 +242,8 @@ def _classes():
                     else "decode")
             self.engine = get_engine(self.local_ip, role, int(self.kv_args.gpu_id))
             try:
-                _maybe_register_member(role, int(self.kv_args.engine_rank))
+                tp = int(getattr(self, "attn_tp_size", 1) or 1)
+                _maybe_register_member(role, int(self.kv_args.engine_rank) % tp, tp)
             except Exception as e:  # noqa: BLE001  membership is optional
                 log.warning("front-router registration failed: %s", e)
 

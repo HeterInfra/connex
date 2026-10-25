@@ -122,6 +122,8 @@ class RouteEntry:
     capabilities: List[TransportCapability]
     epoch: int
     state: RouteState = RouteState.ACTIVE
+    # shards in this endpoint's group (e.g. TP ranks of one stage); 1 = none
+    group_size: int = 1
     
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RouteEntry":
@@ -131,7 +133,29 @@ class RouteEntry:
             capabilities=[TransportCapability(c) for c in d["capabilities"]],
             epoch=d["epoch"],
             state=RouteState(d.get("state", RouteState.ACTIVE)),
+            group_size=int(d.get("group_size")
+                           or (d.get("metadata") or {}).get("group_size") or 1),
         )
+
+
+def serving_routes(routes: List["RouteEntry"]) -> List["RouteEntry"]:
+    """The routes peers should talk to: ungrouped endpoints, plus shard 0 of
+    every group (e.g. the TP ranks of one stage) whose shards are all
+    present. Other shards only exist for liveness: a group with a missing
+    shard cannot serve, and the group's endpoint is its shard 0."""
+    groups: Dict[tuple, set] = {}
+    for r in routes:
+        if r.group_size > 1:
+            groups.setdefault((r.lid.model_name, r.lid.stage_idx, r.lid.replica_idx),
+                              set()).add(r.lid.shard_idx)
+    out = []
+    for r in routes:
+        if r.group_size <= 1:
+            out.append(r)
+        elif r.lid.shard_idx == 0 and groups[(r.lid.model_name, r.lid.stage_idx,
+                                              r.lid.replica_idx)] >= set(range(r.group_size)):
+            out.append(r)
+    return out
 
 
 @dataclass
@@ -177,6 +201,10 @@ class EPCV2ClientConfig:
     stage_idx: int = 0
     shard_idx: int = 0
     replica_idx: int = 0
+    # >1: this endpoint is shard ``shard_idx`` of a group of ``group_size``
+    # (e.g. one tensor-parallel rank). The front-router treats the group as
+    # one endpoint: any shard failing or leaving fails the whole group.
+    group_size: int = 1
     
     # Local addresses to advertise
     local_addresses: List[str] = field(default_factory=list)
@@ -255,7 +283,8 @@ class RouteTableCache:
     def get_for_model(self, model_name: str) -> List[RouteEntry]:
         """Get routes for a specific model."""
         with self._lock:
-            return [r for r in self._routes.values() if r.lid.model_name == model_name]
+            return serving_routes(
+                [r for r in self._routes.values() if r.lid.model_name == model_name])
     
     def update_single(self, route: RouteEntry, epoch: int):
         """Update a single route entry."""
@@ -294,10 +323,10 @@ class RouteTableCache:
     def get_for_stage(self, model_name: str, stage_idx: int) -> List[RouteEntry]:
         """Routes of one stage, sorted by (shard, replica)."""
         with self._lock:
-            out = [
+            out = serving_routes([
                 r for r in self._routes.values()
                 if r.lid.model_name == model_name and r.lid.stage_idx == stage_idx
-            ]
+            ])
         out.sort(key=lambda r: (r.lid.shard_idx, r.lid.replica_idx))
         return out
     
@@ -698,11 +727,14 @@ class EPCV2Client:
     def _register(self, channel: Optional[_ReqChannel] = None) -> bool:
         """Register with Front Router."""
         try:
-            response = self._call_api("register", {
+            params = {
                 "lid": self.lid.to_dict(),
                 "addresses": self.config.local_addresses,
                 "capabilities": [int(c) for c in self.config.capabilities],
-            }, channel=channel)
+            }
+            if self.config.group_size > 1:
+                params["group_size"] = int(self.config.group_size)
+            response = self._call_api("register", params, channel=channel)
             
             if response.get("success"):
                 self._local_epoch = response.get("epoch", 0)

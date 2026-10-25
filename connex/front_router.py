@@ -143,13 +143,23 @@ class RouteEntry:
     
     def to_compact_dict(self) -> Dict[str, Any]:
         """Only the fields data-plane clients need (no timestamps/metadata)."""
-        return {
+        d = {
             "lid": self.lid.to_dict(),
             "addresses": list(self.addresses),
             "capabilities": [int(c) for c in self.capabilities],
             "epoch": self.epoch,
             "state": int(self.state),
         }
+        if self.group_size > 1:
+            d["group_size"] = self.group_size
+        return d
+
+    @property
+    def group_size(self) -> int:
+        """Shards in this endpoint's group (1: not grouped). A group, e.g. the
+        tensor-parallel ranks of one instance, is one endpoint: it is usable
+        only with all shards active and fails or leaves as a whole."""
+        return int(self.metadata.get("group_size", 1) or 1)
     
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "RouteEntry":
@@ -1092,6 +1102,7 @@ class FrontRouter:
             "get_topology": self._handle_get_topology,
             "update_route": self._handle_update_route,
             "force_refresh": self._handle_force_refresh,
+            "report_failure": self._handle_report_failure,
         }
         
         handler = handlers.get(method)
@@ -1136,6 +1147,11 @@ class FrontRouter:
         
         # Add/update route
         route = self.route_manager.add_route(lid, addresses, capabilities, epoch)
+        gsize = int(params.get("group_size", 1) or 1)
+        if gsize > 1:
+            route.metadata["group_size"] = gsize
+        else:
+            route.metadata.pop("group_size", None)
         
         # Event seq at snapshot time (read before the snapshot; see get_routes)
         snapshot_seq = self.event_bus.seq
@@ -1217,10 +1233,61 @@ class FrontRouter:
             source_lid=lid.to_key(),
         ))
 
+    # -- groups (e.g. the TP ranks of one instance) -----------------------------
+    def _group_routes(self, lid: LogicalEndpointID) -> List[RouteEntry]:
+        """Routes of the group ``lid`` belongs to (all shards of its model,
+        stage and replica) if it is grouped, else just its own route."""
+        route = self.route_manager.get_route(lid)
+        if route is None or route.group_size <= 1:
+            return [route] if route is not None else []
+        return [r for r in self.route_manager.get_routes_for_stage(lid.model_name, lid.stage_idx)
+                if r.lid.replica_idx == lid.replica_idx and r.group_size > 1]
+
+    def fail_group(self, lid: LogicalEndpointID, reason: str) -> List[str]:
+        """Fail ``lid`` and, if it is a shard of a group, the whole group:
+        every shard's route is removed and announced as deregistered with
+        ``reason``, so senders route around the group at once. Shards that
+        are still alive re-register on their next heartbeat; the group is
+        usable again once all its shards are back (same identity)."""
+        if not isinstance(lid, LogicalEndpointID):   # e.g. connex.protocol's LID
+            lid = LogicalEndpointID(lid.model_name, int(lid.stage_idx), int(lid.shard_idx),
+                                    int(lid.replica_idx))
+        routes = self._group_routes(lid)
+        failed: List[str] = []
+        for r in routes:
+            if self.route_manager.remove_route(r.lid) is None:
+                continue
+            failed.append(r.lid.to_key())
+            self.event_bus.publish(Event(
+                type=EventType.ENDPOINT_DEREGISTERED,
+                epoch=self.epoch_manager.current,
+                payload={"lid": r.lid.to_dict(), "reason": reason,
+                         "group": [lid.model_name, lid.stage_idx, lid.replica_idx],
+                         "cause": lid.to_key()},
+                source_lid=r.lid.to_key(),
+            ))
+        if failed:
+            self._stats["group_failures"] = self._stats.get("group_failures", 0) + 1
+            logger.warning("Group of %s failed (%s): removed %s", lid.to_key(), reason, failed)
+        return failed
+
+    def _handle_report_failure(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """A peer saw ``lid`` die (transport peer-death event, broken stream):
+        fail it (and its group) now instead of waiting for its lease."""
+        lid = LogicalEndpointID.from_dict(params["lid"])
+        failed = self.fail_group(lid, str(params.get("reason") or "reported"))
+        return {"success": bool(failed), "failed": failed}
+
     def _handle_deregister(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle endpoint deregistration."""
         lid = LogicalEndpointID.from_dict(params["lid"])
         
+        existing = self.route_manager.get_route(lid)
+        if existing is not None and existing.group_size > 1:
+            # one shard leaving takes its group out (a group is one endpoint)
+            failed = self.fail_group(lid, "group_left")
+            self._stats["deregistrations"] += 1
+            return {"success": bool(failed), "failed": failed}
         route = self.route_manager.remove_route(lid)
         if not route:
             return {"success": False, "error": "Route not found"}
@@ -1546,6 +1613,11 @@ class FrontRouter:
     
     def _on_endpoint_unhealthy(self, lid: LogicalEndpointID):
         """Callback when an endpoint becomes unhealthy."""
+        route = self.route_manager.get_route(lid)
+        if route is not None and route.group_size > 1:
+            # a shard missed its lease: the group cannot serve, fail all of it
+            self.fail_group(lid, "group_member_unhealthy")
+            return
         self.event_bus.publish(Event(
             type=EventType.ENDPOINT_UNHEALTHY,
             epoch=self.epoch_manager.current,
