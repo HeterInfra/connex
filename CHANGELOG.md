@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+**Expert parallelism (MoE) with recovery and elasticity: `connex.ep`**
+- `PlacementTable`: versioned expert placement (expert -> physical slots on
+  EP ranks, replicas, rank states up / draining / down, routable masks),
+  epochs applied only at a step boundary, repair planning after a rank fails
+  or drains (destination on a live rank, source a live replica or the
+  checkpoint), warm-standby replicas (`active_replicas`).
+- `ExpertStore`: a rank's expert weights registered with connex-rs; experts
+  move between ranks with one-sided reads straight into the destination slot.
+- `EPController`: two-epoch reconfiguration (route around, copy, route to the
+  new copies) for fail / drain / join / migrate; a move whose source dies is
+  re-planned.
+- `EPGroupSupervisor`: replica-level recovery for engines whose EP group
+  cannot survive a rank loss (health probes, drop from the resume proxy's
+  routing set, rebuild, rejoin).
+- vLLM 0.32 (upstream, no fork): worker extension
+  `connex.ep.vllm_ext.ConnexEPWorker` drives vLLM's EPLB expert maps from the
+  placement table through `collective_rpc`; EPLB support for OLMoE.
+- `benchmarks/ep/`: load + events (`ep_bench.py`), EP-group kill under load
+  (`ep_failover.py`), link bandwidth reference (`link_bw.py`).
+- `ConnexRsTransport.read_many` / `LocalTransport.read_many`: reads into
+  several destination tensors in one wave.
+
 ## 0.1.1
 
 **Prefill-decode disaggregation on upstream vLLM and SGLang (no fork)**

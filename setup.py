@@ -66,6 +66,7 @@ setup(
         "vllm.general_plugins": [
             "connex_pd = connex.adapters.vllm.plugin:register",
             "connex_rl = connex.rl.vllm_plugin:register",
+            "connex_ep = connex.ep.vllm_ext:register",
         ],
         "sglang.srt.plugins": ["connex = connex.adapters.sglang.pd_backend:register"],
     },
