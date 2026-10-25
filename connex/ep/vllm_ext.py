@@ -19,9 +19,11 @@ cutover point a placement epoch needs:
 
 vLLM's own EPLB rebalancing must stay off (``step_interval`` larger than the
 run): Connex owns the map. EPLB needs a model that implements vLLM's
-``MixtureOfExperts`` interface; :func:`register` adds it to OLMoE (vLLM's
-``OlmoeForCausalLM`` builds its MoE layer without EPLB), the models that
-already have it (Qwen3-MoE, DeepSeek-V2/V3, Mixtral, ...) need nothing.
+``MixtureOfExperts`` interface; :func:`enable_olmoe_eplb` adds it to OLMoE
+(vLLM's ``OlmoeForCausalLM`` builds its MoE layer without EPLB), the models
+that already have it (Qwen3-MoE, DeepSeek-V2/V3, Mixtral, ...) need nothing.
+The ``connex_ep`` vLLM plugin applies it only when ``CONNEX_EP=1`` is set,
+so vLLM processes that do not use Connex EP are left untouched.
 
 Controller side: :class:`VLLMEPEngine` is the ``EPController`` engine handle
 for one vLLM server (all its EP ranks).
@@ -38,6 +40,14 @@ _registered = False
 
 
 def register():
+    """``vllm.general_plugins`` entry point: opt-in with ``CONNEX_EP=1``."""
+    import os
+    if os.environ.get("CONNEX_EP", "") not in ("1", "true", "yes"):
+        return
+    enable_olmoe_eplb()
+
+
+def enable_olmoe_eplb():
     """Make vLLM's OLMoE EPLB-capable (idempotent; a no-op without vLLM)."""
     global _registered
     if _registered:
@@ -96,9 +106,9 @@ def register():
     ModelRegistry.register_model("OlmoeForCausalLM", OlmoeForCausalLMEP)
 
 
-# register at import: the worker imports this module (worker extension)
-# before it builds the model
-register()
+# enable at import: the worker imports this module (worker extension)
+# before it builds the model, so using the extension is the opt-in
+enable_olmoe_eplb()
 
 
 class ConnexEPWorker:

@@ -64,6 +64,10 @@ VLLM_SERVER_DEV_MODE=1 PYTHONPATH=/path/to/connex vllm serve allenai/OLMoE-1B-7B
     --worker-extension-cls connex.ep.vllm_ext.ConnexEPWorker
 ```
 
+The worker extension also makes vLLM's OLMoE EPLB-capable. Other vLLM
+processes are left alone; to get the OLMoE EPLB support without the
+extension, set `CONNEX_EP=1` (the `connex_ep` vLLM plugin then applies it).
+
 ```python
 from connex.ep import EPController
 from connex.ep.vllm_ext import VLLMEPEngine
