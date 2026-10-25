@@ -101,7 +101,13 @@ Two SGLang details mattered:
 
 * **The overlap scheduler.** Input handling for batch N+1 runs while batch N
   is still on the GPU, so a map write there could race with batch N. The
-  first version waits for the device before and after the write.
+  first version synchronized the device before and after the write, which
+  blocked the scheduler for one decode step (22 ms) per epoch. The writes
+  are now ordered on the GPU: the scheduler thread runs on SGLang's
+  schedule stream, which waits for the forward stream before the writes,
+  and every forward waits for the schedule stream anyway. A move into a
+  slot the epoch staged out waits for an event recorded after the writes
+  (in its background thread, so nothing blocks the loop).
 * **Replicas were silently unused.** SGLang's Qwen2-MoE passes the dispatch
   info to `TopK` only on its DeepEP path; without an all-to-all backend the
   top-k ids stayed logical and were used as physical slot ids. With 60
@@ -116,6 +122,17 @@ Reproduce: start Qwen1.5-MoE with `--ep 2 --ep-num-redundant-experts 60
 --ep-dispatch-algorithm dynamic` without `CONNEX_EP=1`, run `ep_bench.py run
 --engine sglang`, then `POST /start_profile` with `num_steps` and sum the
 kernel times per rank in the two traces.
+
+**Attaching under load stalled serving.** The first controller attach
+stalled every running request for 0.3-2.3 s even after the registration
+moved to a background thread. Timing the parts in the server showed that
+the registration itself is short (130-250 ms for 24.9 GB) and creating the
+connex-rs endpoint is not (0.2 s on rank 0, 1.1 s on rank 1), and the
+constructor holds the interpreter, so the scheduler thread cannot run.
+A standalone thread test does not reproduce the full stall, so test it in
+the server. The endpoint is now created when the scheduler starts. Reproduce:
+attach with the in-process transport (`SGLangEPEngine(..., transport="local")`):
+no stall; with connex-rs created at attach time: the stall is back.
 
 **Scoring on SGLang.** Its default kernels are not batch invariant, so a
 teacher-forced score flips 0-2 near-ties per 32,768 tokens even in runs

@@ -165,8 +165,20 @@ ctl.drain_rank(1)
   extension's (`connex_ep_info`, `_init`, `_apply`, `_move_start`,
   `_move_poll`, `_load`), so `EPController` drives both engines the same way.
 * **Overlap scheduler.** SGLang prepares batch N+1 while batch N still runs
-  on the GPU, so `apply` waits for the device before it writes the maps:
-  batch N finishes on the old epoch and N+1 runs entirely on the new one.
+  on the GPU. `apply` orders the map writes on the GPU instead of blocking:
+  the scheduler's stream waits for the forward stream (batch N), writes the
+  maps from pinned memory, and batch N+1 waits for the scheduler's stream
+  as it always does. Batch N runs entirely on the old epoch, N+1 on the new
+  one, and the scheduler thread never waits for the GPU. A background move
+  waits for an event recorded after the writes before it touches a slot
+  the epoch staged out. `CONNEX_EP_APPLY_SYNC=1` restores the blocking
+  variant (device synchronize before and after).
+* **Attach.** The connex-rs endpoint of each rank is created when the
+  scheduler starts (`CONNEX_EP_TRANSPORT`, default `connex-rs`; `none`
+  skips it): creating it takes 0.2-1.1 s and holds the interpreter, which
+  stalled serving when a controller attached under load. Registering the
+  expert weights runs in a background thread; `SGLangEPEngine.describe()`
+  polls until every rank is ready.
 * **Replica routing fix.** SGLang 0.5.22's Qwen2-MoE passes the dispatch
   info to `TopK` only on its DeepEP path. Without an all-to-all backend the
   top-k ids stay logical and are used as physical slot ids, so with

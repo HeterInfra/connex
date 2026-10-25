@@ -173,3 +173,15 @@ def test_control_endpoint_drives_epcontroller_end_to_end():
     finally:
         sched.stop = True
         sched._connex_ep_srv.shutdown()
+
+
+def test_init_registers_in_the_background_and_polls():
+    layers = [[torch.zeros(S, H, H)] for _ in range(L)]
+    w = FakeWorker(FakeMD(linear_rows()), 0, layers)
+    out = w.connex_ep_init(json.dumps({"transport": "local"}))
+    deadline = time.time() + 10
+    while out.get("pending") and time.time() < deadline:
+        time.sleep(0.01)
+        out = w.connex_ep_init(json.dumps({"transport": "local"}))
+    assert out["rank"] == 0 and len(out["layers"]) == L
+    assert w.connex_ep_init("{}") == out                 # registered once

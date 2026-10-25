@@ -159,6 +159,13 @@ def _tp_rank():
 
 def _setup(sched):
     sched._connex_ep = SGLangEPWorker(sched)
+    kind = os.environ.get("CONNEX_EP_TRANSPORT", "connex-rs")
+    if kind != "none":
+        # create the endpoint now, not at attach time under load
+        try:
+            sched._connex_ep._transport({"transport": kind})
+        except Exception:  # noqa: BLE001
+            log.exception("connex.ep: transport %s not created at start", kind)
     if _tp_rank() != 0:
         return
     sched._connex_ep_q = queue.Queue()
@@ -255,6 +262,22 @@ class SGLangEPWorker(ConnexEPWorker):
     def __init__(self, sched):
         self.sched = sched
 
+    def _transport(self, cfg=None):
+        """The rank's transport for ``cfg`` (kind, group), created once.
+        Creating a connex-rs endpoint takes 0.2-1.1 s and holds the
+        interpreter, which stalls the scheduler loop; the plugin therefore
+        creates the default one when the scheduler starts (before serving),
+        see :func:`_setup`."""
+        from connex.rl.transport import make_transport
+        cfg = cfg or {}
+        key = (cfg.get("transport", "connex-rs"), int(cfg.get("group", 0)))
+        cache = self.__dict__.setdefault("_connex_ep_transports", {})
+        if key not in cache:
+            rank = self._ep_rank()
+            cache[key] = make_transport(key[0], name=f"ep-r{rank}",
+                                        lid=("connex-ep", 0, rank, key[1]))
+        return cache[key]
+
     # -- engine access -------------------------------------------------------
     def _md(self):
         from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
@@ -313,17 +336,48 @@ class SGLangEPWorker(ConnexEPWorker):
         }
 
     def connex_ep_init(self, cfg="{}"):
+        """Register the expert weights with connex-rs (and export CUDA IPC
+        handles) in a background thread: registering tens of GB takes
+        0.3-2 s and would stall the scheduler loop. Returns
+        ``{"pending": True}`` until done, then ``ExpertStore.describe()``;
+        call again to poll."""
         cfg = json.loads(cfg) if isinstance(cfg, str) else (cfg or {})
-        from connex.rl.transport import make_transport
-        from .mover import ExpertStore
-        if getattr(self, "_connex_ep_store", None) is not None:
-            return self._connex_ep_store.describe()
-        rank = self._ep_rank()
-        t = make_transport(cfg.get("transport", "connex-rs"), name=f"ep-r{rank}",
-                           lid=("connex-ep", 0, rank, int(cfg.get("group", 0))))
-        self._connex_ep_store = ExpertStore(rank, self._expert_layers(), t)
-        self._connex_ep_epoch = getattr(self, "_connex_ep_epoch", 0)
-        return self._connex_ep_store.describe()
+        store = getattr(self, "_connex_ep_store", None)
+        if store is not None:
+            return store.describe()
+        job = getattr(self, "_connex_ep_init_job", None)
+        if job is None:
+            import threading
+            import torch
+            from .mover import ExpertStore
+            layers, rank = self._expert_layers(), self._ep_rank()
+            dev = layers[0][0].device if layers else None
+            job = self._connex_ep_init_job = {"done": False, "error": None}
+
+            def run():
+                try:
+                    if dev is not None and dev.type == "cuda":
+                        torch.cuda.set_device(dev)
+                    t0 = time.perf_counter()
+                    t = self._transport(cfg)
+                    t1 = time.perf_counter()
+                    st = ExpertStore(rank, layers, t)
+                    job["describe"] = st.describe()
+                    log.info("connex.ep attach, rank %d: transport %.0f ms, registration "
+                             "%.0f ms", rank, (t1 - t0) * 1e3, (time.perf_counter() - t1) * 1e3)
+                    self._connex_ep_store = st
+                except Exception as ex:  # noqa: BLE001
+                    job["error"] = repr(ex)
+                job["done"] = True
+
+            threading.Thread(target=run, daemon=True, name="connex-ep-init").start()
+            self._connex_ep_epoch = getattr(self, "_connex_ep_epoch", 0)
+        if not job["done"]:
+            return {"pending": True, "rank": self._ep_rank()}
+        if job["error"]:
+            self._connex_ep_init_job = None          # let the caller retry
+            raise RuntimeError(job["error"])
+        return job["describe"]
 
     def connex_ep_apply(self, view):
         import torch
@@ -369,11 +423,32 @@ class SGLangEPWorker(ConnexEPWorker):
                 [[next((p for p in ps if p // S == me), ps[0]) for ps in
                   [[p for p in a[e] if p >= 0] for e in range(len(a))]] for a in l2p],
                 dtype=md.logical_to_rank_dispatch_physical_map.dtype)
-        # the previous (overlapped) batch may still read the maps
-        sync = (lambda: torch.cuda.synchronize(dev)) if dev.type == "cuda" else (lambda: None)
-        sync()
-        self._write_maps(md, dev, rows, rows_t, l2p_t, w, width, cnt_t, rank_map)
-        sync()
+        if dev.type == "cuda" and os.environ.get("CONNEX_EP_APPLY_SYNC", "0") == "1":
+            # blocking variant: wait out the overlapped batch on the CPU
+            torch.cuda.synchronize(dev)
+            self._write_maps(md, dev, rows, rows_t, l2p_t, w, width, cnt_t, rank_map)
+            torch.cuda.synchronize(dev)
+        elif dev.type == "cuda":
+            # The scheduler thread runs on its schedule stream; the previous
+            # batch may still run on the forward stream (overlap scheduler)
+            # and read the maps. Order the writes after it on the GPU, not by
+            # blocking the CPU: the schedule stream waits for the forward
+            # stream, writes, and the next forward waits for the schedule
+            # stream (SGLang's run_batch does forward_stream.wait_stream).
+            st = torch.cuda.current_stream(dev)
+            fwd = getattr(self.sched, "forward_stream", None)
+            if fwd is not None and fwd != st:
+                st.wait_stream(fwd)
+            src = [x.pin_memory() for x in (l2p_t, cnt_t) + tuple(
+                x for x in (rows_t, rank_map) if x is not None)]
+            self._write_maps(md, dev, rows, rows_t, l2p_t, w, width, cnt_t, rank_map)
+            ev = torch.cuda.Event()
+            ev.record(st)
+            # moves into slots this epoch staged out must not start before
+            # the batches that could still read them are done
+            self._connex_ep_applied = (ev, src)
+        else:
+            self._write_maps(md, dev, rows, rows_t, l2p_t, w, width, cnt_t, rank_map)
         self._connex_ep_epoch = view["epoch"]
         return {"applied": True, "epoch": view["epoch"], "rank": self._ep_rank(),
                 "apply_ms": (time.perf_counter() - t0) * 1e3}
@@ -394,6 +469,13 @@ class SGLangEPWorker(ConnexEPWorker):
         md.logical_to_all_physical_map_num_valid.copy_(cnt_t.to(dev, non_blocking=nb))
         if rank_map is not None:
             md.logical_to_rank_dispatch_physical_map.copy_(rank_map.to(dev, non_blocking=nb))
+
+    def _connex_ep_before_move(self):
+        """Background move thread: wait until the epoch that staged the
+        destination slots is in effect and earlier batches are done."""
+        applied = getattr(self, "_connex_ep_applied", None)
+        if applied is not None:
+            applied[0].synchronize()
 
     def connex_ep_checksum(self, slots="[]"):
         import torch
@@ -448,6 +530,18 @@ class SGLangEPEngine(VLLMEPEngine):
 
     def __init__(self, ctrl_url, **kw):
         super().__init__(ctrl_url, **kw)
+
+    def describe(self, poll_s=0.02):
+        """Every rank's ``ExpertStore.describe()``; registration runs in the
+        background on the ranks, so poll until all are ready."""
+        t_end = time.time() + self.timeout
+        while True:
+            res = self.rpc("connex_ep_init", self.cfg)
+            if not any(isinstance(d, dict) and d.get("pending") for d in res):
+                return {d["rank"]: d for d in res}
+            if time.time() > t_end:
+                raise TimeoutError("connex_ep_init still pending")
+            time.sleep(poll_s)
 
     def rpc(self, method, *args):
         r = self.s.post(self.base + "/rpc",

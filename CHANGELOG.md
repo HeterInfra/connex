@@ -27,7 +27,11 @@
   `connex.ep.sglang_ext.SGLangEPEngine` is the controller's engine handle.
   The plugin also makes `TopK` apply the expert location dispatch on MoE
   paths that skip it (SGLang's Qwen2-MoE without an all-to-all backend sent
-  every token to EP rank 0 when replicas existed).
+  every token to EP rank 0 when replicas existed). Epoch writes are ordered
+  on the GPU behind the overlapped batch instead of a device sync (apply
+  round trip 48 -> 23 ms, scheduler blocked 22 -> 1.7 ms), and the connex-rs
+  endpoint is created at server start with registration in the background
+  (attaching a controller under load no longer stalls serving for 0.3-2.3 s).
 - `benchmarks/ep/`: load + events (`ep_bench.py`, `--engine sglang`), EP-group
   kill under load (`ep_failover.py`, `--worker-needle` for SGLang), link
   bandwidth reference (`link_bw.py`).

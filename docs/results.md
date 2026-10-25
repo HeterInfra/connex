@@ -658,6 +658,33 @@ server (as vLLM does), so recovery is group level:
 | group rebuilt and back in the routing set | 43.5 s after the kill |
 | non-argmax tokens | 2 of 104,576 (gap 0.75 nats; both at token 89 of two requests with the same prompt topic, started about two minutes after the kill) |
 
+**Performance pass (SGLang control path).** A microbenchmark under the same
+load (512 requests, 32 concurrent) attaches a controller, applies 20
+epochs and migrates an expert 10 times; medians:
+
+| | first version | after |
+|---|---|---|
+| attach (register 24.9 GB per rank with connex-rs) | scheduler blocked 0.28 s; the batch in flight stalled 0.3-2.3 s | 1 ms on the scheduler; 0.29 s in the background; no stall (largest gap 0.06 s) |
+| epoch apply: controller round trip | 48-50 ms | 23 ms |
+| epoch apply: scheduler blocked per rank | 22 ms (device sync waits out the overlapped batch) | 1.5-1.8 ms |
+| migrate one expert (cutover + copy + commit) | 172-178 ms | 96-123 ms |
+| drain cutover in the drain run (2 runs) | 44 / 202 ms | 23 / 24 ms |
+| migrate per expert in the migrate run | 0.17-0.20 s | 0.10-0.14 s |
+| steady state, `active_replicas=1` | 1,323-1,330 tok/s | 1,310-1,325 tok/s |
+
+Two causes. Applying an epoch synchronized the device to wait out the batch
+the overlap scheduler still had on the GPU, blocking the scheduler for one
+decode step; the writes are now ordered on the GPU (schedule stream waits
+for the forward stream) and moves wait for an event. Attaching created the
+connex-rs endpoint inside the scheduler (0.2 s on rank 0, 1.1 s on rank 1,
+holding the interpreter); the endpoint is now created at server start and
+registration runs in a background thread. What remains of the round trip
+is waiting for the next scheduler iteration (8-15 ms). The rerun events
+(drain twice, migrate, steady) completed every request; in deterministic
+mode drain (NaN slots) and migration again score 0 non-argmax tokens, and
+with default kernels 0-1 (the same near-tie token as before the change,
+generated after the rejoin).
+
 `/health` of SGLang runs a one-token generate and answers after at least
 1 s, longer than the supervisor's probe timeout: the first attempt marked
 both groups down at once. The servers ran with
