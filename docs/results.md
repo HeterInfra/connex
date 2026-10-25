@@ -2,8 +2,8 @@
 
 This page collects the measurements behind Connex v0.1.0 on a vLLM pipeline
 (sections 1-6), prefill-decode disaggregation on upstream vLLM and SGLang
-(section 7), RL weight sync (section 8) and agent session migration
-(section 9). Sections 1-6 cover
+(section 7), RL weight sync (section 8), agent session migration
+(section 9) and expert parallelism (section 10). Sections 1-6 cover
 steady-state latency and throughput with one and four pipeline steps in
 flight, correctness and latency of in-flight request handover when a
 downstream stage dies, goodput while a replica churns (with and without the
@@ -495,6 +495,100 @@ Not covered: moving the KV itself (no `KVMover` ships yet), more than two
 instances, sampling (greedy only), chat requests (completions only in this
 benchmark), text resume with tokenizations that do not round-trip.
 
+## 10. Expert parallelism (MoE)
+
+`connex.ep` ([`ep.md`](ep.md)), `benchmarks/ep/`. vLLM 0.32.0, OLMoE-1B-7B
+(64 experts, top-8, 16 MoE layers, bf16), one EP group = tensor and expert
+parallel over two A40s of one host (PCIe, no NVLink), 0.6 memory fraction,
+CUDA graphs on. Connex runs vLLM with `--enable-eplb`, 64 redundant experts
+(every expert on both ranks: either rank can carry all of them) and EPLB's
+own rebalancing off; its placement table drives vLLM's expert maps through
+the worker extension. Load: 128 or 256 text prompts, 128 greedy tokens each
+(`ignore_eos`), 32 concurrent, streaming. **Correctness** is the
+teacher-forced check of `pd_bench.py score` on a freshly started default-EP
+server: every generated token must be the argmax given its own prefix
+(0.5 nat tolerance for near-ties). One run per row unless stated.
+
+**Steady state.** Throughput of the whole load (two runs where given):
+
+| configuration | tokens/s | TPOT p50 | non-argmax tokens |
+|---|---|---|---|
+| vLLM default EP (no EPLB) | 2,317 / 2,338 | 13.1 ms | 0 |
+| EPLB, 0 redundant, Connex extension | 2,314 | 13.2 ms | |
+| EPLB, 32 redundant, every replica routed | 1,889 | 16.3 ms | |
+| EPLB, 64 redundant, every replica routed (first version) | 1,590 / 1,572 | 19.6 ms | 0 |
+| EPLB, 64 redundant, Connex `active_replicas=1` (standby) | 2,299 / 2,307 | 13.3 ms | 0 |
+
+The control path costs nothing measurable (row 2). Routing tokens to every
+replica does (rows 3-4): vLLM hashes tokens over all copies, so each decode
+step reads both copies of a hot expert. With one routed replica per expert
+and the second copy as warm standby the redundant deployment runs within
+1 % of the default, and the standby copies take over in the next epoch when
+a rank drains or fails, with no weight movement.
+
+**Drain a rank under load, then rejoin it.** At t = 4 s rank 1 is drained;
+then all 64 of its expert slots are overwritten with NaN, so any token still
+routed there would wreck its output; 6 s later rank 1 rejoins: its slots are
+refilled from rank 0 (1,024 expert-layer copies, 12.9 GB) and routed to
+again. 256 requests, all completed in every run.
+
+| | first version | after the performance pass |
+|---|---|---|
+| drain: epoch cutover (controller round trip) | 100 ms | 23-31 ms |
+| worker-side apply of one epoch | 81-86 ms | 13 ms |
+| rejoin: copy of 12.9 GB | 1.62 s, inside the step loop (connex-rs) | 3.7 s in the background (connex-rs), 1.0-1.1 s in the background (same-host CUDA IPC) |
+| largest gap between two tokens of any request | 1.56 s | 0.04-0.05 s (connex-rs), 0.18 s (CUDA IPC) |
+| non-argmax tokens | 0 | 0 |
+
+**Migrate experts under load.** Eight experts (all 16 layers each, 192 MB
+per expert) are copied from rank 0 into rank-1 slots one after the other;
+then every other replica of them is staged out, so all tokens for these
+experts run on the moved weights. 256 requests, all completed, 0 non-argmax
+tokens in every run. Per expert:
+
+| | first version | after |
+|---|---|---|
+| copy, worker side | 17-20 ms (connex-rs, one batch per tensor) | 12.6-13.4 ms (connex-rs, all reads in one wave, or CUDA IPC; bounded by the decode step that runs concurrently) |
+| whole migration (cutover + copy + commit) | 0.13-0.27 s | 0.09-0.15 s |
+| largest gap between two tokens | 0.13 s | 0.03-0.05 s |
+
+On an idle server one expert moves in 6.5 ms over CUDA IPC (about 30 GB/s).
+For reference, `link_bw.py` on the same GPU pair: `Tensor.copy_` peer to
+peer 26.3 GB/s; connex-rs one-sided reads 9.2 GB/s at any chunk size from
+1 to 192 MB (UCX goes through the RDMA NIC in loopback; restricting UCX to
+`cuda_ipc` gave 0.37 GB/s), which is why moves between ranks of one host
+now use CUDA IPC and fall back to connex-rs across hosts. Byte equality of
+moved experts was also checked directly (per-slot checksums), and as a
+negative control, overwriting a moved slot with another expert's weights
+changed 3 of 5 greedy outputs.
+
+**Kill an EP rank under load.** Two EP groups (GPUs 2-3 and 0-1) behind
+the resume proxy, Poisson load at 4 requests/s for 200 s, EP rank 1 of
+group A SIGKILLed at t = 25 s. vLLM stops the whole group; the proxy resumes
+its in-flight requests on group B, `EPGroupSupervisor` drops A from the
+endpoints file, restarts it and re-adds it.
+
+| | first version | after |
+|---|---|---|
+| requests completed | 817 / 817 | 817 / 817 |
+| in flight at the kill, completed | 3 / 3 | 3 / 3 |
+| failure detected (kill -> group removed) | 10.1 s (`/health` kept answering) | 0.05 s (rank process watch) |
+| largest gap between two tokens of any request | 2.56 s (proxy idle timeout) | 0.18 s |
+| group rebuilt and back in the routing set | 61.9 s after the kill | 48.5 s (restart of vLLM: ~48 s) |
+| non-argmax tokens | 0 | 0 |
+
+**A bug the NaN check caught.** One run started a new controller against a
+server that already ran epoch 16 from the previous run; the new controller
+counted from 0, the workers correctly ignored its "stale" epochs, the drain
+never took effect, and the NaN slots produced 418 non-argmax tokens. A
+controller now adopts the engine's epoch when it attaches, and an engine
+that rejects a view as stale raises instead of being silently skipped.
+
+Not covered: SGLang (no placement driving yet; its Mooncake elastic EP did
+not load in this environment), cross-host EP groups, DeepEP / pplx
+all-to-all, data-parallel attention with EP, sampling (greedy only), more
+than one repetition for most rows.
+
 ## How to reproduce
 
 Deploy (see `deploy/k8s/README.md`):
@@ -549,6 +643,24 @@ Proxy overhead (CPU only): `python benchmarks/proxy_overhead.py --concurrency 16
 Before measuring, smoke-test every chain (a few requests to each replica's
 stage 0) and check per-GPU free memory on shared GPUs: a stage that cannot
 get its memory crash-loops and the readiness wait times out.
+
+Expert parallelism (one host, 4 GPUs; `serve.sh GPUS PORT LOG [args]` execs
+`vllm serve MODEL --port PORT -tp 2 --enable-expert-parallel ...` with
+`CUDA_VISIBLE_DEVICES=GPUS VLLM_SERVER_DEV_MODE=1`):
+
+```bash
+EPLB='{"num_redundant_experts":64,"step_interval":100000000,"use_async":false}'
+./serve.sh 2,3 8301 a.log --enable-eplb --eplb-config "$EPLB" \
+    --worker-extension-cls connex.ep.vllm_ext.ConnexEPWorker &
+B=benchmarks/ep/ep_bench.py
+python $B run --active-replicas 1 --out steady.json
+python $B run --n 256 --active-replicas 1 --event drain --event-at 4 --hold 6 --out drain.json
+python $B run --n 256 --active-replicas 1 --event migrate --experts 8 --out migrate.json
+python $B score --url http://DEFAULT_EP_SERVER:8301 --file drain.json
+python benchmarks/ep/ep_failover.py --serve ./serve.sh --gpus-a 2,3 --gpus-b 0,1 \
+    --kill-at 25 --qps 4 --duration 200 --out failover.json
+CUDA_VISIBLE_DEVICES=2,3 python benchmarks/ep/link_bw.py
+```
 
 ## Not covered
 

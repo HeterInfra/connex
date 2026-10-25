@@ -105,7 +105,12 @@ class Pool:
         except OSError:
             return
         if urls:
+            gone = [u for u in self.order if u not in [x.rstrip("/") for x in urls]]
             self.set_urls(urls)
+            # an endpoint taken out of the file (e.g. by a supervisor that saw
+            # it die) is dead now: wake its waiters and cut its streams
+            for u in gone:
+                self.mark_bad(self.eps[u], "removed from endpoints file")
 
     def mark_bad(self, ep, why=""):
         if ep.healthy(time.monotonic()):
@@ -309,6 +314,7 @@ class Proxy:
         self.session = None
         self.probe_session = None
         self.stats = {"requests": 0, "retries": 0, "resumes": 0, "failed": 0}
+        self.reload_interval = 1.0
         self._bg = []
 
     # -- lifecycle --------------------------------------------------------------
@@ -344,7 +350,7 @@ class Proxy:
 
     async def _reload_loop(self):
         while True:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(self.reload_interval)
             self.pool.reload()
 
     async def _probe_loop(self):
@@ -407,7 +413,8 @@ class Proxy:
                     while True:
                         if got_first or base_k > 0:
                             if watchdog is None and self.idle_timeout:
-                                watchdog = asyncio.ensure_future(self._watchdog(r, last, fired))
+                                watchdog = asyncio.ensure_future(
+                                    self._watchdog(r, last, fired, ep.dead))
                             try:
                                 line = await content.readline()
                             except RETRYABLE:
@@ -443,15 +450,23 @@ class Proxy:
             st.resp = None
             ep.inflight -= 1
 
-    async def _watchdog(self, r, last, fired):
+    async def _watchdog(self, r, last, fired, dead=None):
+        """Close the stream when no line arrived for idle_timeout, or at once
+        when the endpoint is declared dead (probe, removal, other stream)."""
         loop = asyncio.get_running_loop()
         while True:
             wait = last[0] + self.idle_timeout - loop.time()
-            if wait <= 0:
+            if wait <= 0 or (dead is not None and dead.is_set()):
                 fired[0] = True
                 r.close()
                 return
-            await asyncio.sleep(max(wait, 0.01))
+            if dead is None:
+                await asyncio.sleep(max(wait, 0.01))
+            else:
+                try:
+                    await asyncio.wait_for(dead.wait(), timeout=max(wait, 0.01))
+                except asyncio.TimeoutError:
+                    pass
 
     async def _wait_first(self, content, ep, abort=None):
         """Wait for the next line before the first token, without a fixed idle
@@ -701,7 +716,10 @@ def main():
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=5199)
     ap.add_argument("--endpoints", default="", help="comma-separated stage-0 base URLs")
-    ap.add_argument("--endpoints-file", default=None, help="one URL per line, re-read every 1 s")
+    ap.add_argument("--endpoints-file", default=None,
+                    help="one URL per line, re-read every --reload-interval s; an endpoint "
+                         "removed from it is treated as dead (its streams resume elsewhere)")
+    ap.add_argument("--reload-interval", type=float, default=1.0)
     ap.add_argument("--idle-timeout", type=float, default=2.5,
                     help="max gap between chunks once the first token arrived (s)")
     ap.add_argument("--first-token-timeout", type=float, default=None,
@@ -719,6 +737,7 @@ def main():
     pool = Pool([u for u in a.endpoints.split(",") if u], a.endpoints_file, a.blacklist_s)
     proxy = Proxy(pool, a.idle_timeout, a.connect_timeout, a.max_attempts, a.probe_interval,
                   not a.no_token_ids, a.first_token_timeout)
+    proxy.reload_interval = a.reload_interval
     try:
         import uvloop
         uvloop.install()

@@ -83,6 +83,11 @@ class LocalTransport:
         for remote_addr, dst_off, length in ops:
             self.read(remote_url, remote_addr, dst, dst_off, length, timeout_ms)
 
+    def read_many(self, remote_url, batches, timeout_ms=None):
+        """``batches``: [(dst_tensor, [(remote_addr, dst_off, len)])]."""
+        for dst, ops in batches:
+            self.read_batch(remote_url, ops, dst, timeout_ms)
+
     def kill(self):
         """Simulate process death: further reads from this url fail."""
         with self._lock:
@@ -161,6 +166,30 @@ class ConnexRsTransport:
             raise TransferError(f"{remote_url}: {err}") from err
         self.reads += len(ops)
         self.bytes += sum(o[2] for o in ops)
+
+    def read_many(self, remote_url, batches, timeout_ms=None):
+        """Like ``read_batch`` for several destination tensors: every read of
+        every batch is in flight at once, then all are awaited."""
+        to = timeout_ms or self.timeout_ms
+        hs, err, total = [], None, 0
+        try:
+            for dst, ops in batches:
+                base = dst.data_ptr()
+                for remote_addr, dst_off, length in ops:
+                    hs.append(self.e.get_async(remote_url, base + dst_off, remote_addr, length, to))
+                    total += length
+        except Exception as ex:
+            err = ex
+        for h in hs:
+            try:
+                if not h.wait(to + 1000):
+                    err = err or TimeoutError("read timed out")
+            except Exception as ex:
+                err = err or ex
+        if err is not None:
+            raise TransferError(f"{remote_url}: {err}") from err
+        self.reads += len(hs)
+        self.bytes += total
 
     def close(self):
         try:
