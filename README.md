@@ -29,6 +29,20 @@ current address; senders keep in-flight work correct when the endpoint
 behind an identity changes, so requests hand over to another replica on
 failure or scale-down and new replicas take traffic as soon as they join.
 
+### Supported scenarios
+
+| Scenario | Engines | Status |
+|---|---|---|
+| 🔗 Multi-replica pipeline parallelism with in-flight failover | vLLM | ✅ validated on GPUs |
+| 📈 Elastic scale up / down of replicas | vLLM | ✅ validated on GPUs |
+| 🔀 Prefill-decode disaggregation, elastic P/D pools ([docs](docs/pd-disaggregation.md)) | vLLM 0.32, SGLang 0.5.22 (plugins, no fork) | ✅ validated on one host; cross-host not yet |
+| 🎯 RL post-training: elastic weight sync, versioned rollouts ([docs](docs/rl.md)) | vLLM, SGLang | ✅ validated on GPUs |
+| 🤖 Agent session migration between instances ([docs](docs/agent-migration.md)) | vLLM, SGLang | ✅ validated (re-prefill; direct KV move not yet) |
+| 🧬 Heterogeneous transports (RDMA, TCP, GPUDirect) | any | ✅ transports validated; mixed GPU types not yet |
+| 🧠 Attention-FFN disaggregation | | 🗺️ roadmap |
+
+Details and limits per scenario: [Scenarios and status](#scenarios-and-status).
+
 Tensor bytes move through a pluggable data plane. On RDMA hosts the default
 is [**connex-rs**](https://github.com/HeterInfra/connex-rs), Connex's own Rust data plane over UCX:
 GPUDirect one-sided transfers as fast as Mooncake Transfer Engine, plus
