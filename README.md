@@ -45,6 +45,7 @@ a fork. Upstream PRs:
 vLLM ConnexConnector for PD ([vllm#63804](https://github.com/vllm-project/vllm/pull/63804)),
 vLLM Connex weight transfer backend for RL ([vllm#63805](https://github.com/vllm-project/vllm/pull/63805)),
 SGLang connex KV transfer backend ([sglang#46599](https://github.com/sgl-project/sglang/pull/46599)).
+Pipeline parallelism without a fork is proposed in [vllm#63818](https://github.com/vllm-project/vllm/issues/63818) (RFC: pluggable PP transport).
 Limits per scenario: [Scenarios and status](docs/overview.md#scenarios-and-status).
 
 ## Quick start
