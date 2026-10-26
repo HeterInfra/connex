@@ -325,24 +325,39 @@ class VLLMEPEngine:
 
     def __init__(self, base_url, transport="connex-rs", group=0, timeout=120.0,
                  async_moves=True, poll_s=0.005):
-        import requests
+        import urllib.request
         self.base = base_url.rstrip("/")
-        self.s = requests.Session()
-        self.s.trust_env = False
+        # stdlib HTTP, proxies ignored (the server is on the cluster network)
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.cfg = {"transport": transport, "group": group}
         self.timeout = timeout
         self.async_moves = async_moves
         self.poll_s = poll_s
         self.last = {}
 
+    def _post(self, path, method, args):
+        """POST a JSON rpc body to ``base + path``: (status, parsed body or
+        raw text). Non-2xx statuses are returned, not raised."""
+        import urllib.error
+        import urllib.request
+        body = json.dumps({"method": method,
+                           "args": [a if isinstance(a, str) else json.dumps(a) for a in args],
+                           "timeout": self.timeout}).encode()
+        req = urllib.request.Request(self.base + path, data=body, method="POST",
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with self._opener.open(req, timeout=self.timeout + 5) as r:
+                status, raw = r.status, r.read()
+        except urllib.error.HTTPError as e:
+            status, raw = e.code, e.read()
+        if status != 200:
+            return status, raw.decode(errors="replace")
+        return status, json.loads(raw)
+
     def rpc(self, method, *args):
-        r = self.s.post(f"{self.base}/collective_rpc",
-                        json={"method": method,
-                              "args": [a if isinstance(a, str) else json.dumps(a) for a in args],
-                              "timeout": self.timeout},
-                        timeout=self.timeout + 5)
-        r.raise_for_status()
-        out = r.json()
+        status, out = self._post("/collective_rpc", method, args)
+        if status != 200:
+            raise RuntimeError(f"{method}: HTTP {status} {out[:300]}")
         return out.get("results", out) if isinstance(out, dict) else out
 
     def info(self):

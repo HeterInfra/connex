@@ -216,6 +216,26 @@ def test_real_endpoints_steady_state_connexrs(crs, k):
     assert e2.ledger.kv_len == {"a": 10, "b": 10}
 
 
+def _wait_all(s0, ids, timeout_s):
+    """s0.wait for each step, bounded: a lost step fails the test instead of
+    hanging it (wait itself has no deadline across re-sends)."""
+    box = {}
+
+    def run():
+        try:
+            box["outs"] = [s0.wait(c) for c in ids]
+        except BaseException as exc:  # noqa: BLE001
+            box["exc"] = exc
+
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(timeout_s)
+    assert not th.is_alive(), f"steps not answered within {timeout_s} s"
+    if "exc" in box:
+        raise box["exc"]
+    return box["outs"]
+
+
 def test_failover_by_transport_event_alone(crs):
     """K=4: stage-1 replica a dies with steps in flight. No lease event and
     no data-path timeout: the connex-rs peer-failure event alone fails the
@@ -235,7 +255,7 @@ def test_failover_by_transport_event_alone(crs):
         deadline = time.monotonic() + 5
         while (1, 0) not in s0ep._crs_alive and time.monotonic() < deadline:
             time.sleep(0.05)
-        assert (1, 0) in s0ep._crs_alive          # linked by the watcher
+        assert (1, 0) in s0ep._crs_alive          # linked by replica a (reads from stage 0)
         pump_a.stop.set()
         pump_a.threads[0].join(5)
         ids = [s0.submit({"h": torch.full((1,), float(i)), "nsched": [4]}, [f"r{i}"], [0])
@@ -243,7 +263,7 @@ def test_failover_by_transport_event_alone(crs):
         t = time.monotonic()
         e1a_eng.close()                            # stage-1 replica a "dies"
         s1a.close()
-        outs = [s0.wait(c) for c in ids]
+        outs = _wait_all(s0, ids, timeout_s=30.0)
         took = time.monotonic() - t
     assert [o["h"].item() for o in outs] == [2.0, 3.0, 4.0, 5.0]
     assert s0ep._sticky_peer[1] == 1 and s0ep._chain_epoch == 1

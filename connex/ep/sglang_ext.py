@@ -580,14 +580,10 @@ class SGLangEPEngine(VLLMEPEngine):
             time.sleep(poll_s)
 
     def rpc(self, method, *args):
-        r = self.s.post(self.base + "/rpc",
-                        json={"method": method,
-                              "args": [a if isinstance(a, str) else json.dumps(a) for a in args],
-                              "timeout": self.timeout},
-                        timeout=self.timeout + 5)
-        if r.status_code != 200:
-            raise RuntimeError(f"{method}: HTTP {r.status_code} {r.text[:300]}")
-        out = r.json()["results"]
+        status, body = self._post("/rpc", method, args)
+        if status != 200:
+            raise RuntimeError(f"{method}: HTTP {status} {body[:300]}")
+        out = body["results"]
         errs = [x["error"] for x in out if not x["ok"]]
         if errs:
             raise RuntimeError(f"{method} failed: {errs}")
