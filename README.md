@@ -41,7 +41,8 @@ SIGCOMM 2026 paper ([Citation](#citation)).
 | 🪓 Attention-FFN disaggregation | | 🗺️ roadmap |
 
 PD, TP, EP, RL and agent support run on upstream engines as plugins, without
-a fork. Limits per scenario: [Scenarios and status](docs/overview.md#scenarios-and-status).
+a fork. Upstream PRs: SGLang connex KV transfer backend
+([sgl-project/sglang#46599](https://github.com/sgl-project/sglang/pull/46599)). Limits per scenario: [Scenarios and status](docs/overview.md#scenarios-and-status).
 
 ## Quick start
 
