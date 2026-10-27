@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+**Pipeline parallelism on upstream vLLM** ([`integrations/vllm/README.md`](integrations/vllm/README.md#upstream-vllm-no-fork), [`docs/results.md`](docs/results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork))
+- `connex.adapters.vllm.pp`: `ConnexPPGroup` (`--pp-group-cls`; hidden
+  states and the V2 runner's sampled tokens over connex-rs, the receiving
+  stream waits on a host flag instead of the CPU), `ConnexPPWorker`
+  (`--worker-cls`), `ConnexPPExecutor` (`--distributed-executor-backend`:
+  stage 0 drives stage instances with replicas, fails over on connex-rs
+  peer-failure events, reports the lost KV so vLLM recomputes) and the stage
+  server `python -m connex.adapters.vllm.pp.stage`.
+- Needs vLLM main with the three changes of RFC vllm#63818
+  (`--pp-group-cls`, `--pipeline-stage-rank`, `KVConnectorOutput.lost_kv_req_ids`
+  / `lost_all_kv`); the fork path is unchanged.
+- `benchmarks/pp_upstream/`: per-hop latency of vLLM's PP API (NCCL vs
+  connex-rs), failover under load.
+
 **Across hosts and mixed GPUs** ([`docs/results.md`](docs/results.md#12-across-hosts-and-mixed-gpus), [`docs/design/multi-host-validation.md`](docs/design/multi-host-validation.md))
 - PD (vLLM, SGLang), TP PD and EP validated with instances on different
   nodes over 100 Gb InfiniBand: on par with NIXL / Mooncake, decode and

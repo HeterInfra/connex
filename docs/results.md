@@ -4,8 +4,9 @@ This page collects the measurements behind Connex v0.1.0 on a vLLM pipeline
 (sections 1-6), prefill-decode disaggregation on upstream vLLM and SGLang
 (section 7), RL weight sync (section 8), agent session migration
 (section 9), expert parallelism (section 10), tensor parallelism with
-group-level recovery (section 11), and PD, TP and EP across hosts and with
-mixed GPUs (section 12). Sections 1-6 cover
+group-level recovery (section 11), PD, TP and EP across hosts and with
+mixed GPUs (section 12), and pipeline parallelism on upstream vLLM without
+the fork (section 13). Sections 1-6 cover
 steady-state latency and throughput with one and four pipeline steps in
 flight, correctness and latency of in-flight request handover when a
 downstream stage dies, goodput while a replica churns (with and without the
@@ -1020,6 +1021,116 @@ node loss or link cuts (all failures here are process kills).
 | a node without GPUDirect RDMA could only use UCX over TCP: 0.4-0.5 GB/s KV transfer, saturating at about QPS 3, and a UCX crash under load | host staging (`connex/pd/host_staging.py`): pinned host mirror of the KV cache registered instead of GPU memory, device -> mirror copy queued on the engine stream when a prefill is held, mirror -> device after the read; picked automatically when no peer-memory driver is loaded (`CONNEX_PD_HOST_STAGING=auto`) | A6000 -> A40 at QPS 4: TTFT p50 5.79 s, 414 tok/s; 32 clients 379 tok/s | 0.53 s, 488 tok/s; 591 tok/s (GPUDirect reference 0.46 s, 488, 641) |
 | EP rank failure on another node went unnoticed: process watch is local, `/health` stays up | `RankDeathWatcher` (connex-rs peer-death events of the ranks' EP transports) | not detected in 200 s; stall 2.6 s | 0.29 s; stall 0.37 s |
 | first cross-node expert move crashed the receiving rank (UCX zero-copy of a 1-byte read-only heartbeat) | `UCX_ZCOPY_THRESH=4096` default in the EP/RL connex-rs transport | rank 1 segfault, group lost | 12.9 GB moved in 1.82 s under load |
+
+## 13. Pipeline parallelism on upstream vLLM (no fork)
+
+Sections 1-6 ran on the external-PP vLLM fork. This section runs Connex PP
+on vLLM main (2026-10-26, model runner V2, the default) with three small
+vLLM changes proposed in RFC
+[vllm#63818](https://github.com/vllm-project/vllm/issues/63818) and the
+plugin `connex.adapters.vllm.pp`; see
+[`integrations/vllm/README.md`](../integrations/vllm/README.md#upstream-vllm-no-fork).
+Two modes: **in-process** (stock vLLM PP in one instance, only the PP group
+replaced: hidden states and sampled tokens over connex-rs instead of NCCL)
+and **one stage per instance** (stage servers with replicas, failover).
+
+**Setup.** One host with 4x A40 (48 GB, PCIe, no NVLink) and a ConnectX
+100 Gb InfiniBand NIC; one-host transfers between GPUs go through the NIC in
+loopback (GPUDirect RDMA), NCCL uses PCIe P2P. For the two-host rows the
+stages run on two other nodes of the same kind (agent pods as in section
+12, stages on GPUs next to the NIC). Llama-3-8B bf16, 0.75 memory fraction,
+`VLLM_USE_FLASHINFER_SAMPLER=0`. Throughput and latency: `vllm bench serve`
+with random 512-token prompts and 128 output tokens (`--ignore-eos`),
+`--max-concurrency` C and 8·C prompts (at least 32), one run per cell.
+Correctness: 16 greedy requests of 200 tokens, every generated token
+re-scored by teacher forcing on a non-PP (TP=1) vLLM instance; a token
+counts as off the argmax if it is more than 0.5 nats below it.
+
+**Correctness.** 0 of 3,200 tokens off the argmax in every configuration
+below, NCCL and Connex, with and without failover (worst gap 0.125 nats,
+the same as between two non-PP runs).
+
+**Steady state.** Median TPOT (ms) / output throughput (tok/s):
+
+| setup | C=1 | C=8 | C=32 |
+|---|---|---|---|
+| no PP (TP=1, one GPU) | 28.15 / 34.8 | 31.08 / 238.9 | 44.99 / 662.5 |
+| PP=2, NCCL (stock vLLM) | 28.24 / 34.1 | 32.99 / 218.6 | 41.85 / 717.3 |
+| PP=2, in-process, connex-rs | 29.04 / 33.8 | 33.01 / 232.9 | 40.38 / 736.9 |
+| PP=2, one stage per instance | 28.78 / 34.1 | 32.33 / 233.0 | 40.42 / 729.8 |
+| PP=4, NCCL | 28.32 / 34.0 | 31.65 / 223.5 | 39.04 / 754.0 |
+| PP=4, in-process, connex-rs | 29.55 / 33.2 | 32.94 / 232.6 | 40.54 / 739.1 |
+| PP=4, one stage per instance | 29.44 / 33.3 | 35.46 / 224.2 | 40.86 / 736.6 |
+| PP=2 x TP=2, NCCL | 15.53 / 60.3 | 17.66 / 378.6 | 22.40 / 1263.9 |
+| PP=2 x TP=2, in-process, connex-rs | 16.09 / 60.3 | 17.61 / 423.7 | 22.47 / 1254.6 |
+| PP=2 x TP=2, one stage per instance | 16.03 / 60.4 | 17.27 / 427.8 | 23.53 / 1227.9 |
+| two hosts, PP=2, NCCL (`--nnodes 2`) | 28.27 / 34.1 | 33.23 / 218.9 | 41.06 / 728.4 |
+| two hosts, PP=2, in-process, connex-rs | 28.98 / 33.3 | 33.35 / 218.2 | 40.53 / 729.1 |
+| two hosts, PP=2, one stage per instance | 29.05 / 33.2 | 33.26 / 217.7 | 40.81 / 723.7 |
+
+Connex adds 0.5-1.2 ms per token at C=1 (2-4%) and is within a few percent
+either way at C=8 and C=32, except one stage per instance at PP=4, C=8
+(+12% TPOT). The per-token cost at C=1 is the per-hop overhead below.
+
+**Per hop.** The same `GroupCoordinator` calls vLLM's worker makes
+(`isend_tensor_dict` / `irecv_tensor_dict`, `{hidden_states, residual}` bf16,
+hidden size 4096), two ranks ping-ponging, one way = round trip / 2, median
+of 200 (`benchmarks/pp_upstream/bench_p2p.py`):
+
+| tokens (bytes) | one host NCCL | one host connex-rs | two hosts NCCL | two hosts connex-rs |
+|---|---|---|---|---|
+| 1 (16 KB) | 412 µs | 650 µs | 467 µs (p99 2.6 ms) | 697 µs (p99 0.76 ms) |
+| 64 (1 MB) | 403 µs | 823 µs | 516 µs | 786 µs |
+| 512 (8 MB) | 518 µs | 1,469 µs | 1,660 µs | 1,834 µs |
+| 2048 (32 MB) | 1,543 µs | 4,474 µs | 5,994 µs | 5,652 µs |
+
+vLLM's NCCL path pays about 0.4 ms per hop for the metadata it sends over
+gloo. Connex is slower on one host because its GPU-to-GPU path is RDMA
+loopback through the NIC (about 9 GB/s here) instead of PCIe P2P, and for
+small messages because Python threads are on the path; across hosts the
+large transfers are on par. End to end this matters less than the table
+suggests because the receiving stage does not wait on the CPU: the sender
+announces the tensors at launch time (like vLLM's metadata), the receiver
+queues its work right away and its CUDA stream waits for a host flag that
+is set when the bytes have landed. With a blocking receive (the first
+version) TPOT at PP=2, C=1 was 31.9 ms instead of 29.0 ms.
+
+**Failover.** PP=2 with two stage-1 replicas (one host, and with stage 0
+and the two replicas on three hosts), and PP=3 with two replicas of the
+last stage; 32 closed-loop streaming clients (128 tokens each), SIGKILL of
+the active replica 15 s in, the killed replica restarted with the same
+command before the next kill (it rejoins as a spare):
+
+| setup | kills | requests completed | errors | largest gap between two tokens, per run |
+|---|---|---|---|---|
+| PP=2, one host | 10 | 3,168 / 3,168 | 0 | 0.39-0.71 s |
+| PP=3, last stage, one host | 2 | 640 / 640 | 0 | 0.46-0.58 s |
+| PP=2, three hosts | 2 | 640 / 640 | 0 | 0.43-0.49 s |
+
+All 32 requests in flight at every kill completed. Steady TPOT before the
+kill was 32.2-33.6 ms. A kill is detected by connex-rs within milliseconds
+(the dead process's connections reset); stage 0 completes the steps in
+flight as lost, reports the replaced stage's KV as lost, and vLLM's
+scheduler recomputes every running request on the new route.
+
+In 14 more kills during the 16-request greedy runs (killed 3 s in), 13
+runs completed with 0 tokens off the argmax. **One run did not complete**:
+PP=2 on one host, the fourth kill of a series, all 16 requests hung until
+the client timeout (600 s) and stage 0 had no active route afterwards. It
+did not reproduce in the 15 kills that followed and its logs were
+overwritten by the next run, so the cause is not known.
+
+An earlier version that only preempted the requests, without evicting
+their blocks from the prefix cache, completed every request but left 59
+tokens off the argmax in 14 of 16 requests, all after the failover point:
+the resumed requests hit their own prefix-cached blocks, whose KV the new
+replica did not have.
+
+**Not covered.** A replica shared by several pipelines (the fork path
+supports it; here a replica serves one stage 0 at a time), failover of a
+TP > 1 stage, more than one failure at a time, stage 0 failures (the API
+instance; use the resume proxy of section 4), PP across hosts with more
+than two stages, repeated runs of the steady-state cells.
 
 ## How to reproduce
 

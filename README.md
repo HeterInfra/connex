@@ -30,7 +30,7 @@ SIGCOMM 2026 paper ([Citation](#citation)).
 
 | Scenario | Engines | Status |
 |---|---|---|
-| 🔗 Multi-replica pipeline parallelism, in-flight failover | vLLM (fork) | ✅ validated |
+| 🔗 Multi-replica pipeline parallelism, in-flight failover | vLLM (fork; upstream vLLM main with 3 proposed changes) | ✅ validated |
 | 📈 Elastic scale up / down | vLLM | ✅ validated |
 | 🔀 [Prefill-decode disaggregation](docs/pd-disaggregation.md), elastic P/D pools | vLLM, SGLang | ✅ validated, across hosts |
 | 🧩 [Tensor parallelism](docs/tp.md): a TP group is one endpoint | vLLM, SGLang | ✅ validated, groups within a host |
@@ -45,7 +45,7 @@ a fork. Upstream PRs:
 vLLM ConnexConnector for PD ([vllm#63804](https://github.com/vllm-project/vllm/pull/63804)),
 vLLM Connex weight transfer backend for RL ([vllm#63805](https://github.com/vllm-project/vllm/pull/63805)),
 SGLang connex KV transfer backend ([sglang#46599](https://github.com/sgl-project/sglang/pull/46599)).
-Pipeline parallelism without a fork is proposed in [vllm#63818](https://github.com/vllm-project/vllm/issues/63818) (RFC: pluggable PP transport).
+Pipeline parallelism without a fork is proposed in [vllm#63818](https://github.com/vllm-project/vllm/issues/63818) (RFC: pluggable PP transport); the plugin `connex.adapters.vllm.pp` already runs on vLLM main with the three changes it proposes ([`integrations/vllm/README.md`](integrations/vllm/README.md#upstream-vllm-no-fork), results in [`docs/results.md`](docs/results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork)).
 Limits per scenario: [Scenarios and status](docs/overview.md#scenarios-and-status).
 
 ## Quick start
@@ -127,7 +127,7 @@ Full tables, setup and reproduction commands: [`docs/results.md`](docs/results.m
 | [Deploy](docs/deploy.md) | CPU demo, docker compose, multi-host, Kubernetes |
 | [Configuration](docs/configuration.md) | every environment variable and flag |
 | [Results](docs/results.md) | all measurements and how to reproduce them |
-| [vLLM integration](integrations/vllm/README.md) | fork for pipeline parallelism, engine patches |
+| [vLLM integration](integrations/vllm/README.md) | pipeline parallelism on upstream vLLM (plugin) or on the fork with engine patches |
 | [Design notes](docs/design/) | rationale and engine contract |
 
 ## Contributing

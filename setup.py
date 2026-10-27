@@ -48,7 +48,8 @@ setup(
         "bench": ["aiohttp"],
         # Engine adapters (connex.adapters.*). PD disaggregation works with
         # upstream vLLM (KV connector) and SGLang (transfer backend plugin);
-        # the pipeline-parallel adapter needs the Connex vLLM fork.
+        # pipeline parallelism: connex.adapters.vllm.pp on vLLM with the changes of
+        # RFC vllm#63818, or the Connex vLLM fork.
         "vllm": ["vllm", "aiohttp"],
         "sglang": ["sglang", "aiohttp"],
         "test": ["pytest", "pyflakes", "aiohttp"],
