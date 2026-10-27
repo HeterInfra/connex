@@ -25,6 +25,9 @@ import time
 import torch
 import torch.multiprocessing as mp
 
+# no model config here: size the same-host channel slots for the largest dict
+os.environ.setdefault("CONNEX_PP_IPC_SLOT_MB", "40")
+
 
 def _run_remote(rank: int, args, q) -> None:
     _run(rank, args, None, q, device=0)

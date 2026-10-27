@@ -81,7 +81,8 @@ spare again.
 | `CONNEX_PP_REPLICA` | 0 | this instance's replica index (stage 0: preferred replica of each stage) |
 | `CONNEX_PP_DATA_PORT` | ephemeral | port of the stage's data endpoint |
 | `CONNEX_RS_LOCAL_IP` | vLLM's host IP | address to listen on (use the RDMA interface's) |
-| `CONNEX_PP_RING_MB` | from the config | registered GPU buffer per direction ((PP+1) steps of hidden states) |
+| `CONNEX_PP_RING_MB` | from the config | registered GPU buffer per direction for RDMA ((PP+1) steps of hidden states) |
+| `CONNEX_PP_CUDA_IPC` | 1 | same-host stage pairs over CUDA IPC (0: RDMA loopback) |
 | `CONNEX_PP_STEP_TIMEOUT_S` | 60 | a step without reply after this long triggers a ping; no pong = failover |
 | `CONNEX_PP_REPLACE_TIMEOUT_S` | 120 | how long stage 0 waits for a live replacement |
 | `CONNEX_RS_HEARTBEAT_MS` / `_TIMEOUT_MS` | 1000 / 3000 | connex-rs heartbeat for hung peers |
@@ -97,10 +98,22 @@ spare again.
 | a replica shared by several pipelines | no: one pipeline at a time (spares are taken over) | yes |
 | membership | static list in `CONNEX_PP_STAGES` | front-router, leases |
 | data plane | connex-rs | Mooncake TE, connex-rs, UCX, ZeroMQ |
-| stage-0 TP > 1 | yes | with the resume proxy |
+| stage-0 TP > 1 | serving yes; failover hangs | with the resume proxy |
 
-Known limitation: the receive paths make a CUDA stream wait for a flag that
-a Python thread sets. A CUDA call that holds the GIL and synchronizes the
+Stage pairs on one host exchange the hidden states and the sampled tokens
+over CUDA IPC: the sender's GPU copies into a ring the receiver has mapped
+and sets a flag in shared pinned memory with `cuStreamWriteValue32`; the
+receiver's stream waits on it with `cuStreamWaitValue32`. Nothing on that
+path runs in Python, so it is as asynchronous as NCCL, and on these PCIe A40s
+it is faster than vLLM's NCCL path for large steps. `CONNEX_PP_CUDA_IPC=0`
+uses RDMA loopback instead. When a peer dies its flags are released at once
+and its memory is unmapped once the local streams have passed that point,
+so a replica restarted on the same GPU finds its memory free.
+
+Known limitations: failover with TP > 1 on stage 0 hangs (the TP ranks of
+stage 0 block in their in-group broadcast of the sampled tokens; see
+`docs/results.md` section 13). Between hosts, the receive paths make a CUDA
+stream wait for a flag that a Python thread sets. A CUDA call that holds the GIL and synchronizes the
 device (a first-time kernel module load) would deadlock against it, so
 receives wait on the CPU during warmup (`ConnexPPWorker`), where kernels
 load. A kernel that is first loaded later, while traffic flows, could still

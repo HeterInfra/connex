@@ -71,16 +71,36 @@ async def main_async(a):
     async with aiohttp.ClientSession(trust_env=False) as s:
         tasks = [asyncio.create_task(client(s, a, c, stop, out)) for c in range(a.clients)]
         t_kill = None
+        probes: list = []
         if a.kill:
             await asyncio.sleep(a.kill_after)
             t_kill = time.time()
             rc = subprocess.run(a.kill, shell=True).returncode
             print(f"kill rc={rc} at +{t_kill - start:.1f}s", flush=True)
+            tasks.append(asyncio.create_task(probe(s, a, stop, probes)))
         await asyncio.gather(*tasks)
-    return start, t_kill, out
+    return start, t_kill, out, probes
 
 
-def summarize(start, t_kill, out, a):
+async def probe(s, a, stop, probes):
+    """Is the service answering? A 1-token completion every 0.25 s."""
+    while time.time() < stop + 120:
+        t = time.time()
+        ok = False
+        try:
+            async with s.post(a.url + "/v1/completions",
+                              json={"model": a.model, "prompt": "Hi", "max_tokens": 1},
+                              timeout=aiohttp.ClientTimeout(total=5)) as r:
+                ok = r.status == 200
+        except Exception:  # noqa: BLE001
+            pass
+        probes.append((t, ok))
+        if ok and t > stop:
+            return
+        await asyncio.sleep(0.25)
+
+
+def summarize(start, t_kill, out, a, probes=()):
     done = [r for r in out if r["ok"]]
     failed = [r for r in out if not r["ok"]]
     toks = sum(r["n"] for r in done)
@@ -106,6 +126,16 @@ def summarize(start, t_kill, out, a):
             if gaps:
                 stall.append(max(gaps))
         q = lambda v, p: round(sorted(v)[min(len(v) - 1, int(p * len(v)))], 3) if v else None  # noqa: E731
+        down = [t for t, ok in probes if not ok]
+        up_after = [t for t, ok in probes if ok and down and t > down[0]]
+        window = [r for r in out if r["t0"] >= t_kill - 0 and r["t0"] < t_kill + a.window]
+        res.update({"tokens_lost": sum(r["n"] for r in failed),
+                    "service_down_s": round(up_after[0] - t_kill, 2) if up_after else (
+                        None if down else 0.0),
+                    "goodput_window": round(sum(r["ok"] for r in inflight + window)
+                                            / max(1, len(inflight + window)), 3),
+                    "tokens_window": sum(r["n"] for r in out if r["ok"] and r["t_end"] > t_kill
+                                         and r["t_end"] <= t_kill + a.window)})
         res.update({"kill_at_s": round(t_kill - start, 2), "inflight_at_kill": len(inflight),
                     "inflight_failed": sum(not r["ok"] for r in inflight),
                     "handover_s_median": q(hand, 0.5), "handover_s_max": q(hand, 1.0),
@@ -122,10 +152,12 @@ def main():
     ap.add_argument("--duration", type=float, default=40)
     ap.add_argument("--kill", default="")
     ap.add_argument("--kill-after", type=float, default=15)
+    ap.add_argument("--window", type=float, default=60,
+                    help="seconds after the kill for the goodput window")
     ap.add_argument("--out", default="")
     a = ap.parse_args()
-    start, t_kill, out = asyncio.run(main_async(a))
-    res = summarize(start, t_kill, out, a)
+    start, t_kill, out, probes = asyncio.run(main_async(a))
+    res = summarize(start, t_kill, out, a, probes)
     print(json.dumps(res))
     if a.out:
         with open(a.out, "w") as f:

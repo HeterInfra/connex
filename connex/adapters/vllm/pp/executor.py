@@ -295,10 +295,28 @@ class ConnexPPExecutor(MultiprocExecutor):
         r = self._find(peer)
         if r is None:
             return
+        if r.alive and self._answers_ping(r):
+            # A late event about an earlier incarnation (a replica restarted
+            # under the same identity) or a failed connect attempt: the live
+            # one answers. Failing it over would recompute every request
+            # again and again.
+            log.info("connex-pp: ignoring failure event for s%dr%d (%s): it answers",
+                     r.stage, r.idx, reason)
+            return
         log.warning("connex-pp: replica s%dr%d failed (%s)", r.stage, r.idx, reason)
         with self.lock:
             r.alive = False
         self._failover(r, f"peer failed: {reason}")
+
+    def _answers_ping(self, r: Replica, timeout: float = 1.5) -> bool:
+        t = time.monotonic()
+        if not self.ctl.send(r.ctl_url, ("PING",), quiet=True):
+            return False
+        while time.monotonic() - t < timeout:
+            if r.pong >= t:
+                return True
+            time.sleep(0.02)
+        return False
 
     # ------------------------------------------------------------- failover
     def _failover(self, r: Replica, why: str) -> None:
@@ -394,7 +412,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                     p.event.set()
             route = list(self.route)
         setattr(so, ROUTE_ATTR, {"epoch": epoch, "seq": seq, "route": route_urls,
-                                 "max_tokens": self.max_tokens})
+                                 "max_tokens": self.max_tokens, "doomed": doomed})
         if not doomed:
             raw = ControlLink.encode(("EXEC", seq, epoch, so, self.owner))
             for r in route:

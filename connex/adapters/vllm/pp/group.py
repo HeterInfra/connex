@@ -61,6 +61,7 @@ class ConnexPPGroup(GroupCoordinator):
         # residual at the largest batch.
         elem = torch.empty(0, dtype=self._dtype).element_size()
         step_bytes = self._max_batched * max(self._hidden, 1) * 2 * elem
+        step_bytes = max(step_bytes, int(os.getenv("CONNEX_PP_IPC_SLOT_MB", "0")) << 20)
         ring_mb = int(os.getenv("CONNEX_PP_RING_MB", "0")) or max(
             64, -(-(parallel_config.pipeline_parallel_size + 1) * step_bytes // (1 << 20)))
         self.stage_rank = getattr(parallel_config, "pipeline_stage_rank", None)
@@ -99,7 +100,8 @@ class ConnexPPGroup(GroupCoordinator):
             port = int(os.getenv("CONNEX_PP_DATA_PORT", "0"))
             if self.is_endpoint:
                 self.link = StageLink(MODEL_ID, self.stage_rank, 0, replica, self.device,
-                                      port=port, ring_mb=ring_mb)
+                                      port=port, ring_mb=ring_mb, ipc_slot_bytes=step_bytes,
+                                      ipc_slots=max(3, parallel_config.pipeline_parallel_size + 1))
                 self.link.abort_callbacks.append(self._on_abort)
             log.info("Connex PP group: stage %d of %d, TP rank %d%s", self.stage_rank,
                      num_stages, self.tp_rank,
@@ -109,7 +111,8 @@ class ConnexPPGroup(GroupCoordinator):
             self.is_endpoint = True
             if self.world_size > 1:
                 self.link = StageLink(MODEL_ID, self.rank_in_group, self.tp_rank, 0,
-                                      self.device, ring_mb=ring_mb)
+                                      self.device, ring_mb=ring_mb, ipc_slot_bytes=step_bytes,
+                                      ipc_slots=max(3, self.world_size + 1))
                 urls: list[Any] = [None] * self.world_size
                 torch.distributed.all_gather_object(urls, self.link.url, group=self.cpu_group)
                 self._route = list(urls)
@@ -136,7 +139,10 @@ class ConnexPPGroup(GroupCoordinator):
             # of this stage alone): no inter-stage traffic.
             self._local_step = self.external
             return
-        self._local_step = False
+        # A step completed as lost (after a failover, before the scheduler
+        # recomputed its requests) only runs locally: nothing is sent and
+        # nobody will send to it.
+        self._local_step = bool(meta.get("doomed"))
         epoch, seq, route = meta["epoch"], meta["seq"], meta["route"]
         if self.link is not None and epoch > self.link.min_epoch:
             self.link.abort(epoch)
@@ -161,6 +167,8 @@ class ConnexPPGroup(GroupCoordinator):
     def _on_abort(self, epoch: int) -> None:
         # Let every stream that still waits for sampled tokens of an older
         # epoch go (the requests are recomputed, the bytes are not used).
+        if self.link is not None:
+            self.link.close_chans(lambda k: k[1][0] == "s" and k[1][1] < epoch)
         if self._waiter is None:
             return
         for key in [k for k in self._pending_slots if k[0] < epoch]:
@@ -259,6 +267,10 @@ class ConnexPPGroup(GroupCoordinator):
         if not self.is_endpoint:
             return
         stream = torch.cuda.current_stream(self.device)
+        if all(u and self.link.same_host(u) for u in self._route[:self.world_size - 1]):
+            for url in self._route[:self.world_size - 1]:
+                self._push_sampled(url, key[0], tensor)
+            return
         host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
         host.copy_(tensor, non_blocking=True)
         ev = torch.cuda.Event()
@@ -270,11 +282,25 @@ class ConnexPPGroup(GroupCoordinator):
             return host.numpy().tobytes()
 
         for url in peers:
-            self.link.send_bytes(url, key, payload, event=ev)
+            if url and self.link.same_host(url):
+                self._push_sampled(url, key[0], tensor)
+            else:
+                self.link.send_bytes(url, key, payload, event=ev)
+
+    _SAMPLED_SLOT = 1 << 16
+
+    def _push_sampled(self, url: str, epoch: int, tensor: torch.Tensor) -> None:
+        ch, new = self.link.tx_chan(url, ("s", epoch), self._SAMPLED_SLOT, 16)
+        if new:
+            self.link.send_bytes(url, (epoch, -1, -2), ("chan", ch.info))
+        ch.push([tensor.contiguous().view(-1).view(torch.uint8)])
 
     def _recv_sampled(self, tensor: torch.Tensor) -> None:
         key = self._bkey()
-        if self.is_endpoint and self.blocking:
+        src = self._route[self.world_size - 1] if self._route else None
+        if self.is_endpoint and src and self.link.same_host(src):
+            self._pop_sampled(src, key[0], tensor)
+        elif self.is_endpoint and self.blocking:
             data = self.link.take(key)
             if data is not None:
                 tensor.view(-1).view(torch.uint8).copy_(
@@ -291,6 +317,30 @@ class ConnexPPGroup(GroupCoordinator):
             self._watch(key, slot)
         if self.external and self.tp_size > 1:
             torch.distributed.broadcast(tensor, src=self.tp.ranks[0], group=self._tp_sibling)
+
+    def _pop_sampled(self, src: str, epoch: int, tensor: torch.Tensor) -> None:
+        """Same host: the last stage's GPU writes the tokens into its ring and
+        sets the flag; our stream waits for it and copies (no Python on the
+        path, see ipcchan.py). The channel is announced once per epoch."""
+        from connex.adapters.vllm.pp.link import _peer_id
+
+        peer = _peer_id(src)
+        ch = self.link._rx_chans.get((peer, ("s", epoch)))
+        if ch is None:
+            msg = self.link.take((epoch, -1, -2), timeout=30.0)
+            if msg is None:
+                # epoch aborted (the requests are recomputed), or the sender
+                # never came: do not hold the worker forever
+                if epoch >= self.link.min_epoch:
+                    log.warning("connex-pp: no sampled-token channel for epoch %d", epoch)
+                return
+            ch = self.link.rx_chan(peer, ("s", epoch), msg[1])
+        i = ch.i
+        ch.i += 1
+        buf = ch.wait(i)
+        n = tensor.numel() * tensor.element_size()
+        tensor.view(-1).view(torch.uint8).copy_(buf[:n])
+        ch.done(i)
 
     def _watch(self, key: tuple, slot: int) -> None:
         """Fill ``slot`` when the bytes for ``key`` arrive (a waiter thread)."""

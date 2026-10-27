@@ -15,6 +15,11 @@
   / `lost_all_kv`); the fork path is unchanged.
 - `benchmarks/pp_upstream/`: per-hop latency of vLLM's PP API (NCCL vs
   connex-rs), failover under load.
+- Same-host stage pairs over CUDA IPC with stream wait/write on shared
+  pinned flags (`connex.adapters.vllm.pp.ipcchan`, `CONNEX_PP_CUDA_IPC`):
+  on par with NCCL end to end, 32 MB per hop 0.80 ms vs 1.54 ms; safe unmap
+  of a dead peer's ring; failure events confirmed with a ping. Kill
+  comparison with stock vLLM under a restart loop in `docs/results.md`.
 
 **Across hosts and mixed GPUs** ([`docs/results.md`](docs/results.md#12-across-hosts-and-mixed-gpus), [`docs/design/multi-host-validation.md`](docs/design/multi-host-validation.md))
 - PD (vLLM, SGLang), TP PD and EP validated with instances on different

@@ -48,6 +48,10 @@ ABORT = 3
 CONTROL = 4
 READY = 5     # the data of an announced tensor dict is in place
 
+# Same-host stage pairs copy over CUDA IPC (CONNEX_PP_CUDA_IPC=0: RDMA loopback).
+IPC_ENABLED = os.getenv("CONNEX_PP_CUDA_IPC", "1") == "1"
+
+
 READ_TIMEOUT_MS = int(os.getenv("CONNEX_PP_READ_TIMEOUT_MS", "10000"))
 _DTYPES = {str(d): d for d in (torch.float16, torch.bfloat16, torch.float32, torch.int64,
                                torch.int32, torch.uint8, torch.float8_e4m3fn)}
@@ -184,7 +188,8 @@ class StageLink:
     def __init__(self, model: str, stage: int, shard: int, replica: int,
                  device: torch.device, port: int = 0, ring_mb: int | None = None,
                  on_peer_failed: Callable[[tuple], None] | None = None,
-                 on_control: Callable[[tuple, Any], None] | None = None):
+                 on_control: Callable[[tuple, Any], None] | None = None,
+                 ipc_slot_bytes: int = 0, ipc_slots: int = 3):
         self.device = device
         si = float(os.getenv("CONNEX_PP_SWITCH_INTERVAL_US", "0"))
         if si > 0:
@@ -218,6 +223,15 @@ class StageLink:
         self._posted: dict[tuple, tuple] = {}   # key -> (recv ring offset, wait slot)
         self._ready: dict[tuple, tuple] = {}    # key -> (peer, READY) before the post
         self._prev_off: int | None = None
+        # GPU-driven same-host channels (ipcchan): ours to each peer, and
+        # the peers' to us; plus the receive whose slot is released next.
+        self.ipc_slot_bytes, self.ipc_slots = ipc_slot_bytes, ipc_slots
+        self._tx_chans: dict[tuple, Any] = {}
+        self._rx_chans: dict[tuple, Any] = {}
+        self._rx_done: tuple | None = None
+        self._rx_last: dict[str, int] = {}
+        self._graveyard = None
+        self._ip = self.url.split(":", 1)[0]
         self._waiter = None
         self._outstanding: dict[int, tuple] = {}
         self._msg_id = 0
@@ -237,7 +251,12 @@ class StageLink:
         """Queue ``tensors`` for ``peer_url``. Stream-ordered: the copy into
         the ring is issued on the current stream, so the caller may reuse
         the tensors after the call."""
+        if not peer_url:
+            return  # no live replica on the route (failover in progress)
         layout, total = _layout(tensors)
+        if self.same_host(peer_url) and total <= self.ipc_slot_bytes:
+            self._send_ipc(peer_url, key, tensors, layout, total, meta)
+            return
         off = self.send_ring.alloc(max(total, _ALIGN))
         base = self.send_buf[off:off + total]
         for lay in layout:
@@ -265,6 +284,64 @@ class StageLink:
             return
         self._tx.put((ev, peer_url, (READY, key, self.url, self.send_buf.data_ptr() + off,
                                      mid, total)))
+
+    def same_host(self, url: str) -> bool:
+        return (bool(url) and IPC_ENABLED and self.ipc_slot_bytes > 0
+                and url.split(":", 1)[0] == self._ip)
+
+    def tx_chan(self, url: str, tag: tuple, slot_bytes: int, slots: int):
+        """Our channel to ``url`` for ``tag``; (channel, created)."""
+        from connex.adapters.vllm.pp.ipcchan import TxChannel
+
+        k = (_peer_id(url), tag)
+        ch = self._tx_chans.get(k)
+        if ch is not None:
+            return ch, False
+        ch = self._tx_chans[k] = TxChannel(self.device, slots, slot_bytes, f"{tag[0]}")
+        return ch, True
+
+    def rx_chan(self, peer: tuple, tag: tuple, info):
+        from connex.adapters.vllm.pp.ipcchan import RxChannel
+
+        k = (tuple(peer), tag)
+        ch = self._rx_chans.get(k)
+        if ch is None or ch.flags.name != info[0]:
+            if ch is not None:
+                self.close_chans(lambda kk, k=k: kk == k)
+            ch = self._rx_chans[k] = RxChannel(self.device, info)
+        return ch
+
+    def close_chans(self, pred) -> None:
+        from connex.adapters.vllm.pp.ipcchan import Graveyard
+
+        if self._graveyard is None:
+            self._graveyard = Graveyard()
+        for d in (self._tx_chans, self._rx_chans):
+            for k in [k for k in d if pred(k)]:
+                self._graveyard.add(d.pop(k))
+        self._graveyard.drain()
+
+    def drain_chans(self) -> None:
+        if self._graveyard is not None:
+            self._graveyard.drain()
+
+    def _send_ipc(self, peer_url, key, tensors, layout, total, meta) -> None:
+        # Stream-ordered: the copy into our ring and the "ready" flag are
+        # queued behind the work that computed the tensors; the header goes
+        # now (at launch time), so the receiver can queue its step.
+        ch, _ = self.tx_chan(peer_url, ("h",), self.ipc_slot_bytes, self.ipc_slots)
+        chunks = [tensors[x.name].contiguous().view(-1).view(torch.uint8) for x in layout]
+        i = ch.push(chunks)
+        lay = [(x.name, str(x.dtype), x.shape, x.offset, x.nbytes) for x in layout]
+        try:
+            self.engine.send_msg(peer_url, pickle.dumps(
+                (TENSORS, key, lay, total, meta, ("ipc", ch.info, i)),
+                protocol=pickle.HIGHEST_PROTOCOL))
+        except Exception as e:  # noqa: BLE001
+            log.warning("connex-pp: send to %s failed: %s", peer_url, e)
+        self.stats["sent"] += 1
+        self.stats["bytes_sent"] += total
+        self.stats["ipc"] = self.stats.get("ipc", 0) + 1
 
     def _release_sent(self, mid: int) -> None:
         with self._out_lock:
@@ -333,8 +410,9 @@ class StageLink:
         if kind == ACK:
             self._release_sent(hdr[1])
         elif kind == TENSORS:
-            _, key, layout, total, meta = hdr
-            self._deliver(key, _Header(layout, total, meta))
+            _, key, layout, total, meta = hdr[:5]
+            ipc = hdr[5] if len(hdr) > 5 else None
+            self._deliver(key, _Header(layout, total, meta, ipc, tuple(peer)))
         elif kind == READY:
             self._on_ready(peer, hdr)
         elif kind == BYTES:
@@ -350,7 +428,7 @@ class StageLink:
                     log.exception("connex-pp: control handler failed")
 
     def _on_ready(self, peer, hdr) -> None:
-        _, key, src_url, src_ptr, mid, total = hdr
+        _, key, src_url, src_ptr, mid, total = hdr[:6]
         with self._post_lock:
             posted = self._posted.pop(key, None)
             if posted is None:
@@ -371,7 +449,7 @@ class StageLink:
             pass
 
     def _read_into(self, peer, hdr, posted) -> None:
-        _, key, src_url, src_ptr, mid, total = hdr
+        _, key, src_url, src_ptr, mid, total = hdr[:6]
         off, slot = posted
         rc = self.engine.transfer_sync_read(src_url, self.recv_buf.data_ptr() + off, src_ptr,
                                             total, READ_TIMEOUT_MS)
@@ -431,8 +509,30 @@ class StageLink:
             ev.record(stream)
             _free_after(ev, self.recv_ring, self._prev_off)
             self._prev_off = None
+        if self._rx_done is not None:
+            ch, i = self._rx_done
+            ch.done(i)   # the previous step's consumers were queued before now
+            self._rx_done = None
         if item is None:
             return None
+        if item.ipc is not None:
+            _, info, i = item.ipc
+            ch = self.rx_chan(item.peer, ("h",), info)
+            last = self._rx_last.get(info[0], -1)
+            for j in range(max(last + 1, i - ch.n), i):
+                ch.done(j)   # messages of aborted steps we never consumed
+            self._rx_last[info[0]] = i
+            buf = ch.wait(i)
+            if blocking:
+                stream.synchronize()  # released by the sender's GPU, not by us
+            self._rx_done = (ch, i)
+            self.stats["recv"] += 1
+            self.stats["bytes_recv"] += item.total
+            out = {}
+            for name, dtype, shape, loff, n in item.layout:
+                dt = _DTYPES.get(dtype) or getattr(torch, dtype.replace("torch.", ""))
+                out[name] = buf[loff:loff + n].view(dt).view(shape)
+            return out, item.meta
         if self._waiter is None:
             from connex.adapters.vllm.pp.hostwait import HostFlagWaiter
 
@@ -486,6 +586,10 @@ class StageLink:
     def _event_loop(self) -> None:
         while not self._closed:
             try:
+                self.drain_chans()
+            except Exception:  # noqa: BLE001
+                log.exception("connex-pp: releasing channels failed")
+            try:
                 ev = self.engine.wait_event(timeout_ms=500)
             except Exception:  # noqa: BLE001
                 return
@@ -501,6 +605,7 @@ class StageLink:
             peer = tuple(ev.get("peer") or ())
             with self.inbox.cv:
                 self.up_peers.discard(peer)
+            self.close_chans(lambda k, peer=peer: k[0] == peer)
             n = self._release_sent_where(lambda ent: ent[2] == peer)
             if n:
                 log.warning("connex-pp: released %d send slot(s) of failed peer %s", n, peer)
@@ -540,6 +645,8 @@ class _Header:
     layout: list
     total: int
     meta: Any
+    ipc: Any = None
+    peer: tuple = ()
 
 
 _pending_frees: deque = deque()

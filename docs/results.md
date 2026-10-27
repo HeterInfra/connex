@@ -1035,13 +1035,13 @@ replaced: hidden states and sampled tokens over connex-rs instead of NCCL)
 and **one stage per instance** (stage servers with replicas, failover).
 
 **Setup.** One host with 4x A40 (48 GB, PCIe, no NVLink) and a ConnectX
-100 Gb InfiniBand NIC; one-host transfers between GPUs go through the NIC in
-loopback (GPUDirect RDMA), NCCL uses PCIe P2P. For the two-host rows the
+100 Gb InfiniBand NIC; NCCL and Connex's same-host path (below) use PCIe P2P
+between the GPUs, Connex's RDMA path goes through the NIC in loopback. For the two-host rows the
 stages run on two other nodes of the same kind (agent pods as in section
 12, stages on GPUs next to the NIC). Llama-3-8B bf16, 0.75 memory fraction,
 `VLLM_USE_FLASHINFER_SAMPLER=0`. Throughput and latency: `vllm bench serve`
 with random 512-token prompts and 128 output tokens (`--ignore-eos`),
-`--max-concurrency` C and 8·C prompts (at least 32), one run per cell.
+`--max-concurrency` C and 8·C prompts (at least 32), 3 runs per cell.
 Correctness: 16 greedy requests of 200 tokens, every generated token
 re-scored by teacher forcing on a non-PP (TP=1) vLLM instance; a token
 counts as off the argmax if it is more than 0.5 nats below it.
@@ -1050,87 +1050,138 @@ counts as off the argmax if it is more than 0.5 nats below it.
 below, NCCL and Connex, with and without failover (worst gap 0.125 nats,
 the same as between two non-PP runs).
 
-**Steady state.** Median TPOT (ms) / output throughput (tok/s):
+**Same-host hops.** Stage pairs on one host move the hidden states and the
+sampled tokens over CUDA IPC (`connex.adapters.vllm.pp.ipcchan`): the sender
+copies into a ring in its own GPU memory that the receiver has mapped, and
+both sides synchronise with `cuStreamWaitValue32` / `cuStreamWriteValue32`
+on flags in shared pinned host memory, so like NCCL no Python thread is on
+the data path. Hops between hosts stay one-sided RDMA (connex-rs).
+`CONNEX_PP_CUDA_IPC=0` turns it off. UCX's own `cuda_ipc` transport was not
+usable here: UCX 1.16 disables its GET path without NVLink (these A40s are
+PCIe only), and forcing it gave 0.9 GB/s.
+
+**Steady state, one host.** 3 runs per cell on the same instance (random
+prompts with seeds 1-3), mean ±standard deviation; median TPOT (ms) / p99
+TPOT (ms) / output throughput (tok/s):
 
 | setup | C=1 | C=8 | C=32 |
 |---|---|---|---|
-| no PP (TP=1, one GPU) | 28.15 / 34.8 | 31.08 / 238.9 | 44.99 / 662.5 |
-| PP=2, NCCL (stock vLLM) | 28.24 / 34.1 | 32.99 / 218.6 | 41.85 / 717.3 |
-| PP=2, in-process, connex-rs | 29.04 / 33.8 | 33.01 / 232.9 | 40.38 / 736.9 |
-| PP=2, one stage per instance | 28.78 / 34.1 | 32.33 / 233.0 | 40.42 / 729.8 |
-| PP=4, NCCL | 28.32 / 34.0 | 31.65 / 223.5 | 39.04 / 754.0 |
-| PP=4, in-process, connex-rs | 29.55 / 33.2 | 32.94 / 232.6 | 40.54 / 739.1 |
-| PP=4, one stage per instance | 29.44 / 33.3 | 35.46 / 224.2 | 40.86 / 736.6 |
-| PP=2 x TP=2, NCCL | 15.53 / 60.3 | 17.66 / 378.6 | 22.40 / 1263.9 |
-| PP=2 x TP=2, in-process, connex-rs | 16.09 / 60.3 | 17.61 / 423.7 | 22.47 / 1254.6 |
-| PP=2 x TP=2, one stage per instance | 16.03 / 60.4 | 17.27 / 427.8 | 23.53 / 1227.9 |
-| two hosts, PP=2, NCCL (`--nnodes 2`) | 28.27 / 34.1 | 33.23 / 218.9 | 41.06 / 728.4 |
-| two hosts, PP=2, in-process, connex-rs | 28.98 / 33.3 | 33.35 / 218.2 | 40.53 / 729.1 |
-| two hosts, PP=2, one stage per instance | 29.05 / 33.2 | 33.26 / 217.7 | 40.81 / 723.7 |
+| PP=2, NCCL (stock vLLM) | 28.24 ±0.00 / 28.25 / 34.8 ±0.0 | 33.03 ±0.43 / 34.99 / 234.2 ±1.4 | 41.55 ±1.24 / 46.19 / 725.0 ±10.3 |
+| PP=2, in-process, Connex | 28.23 ±0.01 / 28.24 / 34.8 ±0.0 | 32.94 ±0.07 / 35.15 / 232.9 ±0.1 | 40.65 ±1.35 / 45.58 / 730.9 ±14.4 |
+| PP=2, one stage per instance | 28.23 ±0.00 / 28.35 / 34.7 ±0.0 | 32.51 ±0.41 / 35.08 / 234.0 ±0.3 | 39.98 ±0.12 / 44.70 / 716.5 ±19.0 |
+| PP=4, NCCL | 28.33 ±0.00 / 28.34 / 34.7 ±0.0 | 32.77 ±1.90 / 36.86 / 235.6 ±4.3 | 40.21 ±1.10 / 44.54 / 743.6 ±13.3 |
+| PP=4, in-process, Connex | 28.35 ±0.00 / 28.38 / 34.6 ±0.0 | 31.93 ±1.60 / 37.19 / 236.5 ±5.0 | 40.20 ±0.19 / 44.55 / 743.0 ±0.3 |
+| PP=4, one stage per instance | 28.33 ±0.01 / 28.43 / 34.6 ±0.0 | 33.88 ±2.26 / 37.02 / 230.3 ±7.0 | 39.44 ±0.16 / 43.13 / 736.4 ±10.7 |
+| PP=2 x TP=2, NCCL | 15.53 ±0.00 / 15.54 / 62.6 ±0.0 | 17.62 ±0.17 / 19.50 / 425.0 ±2.6 | 22.87 ±0.10 / 26.80 / 1255.4 ±5.5 |
+| PP=2 x TP=2, in-process, Connex | 15.51 ±0.01 / 15.53 / 62.7 ±0.0 | 17.76 ±0.09 / 19.52 / 424.3 ±1.4 | 23.20 ±0.38 / 27.05 / 1250.8 ±15.0 |
+| PP=2 x TP=2, one stage per instance | 15.60 ±0.00 / 15.74 / 62.2 ±0.1 | 17.54 ±0.34 / 19.27 / 425.6 ±3.4 | 23.38 ±0.34 / 26.87 / 1194.5 ±45.7 |
 
-Connex adds 0.5-1.2 ms per token at C=1 (2-4%) and is within a few percent
-either way at C=8 and C=32, except one stage per instance at PP=4, C=8
-(+12% TPOT). The per-token cost at C=1 is the per-hop overhead below.
+With the same-host path Connex is within the run-to-run spread of NCCL in
+every cell (the earlier single runs over RDMA loopback were 2-4% slower at
+C=1). The PP=2 x TP=2, one stage per instance cell at C=32 is 5% below
+NCCL in throughput with a large spread.
+
+**Two hosts** (stages on two other nodes over 100 Gb InfiniBand, cross-host
+hops over RDMA; 3 runs per cell): median TPOT / p99 TPOT / tok/s
+
+| setup | C=1 | C=8 | C=32 |
+|---|---|---|---|
+| PP=2, NCCL (`--nnodes 2`) | 28.28 ±0.00 / 28.28 ±0.00 / 34.5 | 32.94 ±0.10 / 39.75 ±7.71 / 228.3 | 41.00 ±0.02 / 46.15 ±0.32 / 721.6 |
+| PP=2, in-process, Connex | 28.94 ±0.01 / 29.08 ±0.07 / 33.7 | 33.07 ±0.12 / 39.75 ±8.04 / 228.1 | 41.87 ±0.22 / 47.61 ±0.28 / 712.6 |
+| PP=2, one stage per instance | 29.11 ±0.01 / 29.20 ±0.03 / 33.5 | 33.03 ±0.25 / 40.23 ±8.27 / 227.7 | 41.79 ±1.03 / 46.23 ±1.31 / 698.7 |
+
+Across hosts Connex adds 0.7-0.8 ms per token at C=1 (2-3%) and its p99
+TPOT is 0.1-1.5 ms higher; the p99 spread at C=8 (±8 ms) is in both.
 
 **Per hop.** The same `GroupCoordinator` calls vLLM's worker makes
 (`isend_tensor_dict` / `irecv_tensor_dict`, `{hidden_states, residual}` bf16,
 hidden size 4096), two ranks ping-ponging, one way = round trip / 2, median
-of 200 (`benchmarks/pp_upstream/bench_p2p.py`):
+of 200 per run, mean ±std over 3 runs (`benchmarks/pp_upstream/bench_p2p.py`):
 
-| tokens (bytes) | one host NCCL | one host connex-rs | two hosts NCCL | two hosts connex-rs |
-|---|---|---|---|---|
-| 1 (16 KB) | 412 µs | 650 µs | 467 µs (p99 2.6 ms) | 697 µs (p99 0.76 ms) |
-| 64 (1 MB) | 403 µs | 823 µs | 516 µs | 786 µs |
-| 512 (8 MB) | 518 µs | 1,469 µs | 1,660 µs | 1,834 µs |
-| 2048 (32 MB) | 1,543 µs | 4,474 µs | 5,994 µs | 5,652 µs |
+| tokens (bytes) | one host NCCL | one host Connex, CUDA IPC | one host Connex, RDMA loopback | two hosts NCCL (1 run) | two hosts Connex RDMA (1 run) |
+|---|---|---|---|---|---|
+| 1 (16 KB) | 407 ±11 µs | 520 ±115 µs | 491 ±202 µs | 467 µs (p99 2.6 ms) | 697 µs (p99 0.76 ms) |
+| 64 (1 MB) | 426 ±20 µs | 352 ±125 µs | 631 ±130 µs | 516 µs | 786 µs |
+| 512 (8 MB) | 517 ±16 µs | 392 ±154 µs | 1,615 ±9 µs | 1,660 µs | 1,834 µs |
+| 2048 (32 MB) | 1,540 ±4 µs | 799 ±42 µs | 4,390 ±19 µs | 5,994 µs | 5,652 µs |
 
 vLLM's NCCL path pays about 0.4 ms per hop for the metadata it sends over
-gloo. Connex is slower on one host because its GPU-to-GPU path is RDMA
-loopback through the NIC (about 9 GB/s here) instead of PCIe P2P, and for
-small messages because Python threads are on the path; across hosts the
-large transfers are on par. End to end this matters less than the table
-suggests because the receiving stage does not wait on the CPU: the sender
-announces the tensors at launch time (like vLLM's metadata), the receiver
-queues its work right away and its CUDA stream waits for a host flag that
-is set when the bytes have landed. With a blocking receive (the first
-version) TPOT at PP=2, C=1 was 31.9 ms instead of 29.0 ms.
+gloo. Connex's small-message latency varies a lot between runs (Python
+threads on the control path); its large transfers on one host are now
+faster than NCCL's (no metadata round trip, one copy into the peer-mapped
+ring).
 
-**Failover.** PP=2 with two stage-1 replicas (one host, and with stage 0
-and the two replicas on three hosts), and PP=3 with two replicas of the
-last stage; 32 closed-loop streaming clients (128 tokens each), SIGKILL of
-the active replica 15 s in, the killed replica restarted with the same
-command before the next kill (it rejoins as a spare):
+**Failover** (rows above the line: RDMA between stages, before the same-host
+path; below: with it). 32 closed-loop streaming clients (128 tokens each),
+SIGKILL of the active replica 15 s in, the killed replica restarted with
+the same command before the next kill (it rejoins as a spare):
 
 | setup | kills | requests completed | errors | largest gap between two tokens, per run |
 |---|---|---|---|---|
 | PP=2, one host | 10 | 3,168 / 3,168 | 0 | 0.39-0.71 s |
 | PP=3, last stage, one host | 2 | 640 / 640 | 0 | 0.46-0.58 s |
 | PP=2, three hosts | 2 | 640 / 640 | 0 | 0.43-0.49 s |
+| PP=2, one host, CUDA IPC | 5 | 3,968 / 3,968 | 0 | 0.34-0.60 s |
+| PP=3, middle stage, one host, CUDA IPC | 2 | 576 / 576 | 0 | 0.69 s and 2.61 s |
 
-All 32 requests in flight at every kill completed. Steady TPOT before the
-kill was 32.2-33.6 ms. A kill is detected by connex-rs within milliseconds
-(the dead process's connections reset); stage 0 completes the steps in
-flight as lost, reports the replaced stage's KV as lost, and vLLM's
-scheduler recomputes every running request on the new route.
+All 32 requests in flight at every kill completed. A kill is detected by
+connex-rs within milliseconds (the dead process's connections reset); stage
+0 completes the steps in flight as lost, reports the replaced stage's KV as
+lost, and vLLM's scheduler recomputes every running request on the new
+route. Correctness runs with a kill 3 s into 16 greedy requests: 17 of 18
+completed with 0 tokens off the argmax (one hung, see below).
 
-In 14 more kills during the 16-request greedy runs (killed 3 s in), 13
-runs completed with 0 tokens off the argmax. **One run did not complete**:
-PP=2 on one host, the fourth kill of a series, all 16 requests hung until
-the client timeout (600 s) and stage 0 had no active route afterwards. It
-did not reproduce in the 15 kills that followed and its logs were
-overwritten by the next run, so the cause is not known.
+The middle-stage kill is the case CUDA IPC makes delicate: the next stage
+has the dead replica's ring mapped, and an open mapping keeps that GPU
+memory allocated. The receiver releases the flags at once (streams waiting
+for the dead peer go on with garbage that the recompute discards) and
+unmaps only after every stream that used the channel has passed that point;
+unmapping or unregistering earlier crashed the stage (CUDA error in a later
+stream operation). The killed replica then restarted on the same GPU each
+time.
 
-An earlier version that only preempted the requests, without evicting
-their blocks from the prefix cache, completed every request but left 59
-tokens off the argmax in 14 of 16 requests, all after the failover point:
-the resumed requests hit their own prefix-cached blocks, whose KV the new
-replica did not have.
+**Kill under load, NCCL vs Connex** (one host, same 32 clients, 150 s, kill
+15 s in; 3 kills per row). Stock vLLM runs under a restart loop (a
+supervisor that relaunches `vllm serve` when it exits); "down" is the time
+from the kill until a 1-token request succeeds again, "tokens lost" the
+tokens already streamed to requests that did not complete, "completed" the
+requests that finished all 128 tokens in the 120 s after the kill.
+
+| setup, what is killed | in flight completed | tokens lost | down | completed in 120 s | tokens/s in 120 s |
+|---|---|---|---|---|---|
+| PP=2 NCCL, stage-1 worker | 0 / 32 (x3) | 1,794 / 2,206 / 2,473 | 57.5 / 63.3 / 62.0 s | 448 / 411 / 416 | 478 / 438 / 444 |
+| PP=2 Connex, active stage-1 replica (spare) | 32 / 32 (x3) | 0 | 0 s (largest gap 0.34 / 0.42 / 0.46 s) | 864 / 871 / 876 | 922 / 929 / 934 |
+| PP=2 x TP=2 NCCL, one TP rank of stage 1 | 0 / 32 (x3) | 547 / 1,481 / 1,170 | 60.7 / 60.1 / 60.6 s | 768 / 777 / 773 | 819 / 829 / 825 |
+| PP=2 x TP=2 Connex, one TP rank of stage 1, no spare | **0 / 32 (x3), failed** | 3,189 / 0 / 0 | not recovered | 0 | 0 |
+
+Stock vLLM reloads the model in 49-50 s after the supervisor relaunches it
+(start to ready); the rest of the outage is detecting the dead engine and
+the exit. Every request in flight is lost and the clients see errors.
+
+**The PP=2 x TP=2 Connex rows failed.** With no spare replica on this host
+the killed stage was restarted by a restart loop (ready again after 26 s),
+and stage 0 should have resumed on it. Instead stage 0's two TP ranks hung
+in the in-group broadcast of the sampled tokens (NCCL timeout after
+10 min); the first run's 32 requests timed out, and in the next two the API
+was already down. A failure-event bug made it worse and is fixed (a late
+"failed" event about the killed incarnation marked the restarted replica
+dead again and again, each time recomputing every request; events are now
+confirmed with a ping), but the hang remains: failover with TP > 1 on stage
+0 is not working. TP > 1 on a downstream stage, and stage 0 at TP=1, are
+unaffected.
+
+Earlier findings: in one of 28 kills of the first series (RDMA, one host)
+all 16 requests of a correctness run hung; the cause found since (the same
+late failure event repeatedly marking a live replica dead) fits, but was not
+confirmed for that run. An earlier version that only preempted the
+requests, without evicting their blocks from the prefix cache, completed
+every request but left 59 tokens off the argmax in 14 of 16 requests.
 
 **Not covered.** A replica shared by several pipelines (the fork path
-supports it; here a replica serves one stage 0 at a time), failover of a
-TP > 1 stage, more than one failure at a time, stage 0 failures (the API
-instance; use the resume proxy of section 4), PP across hosts with more
-than two stages, repeated runs of the steady-state cells.
+supports it; here a replica serves one stage 0 at a time), failover with
+TP > 1 on stage 0 (fails, above), more than one failure at a time, stage 0
+failures (the API instance; use the resume proxy of section 4), PP across
+hosts with more than two stages.
 
 ## How to reproduce
 
