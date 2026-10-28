@@ -30,6 +30,21 @@
   a Python thread (deadlock with GIL-holding device syncs seen in a
   cross-host failover); about 5 ms per token at PP=2, C=1;
   `CONNEX_PP_XHOST_STREAM_WAIT=1` to opt out.
+- Between hosts, the sender's NIC now releases the receiver's stream
+  (`connex.adapters.vllm.pp.rdmachan`, needs connex-rs with
+  `Engine.put_chain`): the receiver owns the slots and flags, the sender's
+  stream rings a doorbell and connex-rs writes the data, reads it back and
+  writes the flag, so no Python thread on either side is on the data path.
+  Two hosts, PP=2: 28.32 ms TPOT at C=1 (NCCL 28.28, CPU waits 34.2), C=32
+  within the run-to-run spread of NCCL, also for PP=2 x TP=2;
+  `CONNEX_PP_RDMA_PUSH=0` falls back to reads with CPU waits. 20 kills (12
+  across hosts, including a TP=2 replica taking over on another host): every
+  request completed, 0 tokens off the argmax.
+- One stage per instance with TP > 1: every TP rank is a pipeline endpoint
+  and exchanges the hidden states with the same rank of the next stage (no
+  broadcast of the received hidden states over the TP group;
+  `CONNEX_PP_TP_ENDPOINTS=0` restores it). Mean TTFT at C=32 10% lower;
+  throughput the same within the spread.
 
 **Across hosts and mixed GPUs** ([`docs/results.md`](docs/results.md#12-across-hosts-and-mixed-gpus), [`docs/design/multi-host-validation.md`](docs/design/multi-host-validation.md))
 - PD (vLLM, SGLang), TP PD and EP validated with instances on different
