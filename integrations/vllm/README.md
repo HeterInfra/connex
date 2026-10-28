@@ -71,8 +71,9 @@ CONNEX_PP_STAGES='[["10.0.0.2:47020","10.0.0.3:47022"]]' \
 
 All stages take the same engine arguments (the block ids in the steps are
 stage 0's, so `--num-gpu-blocks-override` must be the same everywhere);
-tensor parallelism per stage works (`-tp 2`; TP rank 0 is the stage's
-endpoint). Restarting a killed replica with the same command makes it a
+tensor parallelism per stage works (`-tp 2`; every TP rank is an endpoint
+and exchanges the hidden states with the same rank of the next stage, TP
+rank r listens on `CONNEX_PP_DATA_PORT` + 100·r). Restarting a killed replica with the same command makes it a
 spare again.
 
 | Variable | Default | Meaning |
@@ -83,7 +84,11 @@ spare again.
 | `CONNEX_RS_LOCAL_IP` | vLLM's host IP | address to listen on (use the RDMA interface's) |
 | `CONNEX_PP_RING_MB` | from the config | registered GPU buffer per direction for RDMA ((PP+1) steps of hidden states) |
 | `CONNEX_PP_CUDA_IPC` | 1 | same-host stage pairs over CUDA IPC (0: RDMA loopback) |
-| `CONNEX_PP_XHOST_STREAM_WAIT` | 0 | between hosts, let streams wait for data a Python thread releases (faster, can deadlock against GIL-holding device syncs) |
+| `CONNEX_PP_RDMA_PUSH` | 1 | between hosts, the sender's NIC writes the receiver's ring and flag (needs connex-rs with `Engine.put_chain`, after 0.1.3); 0: one-sided reads, the receiver waits on the CPU |
+| `CONNEX_PP_PUSH_MARGIN` | 8 | sampled tokens from a new (epoch, sender) use the push channel from this many steps on (the channel is announced on the first) |
+| `CONNEX_PP_TP_ENDPOINTS` | 1 | one stage per instance with TP > 1: one endpoint per TP rank (0: TP rank 0 receives and broadcasts over the TP group) |
+| `CONNEX_PP_TP_PORT_STRIDE` | 100 | data port of TP rank r = `CONNEX_PP_DATA_PORT` + stride·r |
+| `CONNEX_PP_XHOST_STREAM_WAIT` | 0 | between hosts, for messages that do not come over a push channel: let streams wait for data a Python thread releases (can deadlock against GIL-holding device syncs) |
 | `CONNEX_PP_STEP_TIMEOUT_S` | 60 | a step without reply after this long triggers a ping; no pong = failover |
 | `CONNEX_PP_REPLACE_TIMEOUT_S` | 120 | how long stage 0 waits for a live replacement |
 | `CONNEX_RS_HEARTBEAT_MS` / `_TIMEOUT_MS` | 1000 / 3000 | connex-rs heartbeat for hung peers |
@@ -111,18 +116,22 @@ uses RDMA loopback instead. When a peer dies its flags are released at once
 and its memory is unmapped once the local streams have passed that point,
 so a replica restarted on the same GPU finds its memory free.
 
-Between hosts the receiving stage waits for the bytes on the CPU before it
-queues the step (and fills the sampled tokens right before the step that
-uses them): a stream wait released by a Python thread of the same process
-can deadlock against a CUDA call that holds the GIL and waits for the device
-(a first Triton kernel load). This costs about 5 ms per token at PP=2, C=1
-across two hosts; `CONNEX_PP_XHOST_STREAM_WAIT=1` trades the safety back for
-the speed.
-
-Known limitation: with one stage per instance and TP > 1, only TP rank 0 of
-a stage is a pipeline endpoint and shares each step's hidden states with the
-other ranks over NCCL; at high load this costs a few percent of throughput
-(`docs/results.md` section 13).
+Between hosts the same contract holds over RDMA
+(`connex.adapters.vllm.pp.rdmachan`): the receiver owns a ring (GPU memory
+for hidden states, pinned host memory for sampled tokens) and flags in
+pinned host memory, registered with connex-rs, and announces them to the
+sender. The sender's stream copies into its registered buffer and writes a
+doorbell word with `cuStreamWriteValue32`; connex-rs's progress thread sees
+it (`Engine.put_chain`), writes the bytes into the receiver's slot, reads
+the last word back (so the data is in GPU memory before the flag, also on
+GPUs that do not order inbound RDMA writes), then writes the receiver's
+flag; the receiving stream waits on the flag. No Python thread on either
+side releases a stream wait, which matters: a stream wait that only a
+Python thread of the same process can release deadlocks against a CUDA call
+that holds the GIL and waits for the device (a first Triton kernel load).
+Across two hosts this is on par with NCCL (`docs/results.md` section 13).
+The first messages from a new sender (before the receiver's announcement
+reached it) go the old way, a one-sided read waited for on the CPU.
 
 ## The external-PP fork
 

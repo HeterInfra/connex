@@ -1055,7 +1055,8 @@ sampled tokens over CUDA IPC (`connex.adapters.vllm.pp.ipcchan`): the sender
 copies into a ring in its own GPU memory that the receiver has mapped, and
 both sides synchronise with `cuStreamWaitValue32` / `cuStreamWriteValue32`
 on flags in shared pinned host memory, so like NCCL no Python thread is on
-the data path. Hops between hosts stay one-sided RDMA (connex-rs).
+the data path. Hops between hosts follow the same contract over RDMA (see
+"Between hosts" below).
 `CONNEX_PP_CUDA_IPC=0` turns it off. UCX's own `cuda_ipc` transport was not
 usable here: UCX 1.16 disables its GET path without NVLink (these A40s are
 PCIe only), and forcing it gave 0.9 GB/s.
@@ -1079,37 +1080,57 @@ TPOT (ms) / output throughput (tok/s):
 With the same-host path Connex is within the run-to-run spread of NCCL in
 every cell (the earlier single runs over RDMA loopback were 2-4% slower at
 C=1). The PP=2 x TP=2, one stage per instance cell at C=32 is 5% below
-NCCL in throughput with a large spread.
+NCCL in throughput with a large spread (re-measured below with one endpoint
+per TP rank). Re-measured with the current version (2026-10-28, 3 runs,
+C=1 / C=32 median TPOT and C=32 tok/s): PP=2 NCCL 28.23 / 40.90 ms, 711;
+in-process Connex 28.21 / 40.87 ms, 711; one stage per instance 28.23 /
+40.19 ms, 711.
 
 **Two hosts** (stages on two other nodes over 100 Gb InfiniBand, cross-host
-hops over RDMA; 3 runs per cell): median TPOT / p99 TPOT / tok/s
+hops over RDMA with the sender writing the receiver's ring and flag, see
+"Between hosts" below; 2026-10-28, 3 runs per cell, mean ±std): median TPOT
+(ms) / p99 TPOT (ms) / output throughput (tok/s)
 
-| setup | C=1 | C=8 | C=32 |
-|---|---|---|---|
-| PP=2, NCCL (`--nnodes 2`) | 28.28 ±0.00 / 28.28 ±0.00 / 34.5 | 32.94 ±0.10 / 39.75 ±7.71 / 228.3 | 41.00 ±0.02 / 46.15 ±0.32 / 721.6 |
-| PP=2, in-process, Connex | 28.94 ±0.01 / 29.08 ±0.07 / 33.7 | 33.07 ±0.12 / 39.75 ±8.04 / 228.1 | 41.87 ±0.22 / 47.61 ±0.28 / 712.6 |
-| PP=2, one stage per instance | 29.11 ±0.01 / 29.20 ±0.03 / 33.5 | 33.03 ±0.25 / 40.23 ±8.27 / 227.7 | 41.79 ±1.03 / 46.23 ±1.31 / 698.7 |
+| setup | C=1 | C=32 |
+|---|---|---|
+| PP=2, NCCL (`--nnodes 2`) | 28.28 ±0.00 / 28.30 / 34.5 | 41.62 ±0.17 / 46.49 / 690 ±19 |
+| PP=2, in-process, Connex | 28.32 ±0.00 / 28.33 / 34.7 | 41.31 ±0.52 / 45.69 / 705 ±5 |
+| PP=2, one stage per instance | 28.32 ±0.00 / 28.34 / 34.7 | 41.90 ±0.63 / 46.69 / 687 ±14 |
+| PP=2 x TP=2, NCCL (`--nnodes 2`) | 15.55 ±0.00 / 15.56 / 61.8 | 22.90 ±0.56 / 26.62 / 1182 ±38 |
+| PP=2 x TP=2, one stage per instance | 15.59 ±0.00 / 15.61 / 61.6 | 23.12 ±0.38 / 28.24 / 1159 ±33 |
 
-Across hosts Connex adds 0.7-0.8 ms per token at C=1 (2-3%) and its p99
-TPOT is 0.1-1.5 ms higher; the p99 spread at C=8 (±8 ms) is in both.
+Across hosts Connex is within 0.3% of NCCL's TPOT at C=1 (0.04 ms) and
+within one standard deviation at C=32 (in-process 0.7% faster, one stage
+per instance 0.7% slower, PP=2 x TP=2 1.0% slower with throughput 2.0%
+lower). The earlier cross-host runs, where the receiving side waited on the
+CPU, were at 34.2 ms (C=1) and 46.0 ms (C=32) for PP=2; before that, with
+stream waits released by a Python thread (fast but unsafe), at 28.9 / 41.9
+ms.
 
 **Per hop.** The same `GroupCoordinator` calls vLLM's worker makes
 (`isend_tensor_dict` / `irecv_tensor_dict`, `{hidden_states, residual}` bf16,
 hidden size 4096), two ranks ping-ponging, one way = round trip / 2, median
 of 200 per run, mean ±std over 3 runs (`benchmarks/pp_upstream/bench_p2p.py`):
 
-| tokens (bytes) | one host NCCL | one host Connex, CUDA IPC | one host Connex, RDMA loopback | two hosts NCCL (1 run) | two hosts Connex RDMA (1 run) |
-|---|---|---|---|---|---|
-| 1 (16 KB) | 407 ±11 µs | 520 ±115 µs | 491 ±202 µs | 467 µs (p99 2.6 ms) | 697 µs (p99 0.76 ms) |
-| 64 (1 MB) | 426 ±20 µs | 352 ±125 µs | 631 ±130 µs | 516 µs | 786 µs |
-| 512 (8 MB) | 517 ±16 µs | 392 ±154 µs | 1,615 ±9 µs | 1,660 µs | 1,834 µs |
-| 2048 (32 MB) | 1,540 ±4 µs | 799 ±42 µs | 4,390 ±19 µs | 5,994 µs | 5,652 µs |
+| tokens (bytes) | one host NCCL | one host Connex, CUDA IPC | one host Connex, RDMA loopback | two hosts NCCL | two hosts Connex, push | two hosts Connex, read |
+|---|---|---|---|---|---|---|
+| 1 (16 KB) | 407 ±11 µs | 520 ±115 µs | 491 ±202 µs | 454 ±19 µs | 616 ±34 µs | 668 ±15 µs |
+| 64 (1 MB) | 426 ±20 µs | 352 ±125 µs | 631 ±130 µs | 521 ±23 µs | 756 ±28 µs | 845 ±19 µs |
+| 512 (8 MB) | 517 ±16 µs | 392 ±154 µs | 1,615 ±9 µs | 1,672 ±22 µs | 1,763 ±13 µs | 1,887 ±6 µs |
+| 2048 (32 MB) | 1,540 ±4 µs | 799 ±42 µs | 4,390 ±19 µs | 6,000 ±24 µs | 5,676 ±86 µs | 5,500 ±20 µs |
 
+Two-host columns: 2026-10-28, rank 0 on one node and rank 1 on another;
+"push" is the sender-driven channel described under "Between hosts" below,
+"read" the one-sided read with a CPU wait (`CONNEX_PP_RDMA_PUSH=0`).
 vLLM's NCCL path pays about 0.4 ms per hop for the metadata it sends over
 gloo. Connex's small-message latency varies a lot between runs (Python
-threads on the control path); its large transfers on one host are now
-faster than NCCL's (no metadata round trip, one copy into the peer-mapped
-ring).
+threads on the control path: the header is still a pickled message, so a
+small hop stays 0.15-0.25 ms above NCCL's in this ping-pong; in serving the
+header goes at launch time and overlaps the GPU work, see the two-host
+table). Its large transfers on one host are faster than NCCL's (no metadata
+round trip, one copy into the peer-mapped ring); across hosts at 32 MB the
+push is 3% slower than the read (the read-back and the flag after the data)
+and both are faster than NCCL.
 
 **Failover** (rows above the line: RDMA between stages, before the same-host
 path; below: with it). 32 closed-loop streaming clients (128 tokens each),
@@ -1123,6 +1144,30 @@ the same command before the next kill (it rejoins as a spare):
 | PP=2, three hosts | 2 | 640 / 640 | 0 | 0.43-0.49 s |
 | PP=2, one host, CUDA IPC | 5 | 3,968 / 3,968 | 0 | 0.34-0.60 s |
 | PP=3, middle stage, one host, CUDA IPC | 2 | 576 / 576 | 0 | 0.69 s and 2.61 s |
+
+**Failover with the cross-host push channel and per-TP-rank endpoints**
+(2026-10-28; this version). Same load as above, 45 s per run, each kill
+under load followed by a kill 3 s into 16 greedy requests of 200 tokens
+(scored as in the correctness paragraph); stage servers on three hosts
+(stage 0 on one, the two stage-1 replicas on the other two) unless noted:
+
+| setup, what is killed | kills (load + greedy) | load requests completed | in flight at the kill, completed | greedy runs: tokens off the argmax | largest gap, load runs |
+|---|---|---|---|---|---|
+| PP=2, three hosts, active replica | 3 + 3 | 992 / 992 | 96 / 96 | 0 / 9,600 | 2.47, 0.46, 2.45 s |
+| PP=2 x TP=2, three hosts, one TP rank of the active replica | 3 + 3 | 1,728 / 1,728 | 96 / 96 | 0 / 9,600 | 0.42, 2.18, 0.46 s |
+| PP=2, one host, RDMA push (CUDA IPC off), active replica | 2 + 2 | 677 / 677 | 64 / 64 | 0 / 6,400 | 0.63, 0.45 s |
+| PP=2 x TP=2, one host, one TP rank of stage 1, no spare (restarted in place) | 2 + 2 | 448 / 448 | 64 / 64 | 0 / 6,400 | 28.9, 29.0 s |
+
+20 kills, 12 of them across hosts, including the case that hung before
+(a TP=2 replica on another host taking over and loading kernels in its
+first steps): no hang, every request completed, 0 of 32,000 greedy tokens
+off the argmax, no fallback to a CPU-filled slot in any log. Six load
+requests of the TP=2 runs streamed 127 chunks instead of 128 with a normal
+end (one of them 12 s before its kill): two tokens in one stream chunk, not
+lost tokens. The 2.2-2.5 s gaps (3 of 9 kills with a spare) were not
+investigated further; the earlier version showed gaps up to 2.1-2.7 s as
+well. Without a spare the gap is the restart of the stage server (about
+25 s).
 
 All 32 requests in flight at every kill completed. A kill is detected by
 connex-rs within milliseconds (the dead process's connections reset); stage
@@ -1188,29 +1233,68 @@ event, the second 16 with the ping only right after a rejoin: 0.40-1.63 s);
 0 tokens off the argmax. The earlier unexplained hang (1 in 14) did not
 recur.
 
-**Throughput of PP=2 x TP=2, one stage per instance, at C=32** (1194 ±46 vs
-1255 ±5 tok/s). Per run: 1247, 1168, 1168 tok/s; the slow runs have 10-20%
-higher TTFT. In this mode only TP rank 0 of a stage is a pipeline endpoint
-and it shares each step's hidden states with the other TP rank over NCCL
-(`broadcast_tensor_dict`), an extra copy of up to 32 MB per prefill step on
-the critical path; in-process mode, where every TP rank has its own
-endpoint, matches NCCL (1251 ±15). Not fixed: it needs one endpoint per TP
-rank and per-rank routes.
+**Throughput of PP=2 x TP=2, one stage per instance, at C=32.** The first
+measurement was 1194 ±46 vs NCCL's 1255 ±5 tok/s (per run 1247, 1168, 1168;
+the slow runs with 10-20% higher TTFT). In that version only TP rank 0 of a
+stage was a pipeline endpoint and shared each step's hidden states with the
+other TP rank over NCCL (`broadcast_tensor_dict`), an extra copy of up to
+32 MB per prefill step on the critical path. Now every TP rank is an
+endpoint: the stage reports one URL per rank, the route carries them, and
+TP rank r sends to and receives from TP rank r of the neighbour stage
+(`CONNEX_PP_TP_ENDPOINTS=0` restores the old way). Same host, 3 runs each,
+2026-10-28:
 
-**Between hosts, the receiving side now waits on the CPU.** A CUDA stream
-wait that only a Python thread of the same process can release deadlocks
-against CUDA calls that hold the GIL and wait for the device; a first Triton
-kernel load does, and a freshly restarted replica loads kernels in its first
-steps. That is what hung a cross-host TP=2 failover (the new replica's TP
-rank 0 never joined the in-group broadcast). Same-host hops are released by
-the sender's GPU (no Python), so they keep the stream wait. Between hosts
-the hidden states are now received on the CPU before the step is queued,
-and the sampled tokens are filled on the CPU right before the step that
-consumes them. Cost, two hosts, PP=2, 3 runs: TPOT 34.2 vs 28.9 ms at C=1,
-46.0 vs 41.9 ms at C=32, throughput -9% at C=32 (stock NCCL: 28.3 / 41.0 ms).
-`CONNEX_PP_XHOST_STREAM_WAIT=1` restores the faster stream waits with the
-risk. A release that needs no Python on either side (the sender writing the
-receiver's flag over RDMA) would remove the trade-off; not done.
+| setup, C=32 | median TPOT | p99 TPOT | tok/s | mean TTFT |
+|---|---|---|---|---|
+| NCCL, in-process | 23.11 ±0.36 | 26.63 | 1219 ±18 | 435 ms |
+| one stage per instance, one endpoint per TP rank | 22.76 ±0.53 | 26.32 | 1201 ±18 | 511 ms |
+| one stage per instance, TP rank 0 + broadcast | 21.95 ±0.27 | 25.91 | 1208 ±24 | 567 ms |
+
+Per-rank endpoints cut the mean TTFT by 10% (the 32 MB broadcast is gone
+from prefill steps) but the throughput difference to rank 0 + broadcast is
+inside the run-to-run spread, and this time rank 0 + broadcast was also only
+0.9% below NCCL: the 5% gap of the first measurement did not reproduce. Both
+modes are 1-1.5% below NCCL at C=32, and their TTFT stays 17-30% above
+NCCL's. That difference is probably in the one-stage-per-instance mode
+itself rather than in the hidden-state hop: both modes show it at C=1 too
+(77 vs 71 ms TTFT at 15.54 / 15.58 vs 15.53 ms TPOT).
+
+**Between hosts: the sender's NIC releases the receiver's stream.** A CUDA
+stream wait that only a Python thread of the same process can release
+deadlocks against CUDA calls that hold the GIL and wait for the device; a
+first Triton kernel load does, and a freshly restarted replica loads kernels
+in its first steps. That is what hung a cross-host TP=2 failover (the new
+replica's TP rank 0 never joined the in-group broadcast). The first fix
+received on the CPU instead (hidden states before the step is queued,
+sampled tokens right before the step that consumes them), at a cost of
+5.3 ms per token at C=1 and 9% throughput at C=32 (34.2 / 46.0 ms TPOT).
+A Python thread on the *sending* side would not be safe either: the new
+replica's main thread holds the GIL in the kernel load while its device
+waits for stage 0's hidden states, stage 0's device waits for the new
+replica's sampled tokens of an earlier step, and those would need the new
+replica's GIL.
+
+Now neither side runs Python on the data path
+(`connex.adapters.vllm.pp.rdmachan`, connex-rs `Engine.put_chain`). The
+receiver owns the slots (GPU memory for hidden states, pinned host memory
+for the sampled tokens) and flags in pinned host memory, all registered with
+connex-rs, and announces them to the sender. The sender's stream copies the
+data into its registered buffer and writes a doorbell word in its own
+pinned memory (`cuStreamWriteValue32`); connex-rs's progress thread polls
+armed doorbells, waits for the slot's free flag when the ring wraps (a
+one-sided read of the receiver's flag), puts the bytes, reads the last word
+back, and puts the ready flag; the receiver's stream waits on the flag
+(`cuStreamWaitValue32`) and marks the slot free with `cuStreamWriteValue32`.
+The read-back matters on these GPUs: they report no ordering of inbound
+RDMA writes (`GPU_DIRECT_RDMA_WRITES_ORDERING` = none), and a read cannot
+complete before the earlier writes on the same PCIe path, so the data is in
+GPU memory before the flag is written (NCCL's GDR flush does the same).
+A new sender's first messages, before the receiver's announcement reaches
+it, go the old way (one-sided read, CPU wait); the sampled tokens of an
+(epoch, sender) switch to the channel 8 steps after its first step, a rule
+every TP rank evaluates the same way. From doorbell to flag, a 16 KB
+transfer takes about 20 µs (RDMA loopback, median of 200). Results: the
+two-host table above.
 
 **Not covered.** A replica shared by several pipelines (the fork path
 supports it; here a replica serves one stage 0 at a time), more than one
