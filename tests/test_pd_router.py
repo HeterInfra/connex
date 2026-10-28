@@ -220,9 +220,9 @@ def test_scale_up_and_down_under_load_without_failures():
             extra_p = fb.FakePDBackend("prefill", r.kv)
             extra_d = fb.FakePDBackend("decode", r.kv, tpot_ms=2)
 
-            async def one(i):
+            async def one(i, **kw):
                 prompt = f"w{i} w{i + 3} w7"
-                st, chunks = await r.stream(body(prompt, 10))
+                st, chunks = await r.stream(body(prompt, 10, **kw))
                 assert st == 200
                 check(chunks, prompt, 10)
 
@@ -238,10 +238,12 @@ def test_scale_up_and_down_under_load_without_failures():
             # scale down: the original decode and prefill leave (drain), in-flight finish
             r.dec_pool.drain(r.decode[0].url)
             r.pre_pool.drain(r.prefill[0].url)
-            n_before = len(r.decode[0].requests)
-            tasks += [asyncio.create_task(one(i)) for i in range(60, 80)]
+            # requests that picked the old decode before the drain may still
+            # reach it after their prefill; requests sent after the drain may not
+            tasks += [asyncio.create_task(one(i, user="after-drain")) for i in range(60, 80)]
             await asyncio.gather(*tasks)
-            assert len(r.decode[0].requests) == n_before     # no new work after drain
+            assert not [b for b in r.decode[0].requests if b.get("user") == "after-drain"]
+            assert sum(b.get("user") == "after-drain" for b in extra_d.requests) == 20
             assert extra_d.pulls > 0 and extra_p.prefills > 0
             assert r.router.stats["failed"] == 0
             await extra_p.stop(), await extra_d.stop()
