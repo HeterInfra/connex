@@ -1095,12 +1095,30 @@ class ConnexTEEndpoint(ZmqStageBase):
                 except Exception:  # noqa: BLE001
                     pass
 
+    def _crs_initiates(self, key: tuple) -> bool:
+        """Whether this side opens the connex-rs link to peer `key`. Exactly
+        one side of every pair does, and it is the side the data path
+        connects from: a receiver reads from its sender, so a stage connects
+        to the stage before it and stage 0 to the last stage (the return
+        path). Were the watcher to link the other way, its connect could
+        cross the data path's first read, and two simultaneous connects
+        replace each other's endpoint on both sides: in-flight reads fail,
+        a live peer is reported reset, and neither side reports the link up.
+        Pairs with no data path between them link from the lower key."""
+        s, n = self.stage_idx, self.num_stages
+        t = key[0]
+        if t != s and n > 1:
+            if t == s - 1 or (s == 0 and t == n - 1):
+                return True   # we read from it
+            if t == s + 1 or (t == 0 and s == n - 1):
+                return False  # it reads from us
+        return key > (s, self._replica_idx())
+
     def _crs_link_peers(self, eng) -> None:
         """Connect to every peer replica's connex-rs URL we have no live
-        link to (and that is not known dead). Only towards peers ordered
-        after us: the other side links to us, so no pair connects both ways
-        at once (one endpoint per peer; simultaneous connects would replace
-        each other's endpoint)."""
+        link to (and that is not known dead), for the pairs this side opens
+        (_crs_initiates): the other side links to us, so no pair connects
+        both ways at once."""
         epc = getattr(self, "_epc_client", None)
         if epc is None:
             return
@@ -1110,8 +1128,8 @@ class ConnexTEEndpoint(ZmqStageBase):
             return
         for r in peers:
             key = (r.lid.stage_idx, r.lid.replica_idx)
-            if key <= (self.stage_idx, self._replica_idx()) or key in self._crs_alive \
-                    or key in self._crs_dead:
+            if key == (self.stage_idx, self._replica_idx()) or not self._crs_initiates(key) \
+                    or key in self._crs_alive or key in self._crs_dead:
                 continue
             url = next((a for a in r.addresses[1:] if "#" in a), None)
             if url is None:
