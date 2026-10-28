@@ -91,6 +91,8 @@ jobs:
         run: |
           docker compose -f docker/docker-compose.yml --profile proxy config -q
           MODEL_DIR=/tmp docker compose -f docker/docker-compose.yml -f docker/compose.local-model.yml config -q
+          docker compose -f docker/docker-compose.fork.yml --profile proxy config -q
+          MODEL_DIR=/tmp docker compose -f docker/docker-compose.fork.yml -f docker/compose.local-model.fork.yml config -q
       - name: Kubernetes manifests (kubeconform)
         run: |
           curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz | tar xz kubeconform
@@ -101,10 +103,11 @@ jobs:
           $G stage --stage 2 --replica 1 --model-pvc models --host-network --ib --protocol rdma > out/s2.json
           $G proxy --proxy-endpoints http://cte-s0-r0:5100 > out/proxy.json
           ./kubeconform -strict -summary out/*.json
-      - name: Image build fails fast without a fork URL
+      - name: Legacy fork image build fails fast without a fork URL
         run: |
-          if docker build -f docker/Dockerfile --build-arg BASE_IMAGE=python:3.11-slim --build-arg BUILD_CONNEX_RS=0 . > build.log 2>&1; then exit 1; fi
-          grep -q "set --build-arg VLLM_FORK_REPO" build.log
+          if docker build -f docker/Dockerfile --build-arg PP_ENGINE=fork --build-arg BASE_IMAGE=python:3.11-slim \
+              --build-arg BUILD_CONNEX_RS=0 . > build.log 2>&1; then exit 1; fi
+          grep -q "needs --build-arg VLLM_FORK_REPO" build.log
       - name: Image build fails fast without connex-rs source
         # this checkout has no submodules; an empty CONNEX_RS_REPO leaves no source
         run: |

@@ -14,7 +14,7 @@ while [ $SECONDS -lt $end ]; do
     if [ "$st" = 0 ]; then
       kubectl -n "$NS" get $pod --no-headers | grep -q "1/1" || ok=0
     else
-      kubectl -n "$NS" logs $pod 2>/dev/null | grep -q "entering tight pipeline loop" || ok=0
+      kubectl -n "$NS" logs $pod 2>/dev/null | grep -qE "entering tight pipeline loop|CONNEX_PP_STAGE_READY" || ok=0
     fi
   done
   [ "$(kubectl -n "$NS" get pods -l pipeline=$P$SEL --no-headers 2>/dev/null | wc -l)" -gt 0 ] || ok=0

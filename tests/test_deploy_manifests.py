@@ -16,8 +16,8 @@ def _env(item):
     return {e["name"]: e.get("value") for e in item["spec"]["template"]["spec"]["containers"][0]["env"]}
 
 
-def test_pipeline_p2p_defaults():
-    d = M.generate(["pipeline", "--nodes", "a,b", "--model-host-path", "/m"])
+def test_fork_pipeline_p2p_defaults():
+    d = M.generate(["pipeline", "--engine", "fork", "--nodes", "a,b", "--model-host-path", "/m"])
     assert [(i["kind"], i["metadata"]["name"]) for i in d["items"]] == [
         ("Deployment", "cte-s0-r0"), ("Service", "cte-s0-r0"), ("Deployment", "cte-s1-r0")]
     env = _env(d["items"][2])
@@ -33,7 +33,7 @@ def test_etcd_ib_pvc_and_config(tmp_path, monkeypatch):
     cfg = tmp_path / "c.json"
     cfg.write_text(json.dumps({"namespace": "ns1", "model_pvc": "models"}))
     monkeypatch.setenv("CONNEX_K8S_IMAGE", "img:1")
-    d = M.generate(["stage", "--config", str(cfg), "--stage", "1", "--replica", "1", "--ib",
+    d = M.generate(["stage", "--engine", "fork", "--config", str(cfg), "--stage", "1", "--replica", "1", "--ib",
                     "--metadata", "etcd", "--etcd", "etcd:2379", "--no-host-network"])
     (item,) = d["items"]
     pod = item["spec"]["template"]["spec"]
@@ -45,13 +45,33 @@ def test_etcd_ib_pvc_and_config(tmp_path, monkeypatch):
     assert {"name": "model", "persistentVolumeClaim": {"claimName": "models", "readOnly": True}} in pod["volumes"]
 
 
+def test_upstream_pipeline_defaults():
+    d = M.generate(["pipeline", "--num-stages", "3", "--stage-replicas", "2", "--model-host-path", "/m"])
+    names = [(i["kind"], i["metadata"]["name"]) for i in d["items"]]
+    assert names == [("Deployment", "cte-s0-r0"), ("Service", "cte-s0-r0"),
+                     ("Deployment", "cte-s1-r0"), ("Service", "cte-s1-r0"),
+                     ("Deployment", "cte-s1-r1"), ("Service", "cte-s1-r1"),
+                     ("Deployment", "cte-s2-r0"), ("Service", "cte-s2-r0"),
+                     ("Deployment", "cte-s2-r1"), ("Service", "cte-s2-r1")]
+    s0 = _env(d["items"][0])
+    assert s0["PP_ENGINE"] == "upstream" and "ROUTER_ADDR" not in s0
+    assert json.loads(s0["PP_STAGES"]) == [
+        ["cte-s1-r0.connex.svc.cluster.local:47120", "cte-s1-r1.connex.svc.cluster.local:47122"],
+        ["cte-s2-r0.connex.svc.cluster.local:47220", "cte-s2-r1.connex.svc.cluster.local:47222"]]
+    s1r1 = _env(d["items"][4])
+    assert s1r1["CONTROL_PORT"] == "47122" and s1r1["NUM_GPU_BLOCKS"] == s0["NUM_GPU_BLOCKS"]
+    svc = d["items"][5]
+    assert svc["spec"]["clusterIP"] == "None"
+    assert [p["port"] for p in svc["spec"]["ports"]] == [47122, 47123]
+
+
 def test_errors():
     with pytest.raises(SystemExit):
         M.generate(["pipeline", "--nodes", "a,b"])            # no model source
     with pytest.raises(SystemExit):
         M.generate(["pipeline", "--nodes", "a", "--model-host-path", "/m"])  # 1 node, 2 stages
     with pytest.raises(SystemExit):
-        M.generate(["stage", "--model-host-path", "/m", "--metadata", "etcd"])
+        M.generate(["stage", "--engine", "fork", "--model-host-path", "/m", "--metadata", "etcd"])
 
 
 def test_router():
@@ -92,7 +112,7 @@ def test_two_pipelines_share_a_namespace_without_clobbering():
     assert {i["metadata"]["name"] for i in b} == {"connex-front-router"}
     sel = a[0]["spec"]["selector"]["matchLabels"]
     assert sel["router"] == "a-front-router" and a[1]["spec"]["selector"] == sel
-    st = M.generate(["stage", "--prefix", "a", "--router-name", "a-front-router",
+    st = M.generate(["stage", "--engine", "fork", "--prefix", "a", "--router-name", "a-front-router",
                      "--model-host-path", "/m"])["items"][0]
     assert _env(st)["ROUTER_ADDR"] == "a-front-router.connex.svc.cluster.local:15555"
     pa = M.generate(["proxy", "--prefix", "a", "--proxy-endpoints", "http://a-s0-r0:5100"])["items"]
@@ -109,11 +129,11 @@ def test_host_network_ports_unique_per_node():
     seen = set()
     for r in (0, 1):
         for st in range(4):
-            dep = M.generate(["stage", "--num-stages", "4", "--stage", str(st), "--replica", str(r),
+            dep = M.generate(["stage", "--engine", "fork", "--num-stages", "4", "--stage", str(st), "--replica", str(r),
                               "--host-network", "--model-host-path", "/m"])["items"][0]
             e = _env(dep)
             ports = {int(e["BASE_PORT"]), int(e["API_PORT"]), int(e["MOONCAKE_BASE_PORT"]) + st}
             assert len(ports) == 3 and not seen & ports, (dep["metadata"]["name"], ports)
             seen |= ports
-    s0 = _env(M.generate(["stage", "--host-network", "--model-host-path", "/m"])["items"][0])
+    s0 = _env(M.generate(["stage", "--engine", "fork", "--host-network", "--model-host-path", "/m"])["items"][0])
     assert s0["API_PORT"] == "5100" and s0["BASE_PORT"] == "25500"

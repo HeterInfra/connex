@@ -89,7 +89,7 @@ K=2 is only 1.27x and not ~2x has not been profiled yet. The suspects are
 stage-0 per-step CPU time and the synchronous send_step on the critical path.
 
 Repro: `CONNEX_PP_INFLIGHT=K MOONCAKE_PROTOCOL=tcp docker compose -f
-docker/docker-compose.yml up` (the image applies apply_all.py at build time),
+docker/docker-compose.fork.yml up` (the image applies apply_all.py at build time),
 then `benchmarks/k8s/closed_loop.py --url http://127.0.0.1:8000`. P2PHANDSHAKE needs the communicator fix that advertises
 ip:get_rpc_port() (the TE listens on a random RPC port, so ip:MOONCAKE_BASE_PORT
 got connection refused).

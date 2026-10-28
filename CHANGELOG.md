@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+**Upstream vLLM is the default for pipeline parallelism** ([`docs/deploy.md`](docs/deploy.md))
+- `docker/Dockerfile` (`PP_ENGINE=upstream`, default) builds on
+  `vllm/vllm-openai:latest`, merges the branches of vllm#63897/#63898/#63899
+  into vLLM main and installs it with the precompiled kernels
+  (`VLLM_INSTALL=precompiled|source|none`); `PP_ENGINE=fork` keeps the
+  external-PP fork build as a legacy option.
+- `docker/launch_stage.sh` starts upstream stages (`PP_STAGES`,
+  `CONTROL_PORT`); `docker/docker-compose.yml` is a 2-stage pipeline with two
+  stage-1 replicas (the fork demo moved to `docker/docker-compose.fork.yml`);
+  `deploy/k8s/manifests.py --engine upstream|fork`, `--stage-replicas`.
+
 **Pipeline parallelism on upstream vLLM** ([`integrations/vllm/README.md`](integrations/vllm/README.md#upstream-vllm-no-fork), [`docs/results.md`](docs/results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork))
 - `connex.adapters.vllm.pp`: `ConnexPPGroup` (`--pp-group-cls`; hidden
   states and the V2 runner's sampled tokens over connex-rs, the receiving

@@ -51,7 +51,7 @@ draining rank, for a drain), else the checkpoint. If a source dies during
 the copy, the move is re-planned from another source; repair is best effort
 when the up ranks have too few slots (`uncovered()` reports what is left).
 
-## vLLM (0.32, upstream, no fork)
+## vLLM (upstream, no fork; validated with 0.32)
 
 vLLM's EP keeps a physical-to-logical expert map for its EPLB (expert
 parallel load balancer) and routes each token to one replica of its logical
@@ -126,7 +126,7 @@ For a hard failure, recovery is one level up:
 
 `benchmarks/ep/ep_failover.py` measures this end to end.
 
-## SGLang (0.5.22, upstream, no fork)
+## SGLang (upstream, no fork; validated with 0.5.22)
 
 SGLang keeps the placement of an EP deployment in one
 `ExpertLocationMetadata` per process: `physical_to_logical_map`
