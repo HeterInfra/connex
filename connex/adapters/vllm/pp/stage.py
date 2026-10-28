@@ -27,6 +27,7 @@ import queue
 import signal
 import sys
 import threading
+import time
 
 log = logging.getLogger("vllm.connex_pp")
 
@@ -78,7 +79,21 @@ class StageServer:
         self.out_q.put(("E", 0, 0, self.ex.execute_model(so, non_block=True), None))
         self.live_reqs.clear()
 
+    def _watch_workers(self) -> None:
+        """Exit as soon as one of this stage's worker processes (a TP rank)
+        dies, so stage 0 sees the stage fail at once: the surviving ranks
+        would otherwise block in their collectives, and vLLM's own worker
+        monitor took about 10 s to bring the stage down here."""
+        procs = [w.proc for w in getattr(self.ex, "workers", [])]
+        while procs:
+            for p in procs:
+                if not p.is_alive():
+                    log.error("connex-pp: stage %d worker %s died; exiting", self.stage, p.pid)
+                    os._exit(1)
+            time.sleep(0.05)
+
     def serve_forever(self) -> None:
+        threading.Thread(target=self._watch_workers, name="cx-stage-watch", daemon=True).start()
         threading.Thread(target=self._reply_loop, name="cx-stage-reply", daemon=True).start()
         while True:
             peer, msg = self.q.get()

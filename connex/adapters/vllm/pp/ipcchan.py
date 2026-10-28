@@ -106,6 +106,25 @@ _counter = 0
 _counter_lock = threading.Lock()
 
 
+def _remove_stale_flags() -> None:
+    """Flag files of processes that died without cleaning up (SIGKILL)."""
+    try:
+        names = [n for n in os.listdir("/dev/shm") if n.startswith("cxpp-")]
+    except OSError:
+        return
+    for n in names:
+        try:
+            pid = int(n.split("-")[1])
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            try:
+                os.unlink("/dev/shm/" + n)
+            except OSError:
+                pass
+        except (ValueError, PermissionError, IndexError):
+            pass
+
+
 class TxChannel:
     """Sender end; ``info`` is what the receiver needs to open it."""
 
@@ -114,6 +133,8 @@ class TxChannel:
         with _counter_lock:
             _counter += 1
             cid = _counter
+        if cid == 1:
+            _remove_stale_flags()
         self.n = num_slots
         self.slot_bytes = (slot_bytes + _ALIGN - 1) // _ALIGN * _ALIGN
         self.ring = torch.empty(self.n * self.slot_bytes, dtype=torch.uint8, device=device)

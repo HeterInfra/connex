@@ -24,6 +24,7 @@ class ConnexPPWorker(Worker):
         begin = getattr(group, "begin_step", None)
         if begin is not None:
             begin(getattr(scheduler_output, ROUTE_ATTR, None))
+            group.before_step()
         return super().execute_model(scheduler_output)
 
     def compile_or_warm_up_model(self, *args, **kwargs):

@@ -83,6 +83,7 @@ spare again.
 | `CONNEX_RS_LOCAL_IP` | vLLM's host IP | address to listen on (use the RDMA interface's) |
 | `CONNEX_PP_RING_MB` | from the config | registered GPU buffer per direction for RDMA ((PP+1) steps of hidden states) |
 | `CONNEX_PP_CUDA_IPC` | 1 | same-host stage pairs over CUDA IPC (0: RDMA loopback) |
+| `CONNEX_PP_XHOST_STREAM_WAIT` | 0 | between hosts, let streams wait for data a Python thread releases (faster, can deadlock against GIL-holding device syncs) |
 | `CONNEX_PP_STEP_TIMEOUT_S` | 60 | a step without reply after this long triggers a ping; no pong = failover |
 | `CONNEX_PP_REPLACE_TIMEOUT_S` | 120 | how long stage 0 waits for a live replacement |
 | `CONNEX_RS_HEARTBEAT_MS` / `_TIMEOUT_MS` | 1000 / 3000 | connex-rs heartbeat for hung peers |
@@ -98,7 +99,7 @@ spare again.
 | a replica shared by several pipelines | no: one pipeline at a time (spares are taken over) | yes |
 | membership | static list in `CONNEX_PP_STAGES` | front-router, leases |
 | data plane | connex-rs | Mooncake TE, connex-rs, UCX, ZeroMQ |
-| stage-0 TP > 1 | serving yes; failover hangs | with the resume proxy |
+| stage-0 TP > 1 | yes, with failover | with the resume proxy |
 
 Stage pairs on one host exchange the hidden states and the sampled tokens
 over CUDA IPC: the sender's GPU copies into a ring the receiver has mapped
@@ -110,14 +111,18 @@ uses RDMA loopback instead. When a peer dies its flags are released at once
 and its memory is unmapped once the local streams have passed that point,
 so a replica restarted on the same GPU finds its memory free.
 
-Known limitations: failover with TP > 1 on stage 0 hangs (the TP ranks of
-stage 0 block in their in-group broadcast of the sampled tokens; see
-`docs/results.md` section 13). Between hosts, the receive paths make a CUDA
-stream wait for a flag that a Python thread sets. A CUDA call that holds the GIL and synchronizes the
-device (a first-time kernel module load) would deadlock against it, so
-receives wait on the CPU during warmup (`ConnexPPWorker`), where kernels
-load. A kernel that is first loaded later, while traffic flows, could still
-hang the stage.
+Between hosts the receiving stage waits for the bytes on the CPU before it
+queues the step (and fills the sampled tokens right before the step that
+uses them): a stream wait released by a Python thread of the same process
+can deadlock against a CUDA call that holds the GIL and waits for the device
+(a first Triton kernel load). This costs about 5 ms per token at PP=2, C=1
+across two hosts; `CONNEX_PP_XHOST_STREAM_WAIT=1` trades the safety back for
+the speed.
+
+Known limitation: with one stage per instance and TP > 1, only TP rank 0 of
+a stage is a pipeline endpoint and shares each step's hidden states with the
+other ranks over NCCL; at high load this costs a few percent of throughput
+(`docs/results.md` section 13).
 
 ## The external-PP fork
 

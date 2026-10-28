@@ -143,6 +143,7 @@ class Replica:
     alive: bool = False
     busy: bool = False          # owned by another pipeline
     pong: float = 0.0
+    alive_since: float = 0.0
 
 
 @dataclass
@@ -280,6 +281,8 @@ class ConnexPPExecutor(MultiprocExecutor):
             _, data_url, owner = msg
             with self.cv:
                 r.data_url = data_url
+                if not r.alive:
+                    r.alive_since = time.monotonic()
                 r.alive = True
                 r.busy = owner not in (None, self.owner)
                 self.cv.notify_all()
@@ -295,7 +298,8 @@ class ConnexPPExecutor(MultiprocExecutor):
         r = self._find(peer)
         if r is None:
             return
-        if r.alive and self._answers_ping(r):
+        if (r.alive and time.monotonic() - r.alive_since < 30.0
+                and self._answers_ping(r, timeout=0.5)):
             # A late event about an earlier incarnation (a replica restarted
             # under the same identity) or a failed connect attempt: the live
             # one answers. Failing it over would recompute every request
@@ -395,7 +399,15 @@ class ConnexPPExecutor(MultiprocExecutor):
             return super().execute_model(scheduler_output, non_block)
         so = scheduler_output
         forward = so.total_num_scheduled_tokens > 0
-        with self.lock:
+        with self.cv:
+            # A stage without a live replica (e.g. restarting in place): wait
+            # for one instead of running a step nobody downstream will see.
+            # Such a step would never complete, and stage 0's receive for it
+            # would hold its streams (and, with TP > 1, its in-group
+            # broadcast) forever.
+            deadline = time.monotonic() + self.replace_timeout
+            while any(r is None for r in self.route) and time.monotonic() < deadline:
+                self.cv.wait(0.5)
             self.seq += 1
             seq, epoch = self.seq, self.epoch
             doomed = self.lost_pending

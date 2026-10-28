@@ -20,6 +20,16 @@
   on par with NCCL end to end, 32 MB per hop 0.80 ms vs 1.54 ms; safe unmap
   of a dead peer's ring; failure events confirmed with a ping. Kill
   comparison with stock vLLM under a restart loop in `docs/results.md`.
+- Fixes: steps wait until every stage has a live replica (a step launched
+  with a hole in the route hung stage 0's TP ranks in the sampled-token
+  broadcast; PP2 x TP2 failover now completes all requests, with and without
+  a spare); the stage server exits within 50 ms when a TP rank dies; failure
+  events right after a rejoin are confirmed with a ping; stale flag files of
+  killed processes are removed.
+- Between hosts, receives wait on the CPU instead of on a stream released by
+  a Python thread (deadlock with GIL-holding device syncs seen in a
+  cross-host failover); about 5 ms per token at PP=2, C=1;
+  `CONNEX_PP_XHOST_STREAM_WAIT=1` to opt out.
 
 **Across hosts and mixed GPUs** ([`docs/results.md`](docs/results.md#12-across-hosts-and-mixed-gpus), [`docs/design/multi-host-validation.md`](docs/design/multi-host-validation.md))
 - PD (vLLM, SGLang), TP PD and EP validated with instances on different

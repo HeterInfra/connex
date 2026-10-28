@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections import deque
 from typing import Any
 
 import torch
@@ -43,6 +44,11 @@ from connex.adapters.vllm.pp.link import StageLink
 log = logging.getLogger("vllm.connex_pp")
 
 MODEL_ID = os.getenv("CONNEX_PP_MODEL_ID", "cxpp")
+# Between hosts, let streams wait for data that a Python thread releases
+# (faster: about 5 ms per token at PP=2, C=1 here, but a CUDA call that holds
+# the GIL and waits for the device, e.g. a first kernel load, can deadlock
+# against it). Default: wait on the CPU instead.
+XHOST_STREAM_WAIT = os.getenv("CONNEX_PP_XHOST_STREAM_WAIT", "0") == "1"
 
 
 class ConnexPPGroup(GroupCoordinator):
@@ -78,6 +84,8 @@ class ConnexPPGroup(GroupCoordinator):
         self._tp_sibling = None
         self._waiter = None
         self._pending_slots: dict[tuple, int] = {}
+        self._deferred: deque = deque()
+        self._step_count = 0
         self._local_step = self.stage_rank is not None
         # While set (warmup), receives wait on the CPU instead of queueing a
         # stream wait: a stream wait that only a Python thread of this
@@ -206,7 +214,12 @@ class ConnexPPGroup(GroupCoordinator):
         td = None
         if self.is_endpoint:
             t0 = time.perf_counter()
-            got = self.link.recv_tensors(key, blocking=self.blocking)
+            # From another host the bytes come through a Python thread, so
+            # do not queue a stream wait on them: wait here, on the CPU (see
+            # _defer_sampled for why a Python-released stream wait is unsafe).
+            src = self._route[(self.rank_in_group - 1) % self.world_size] if self._route else None
+            blocking = self.blocking or not (self._same_host(src) or XHOST_STREAM_WAIT)
+            got = self.link.recv_tensors(key, blocking=blocking)
             self.timing["recv_wait_s"] += time.perf_counter() - t0
             self.timing["steps"] += 1
             if got is None:
@@ -295,28 +308,69 @@ class ConnexPPGroup(GroupCoordinator):
             self.link.send_bytes(url, (epoch, -1, -2), ("chan", ch.info))
         ch.push([tensor.contiguous().view(-1).view(torch.uint8)])
 
+    def _same_host(self, url: str | None) -> bool:
+        """Same decision on every TP rank (only TP rank 0 has a link)."""
+        from connex.adapters.vllm.pp.link import IPC_ENABLED
+
+        own = self._route[self.rank_in_group] if len(self._route) > self.rank_in_group else None
+        return bool(IPC_ENABLED and url and own and url.split(":", 1)[0] == own.split(":", 1)[0])
+
     def _recv_sampled(self, tensor: torch.Tensor) -> None:
         key = self._bkey()
         src = self._route[self.world_size - 1] if self._route else None
-        if self.is_endpoint and src and self.link.same_host(src):
-            self._pop_sampled(src, key[0], tensor)
-        elif self.is_endpoint and self.blocking:
-            data = self.link.take(key)
-            if data is not None:
-                tensor.view(-1).view(torch.uint8).copy_(
-                    torch.frombuffer(bytearray(data), dtype=torch.uint8))
-        elif self.is_endpoint:
-            if self._waiter is None:
-                from connex.adapters.vllm.pp.hostwait import HostFlagWaiter
+        if self._same_host(src):
+            if self.is_endpoint:
+                self._pop_sampled(src, key[0], tensor)
+            if self.external and self.tp_size > 1:
+                torch.distributed.broadcast(tensor, src=self.tp.ranks[0],
+                                            group=self._tp_sibling)
+        elif self.blocking:
+            if self.is_endpoint:
+                data = self.link.take(key)
+                if data is not None:
+                    tensor.view(-1).view(torch.uint8).copy_(
+                        torch.frombuffer(bytearray(data), dtype=torch.uint8))
+            if self.external and self.tp_size > 1:
+                torch.distributed.broadcast(tensor, src=self.tp.ranks[0],
+                                            group=self._tp_sibling)
+        elif XHOST_STREAM_WAIT:
+            if self.is_endpoint:
+                if self._waiter is None:
+                    from connex.adapters.vllm.pp.hostwait import HostFlagWaiter
 
-                self._waiter = HostFlagWaiter(self.device)
-            slot = self._waiter.post(tensor)
-            self._pending_slots[key] = slot
-            # The filler releases the slot at once if the key's epoch was
-            # already aborted.
-            self._watch(key, slot)
-        if self.external and self.tp_size > 1:
-            torch.distributed.broadcast(tensor, src=self.tp.ranks[0], group=self._tp_sibling)
+                    self._waiter = HostFlagWaiter(self.device)
+                slot = self._waiter.post(tensor)
+                self._pending_slots[key] = slot
+                self._watch(key, slot)
+            if self.external and self.tp_size > 1:
+                torch.distributed.broadcast(tensor, src=self.tp.ranks[0],
+                                            group=self._tp_sibling)
+        else:
+            self._defer_sampled(key, tensor)
+
+    def _defer_sampled(self, key: tuple, tensor: torch.Tensor) -> None:
+        """From another host: queue nothing on the GPU now. The tensor is
+        consumed pp steps later; before_step() fills it on the CPU just before
+        that step. A stream wait released by one of our Python threads would
+        deadlock against a CUDA call that holds the GIL and waits for the
+        device (a first Triton kernel load does), and a new replica loads
+        kernels in its first steps: that hung a cross-host failover."""
+        self._deferred.append((self._step_count, key, tensor))
+
+    def before_step(self) -> None:
+        """Called at the start of every execute_model (ConnexPPWorker):
+        complete the sampled-token receives this step consumes."""
+        self._step_count += 1
+        depth = self.world_size
+        while self._deferred and self._deferred[0][0] <= self._step_count - depth:
+            _, key, tensor = self._deferred.popleft()
+            if self.is_endpoint:
+                data = self.link.take(key, timeout=60.0)
+                if data is not None:
+                    host = torch.frombuffer(bytearray(data), dtype=torch.uint8)
+                    tensor.view(-1).view(torch.uint8).copy_(host, non_blocking=False)
+            if self.external and self.tp_size > 1:
+                self.tp.broadcast(tensor, src=0)
 
     def _pop_sampled(self, src: str, epoch: int, tensor: torch.Tensor) -> None:
         """Same host: the last stage's GPU writes the tokens into its ring and

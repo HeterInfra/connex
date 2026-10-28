@@ -1152,34 +1152,69 @@ requests that finished all 128 tokens in the 120 s after the kill.
 | PP=2 NCCL, stage-1 worker | 0 / 32 (x3) | 1,794 / 2,206 / 2,473 | 57.5 / 63.3 / 62.0 s | 448 / 411 / 416 | 478 / 438 / 444 |
 | PP=2 Connex, active stage-1 replica (spare) | 32 / 32 (x3) | 0 | 0 s (largest gap 0.34 / 0.42 / 0.46 s) | 864 / 871 / 876 | 922 / 929 / 934 |
 | PP=2 x TP=2 NCCL, one TP rank of stage 1 | 0 / 32 (x3) | 547 / 1,481 / 1,170 | 60.7 / 60.1 / 60.6 s | 768 / 777 / 773 | 819 / 829 / 825 |
-| PP=2 x TP=2 Connex, one TP rank of stage 1, no spare | **0 / 32 (x3), failed** | 3,189 / 0 / 0 | not recovered | 0 | 0 |
+| PP=2 x TP=2 Connex, one TP rank of stage 1, no spare (restarted in place) | 32 / 32 (x3) | 0 | 23.6-24.3 s (largest gap 27.7-28.4 s) | 1,216-1,245 | 1,297-1,328 |
 
 Stock vLLM reloads the model in 49-50 s after the supervisor relaunches it
 (start to ready); the rest of the outage is detecting the dead engine and
 the exit. Every request in flight is lost and the clients see errors.
+Without a spare, Connex keeps the requests and resumes them once the stage
+is back (the stage server restarts in 24-26 s; its in-flight requests wait
+instead of failing).
 
-**The PP=2 x TP=2 Connex rows failed.** With no spare replica on this host
-the killed stage was restarted by a restart loop (ready again after 26 s),
-and stage 0 should have resumed on it. Instead stage 0's two TP ranks hung
-in the in-group broadcast of the sampled tokens (NCCL timeout after
-10 min); the first run's 32 requests timed out, and in the next two the API
-was already down. A failure-event bug made it worse and is fixed (a late
-"failed" event about the killed incarnation marked the restarted replica
-dead again and again, each time recomputing every request; events are now
-confirmed with a ping), but the hang remains: failover with TP > 1 on stage
-0 is not working. TP > 1 on a downstream stage, and stage 0 at TP=1, are
-unaffected.
+**PP=2 x TP=2 failover (first attempt failed 3 of 3, now fixed).** Root
+cause: while stage 1 had no live replica (restarting in place), stage 0 kept
+scheduling steps with a hole in the route. Nobody downstream ran them, so
+their outputs never came, and stage 0's receive of their sampled tokens
+held its broadcast stream; with TP=2 the in-group broadcast of those tokens
+then blocked both TP ranks until the NCCL timeout. Steps now wait (in the
+executor, before anything is launched) until every stage has a live
+replica. Two more fixes from these runs: the stage server exits within
+50 ms when one of its TP ranks dies (vLLM's own monitor took about 10 s
+here), and a "failed" event that arrives within 30 s of a replica's rejoin
+is confirmed with a ping (late events about the killed incarnation had made
+stage 0 fail the restarted replica over and over).
 
-Earlier findings: in one of 28 kills of the first series (RDMA, one host)
-all 16 requests of a correctness run hung; the cause found since (the same
-late failure event repeatedly marking a live replica dead) fits, but was not
-confirmed for that run. An earlier version that only preempted the
-requests, without evicting their blocks from the prefix cache, completed
-every request but left 59 tokens off the argmax in 14 of 16 requests.
+Validation after the fixes, 32 streaming clients, 3 kills each: no spare
+(above): 32/32 in flight completed each time; with a spare, the three
+replicas on three hosts (stage 0 TP=2, two stage-1 replicas TP=2, one TP
+rank of the active replica killed): 32/32, largest gap 0.24 / 0.33 / 2.14 s.
+Greedy runs with a kill (16 x 200 tokens), 3 without and 3 with a spare:
+0 tokens off the argmax.
+
+**PP=2, repeated kills.** 32 more kills (16 under load, 16 during greedy
+runs) after the fixes: 4,832 of 4,832 requests completed, 0 errors, largest
+gap per run 0.40-2.71 s (the first 16 with a 1.5 s ping on every failure
+event, the second 16 with the ping only right after a rejoin: 0.40-1.63 s);
+0 tokens off the argmax. The earlier unexplained hang (1 in 14) did not
+recur.
+
+**Throughput of PP=2 x TP=2, one stage per instance, at C=32** (1194 ±46 vs
+1255 ±5 tok/s). Per run: 1247, 1168, 1168 tok/s; the slow runs have 10-20%
+higher TTFT. In this mode only TP rank 0 of a stage is a pipeline endpoint
+and it shares each step's hidden states with the other TP rank over NCCL
+(`broadcast_tensor_dict`), an extra copy of up to 32 MB per prefill step on
+the critical path; in-process mode, where every TP rank has its own
+endpoint, matches NCCL (1251 ±15). Not fixed: it needs one endpoint per TP
+rank and per-rank routes.
+
+**Between hosts, the receiving side now waits on the CPU.** A CUDA stream
+wait that only a Python thread of the same process can release deadlocks
+against CUDA calls that hold the GIL and wait for the device; a first Triton
+kernel load does, and a freshly restarted replica loads kernels in its first
+steps. That is what hung a cross-host TP=2 failover (the new replica's TP
+rank 0 never joined the in-group broadcast). Same-host hops are released by
+the sender's GPU (no Python), so they keep the stream wait. Between hosts
+the hidden states are now received on the CPU before the step is queued,
+and the sampled tokens are filled on the CPU right before the step that
+consumes them. Cost, two hosts, PP=2, 3 runs: TPOT 34.2 vs 28.9 ms at C=1,
+46.0 vs 41.9 ms at C=32, throughput -9% at C=32 (stock NCCL: 28.3 / 41.0 ms).
+`CONNEX_PP_XHOST_STREAM_WAIT=1` restores the faster stream waits with the
+risk. A release that needs no Python on either side (the sender writing the
+receiver's flag over RDMA) would remove the trade-off; not done.
 
 **Not covered.** A replica shared by several pipelines (the fork path
-supports it; here a replica serves one stage 0 at a time), failover with
-TP > 1 on stage 0 (fails, above), more than one failure at a time, stage 0
+supports it; here a replica serves one stage 0 at a time), more than one
+failure at a time, stage 0
 failures (the API instance; use the resume proxy of section 4), PP across
 hosts with more than two stages.
 
