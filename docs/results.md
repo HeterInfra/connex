@@ -1275,7 +1275,7 @@ replica's sampled tokens of an earlier step, and those would need the new
 replica's GIL.
 
 Now neither side runs Python on the data path
-(`connex.adapters.vllm.pp.rdmachan`, connex-rs `Engine.put_chain`). The
+(`connex.adapters.vllm.pp.rdmachan`, connex-rs `Engine.put_chain`, connex-rs>=0.1.4). The
 receiver owns the slots (GPU memory for hidden states, pinned host memory
 for the sampled tokens) and flags in pinned host memory, all registered with
 connex-rs, and announces them to the sender. The sender's stream copies the

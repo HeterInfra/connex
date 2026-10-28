@@ -101,7 +101,7 @@ spare again.
 | `CONNEX_RS_LOCAL_IP` | vLLM's host IP | address to listen on (use the RDMA interface's) |
 | `CONNEX_PP_RING_MB` | from the config | registered GPU buffer per direction for RDMA ((PP+1) steps of hidden states) |
 | `CONNEX_PP_CUDA_IPC` | 1 | same-host stage pairs over CUDA IPC (0: RDMA loopback) |
-| `CONNEX_PP_RDMA_PUSH` | 1 | between hosts, the sender's NIC writes the receiver's ring and flag (needs connex-rs with `Engine.put_chain`, after 0.1.3); 0: one-sided reads, the receiver waits on the CPU |
+| `CONNEX_PP_RDMA_PUSH` | 1 | between hosts, the sender's NIC writes the receiver's ring and flag (needs connex-rs>=0.1.4, `Engine.put_chain`); 0: one-sided reads, the receiver waits on the CPU |
 | `CONNEX_PP_PUSH_MARGIN` | 8 | sampled tokens from a new (epoch, sender) use the push channel from this many steps on (the channel is announced on the first) |
 | `CONNEX_PP_TP_ENDPOINTS` | 1 | one stage per instance with TP > 1: one endpoint per TP rank (0: TP rank 0 receives and broadcasts over the TP group) |
 | `CONNEX_PP_TP_PORT_STRIDE` | 100 | data port of TP rank r = `CONNEX_PP_DATA_PORT` + stride·r |
@@ -134,7 +134,7 @@ and its memory is unmapped once the local streams have passed that point,
 so a replica restarted on the same GPU finds its memory free.
 
 Between hosts the same contract holds over RDMA
-(`connex.adapters.vllm.pp.rdmachan`): the receiver owns a ring (GPU memory
+(`connex.adapters.vllm.pp.rdmachan`, needs connex-rs>=0.1.4): the receiver owns a ring (GPU memory
 for hidden states, pinned host memory for sampled tokens) and flags in
 pinned host memory, registered with connex-rs, and announces them to the
 sender. The sender's stream copies into its registered buffer and writes a

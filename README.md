@@ -30,7 +30,7 @@ SIGCOMM 2026 paper ([Citation](#citation)).
 
 | Scenario | Engines | Status |
 |---|---|---|
-| 🔗 Multi-replica pipeline parallelism, in-flight failover | vLLM (upstream, with 3 proposed changes; legacy fork optional) | ✅ validated |
+| 🔗 Multi-replica pipeline parallelism, in-flight failover | vLLM (upstream, with 3 proposed changes; legacy fork optional) | ✅ validated, across hosts |
 | 📈 Elastic scale up / down | vLLM | ✅ validated |
 | 🔀 [Prefill-decode disaggregation](docs/pd-disaggregation.md), elastic P/D pools | vLLM, SGLang | ✅ validated, across hosts |
 | 🧩 [Tensor parallelism](docs/tp.md): a TP group is one endpoint | vLLM, SGLang | ✅ validated, groups within a host |
@@ -115,12 +115,14 @@ token differed from the greedy reference in any failure run.
 | Scenario | Steady state | Kill a process under load |
 |---|---|---|
 | Pipeline, 4 stages × 2 replicas | same latency as Mooncake TE | next token 0.01-0.83 s after the kill (Mooncake: 2-3 s) |
+| Pipeline on upstream vLLM, one host or across hosts | on par with NCCL: 2 hosts, PP=2 TPOT 28.32 ms vs 28.28 ms at C=1, 41.3-41.9 ms vs 41.6 ms at C=32; PP2×TP2 within 1 % | every in-flight request completes, gap 0.4-2.5 s with a spare, about 29 s restarted in place (NCCL: all in-flight requests lost, down 57-63 s) |
 | PD disaggregation, one host or across nodes | on par with NIXL (vLLM) and Mooncake (SGLang) | decode kill: KV re-pulled, max stall 0.63 s |
 | Tensor parallelism 2 | PD 1061 tok/s, TPOT 16 ms | one rank killed: whole group out in 0.16-0.57 s, stall 0.4 s |
 | Expert parallelism | 2,307 tok/s vs 2,338 for vLLM's EP | rank failure detected in 0.05 s, max stall 0.18 s (across nodes: 0.29 s, 0.37 s) |
 | Churn, replica killed every 60 s | | 99.2-99.6 % goodput, 100 % with the resume proxy |
 
-Full tables, setup and reproduction commands: [`docs/results.md`](docs/results.md).
+Full tables, setup and reproduction commands: [`docs/results.md`](docs/results.md)
+(pipeline on upstream vLLM: [section 13](docs/results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork)).
 
 ## Documentation
 

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `connex-ai[rs]` requires `connex-rs>=0.1.4,<0.2` (`Engine.put_chain` for
+  the cross-host PP push channel); submodule at connex-rs v0.1.4.
+
 **Upstream vLLM is the default for pipeline parallelism** ([`docs/deploy.md`](docs/deploy.md))
 - `docker/Dockerfile` (`PP_ENGINE=upstream`, default) builds on
   `vllm/vllm-openai:latest`, merges the branches of vllm#63897/#63898/#63899
@@ -42,8 +45,8 @@
   cross-host failover); about 5 ms per token at PP=2, C=1;
   `CONNEX_PP_XHOST_STREAM_WAIT=1` to opt out.
 - Between hosts, the sender's NIC now releases the receiver's stream
-  (`connex.adapters.vllm.pp.rdmachan`, needs connex-rs with
-  `Engine.put_chain`): the receiver owns the slots and flags, the sender's
+  (`connex.adapters.vllm.pp.rdmachan`, needs
+  connex-rs>=0.1.4, `Engine.put_chain`): the receiver owns the slots and flags, the sender's
   stream rings a doorbell and connex-rs writes the data, reads it back and
   writes the flag, so no Python thread on either side is on the data path.
   Two hosts, PP=2: 28.32 ms TPOT at C=1 (NCCL 28.28, CPU waits 34.2), C=32

@@ -67,7 +67,7 @@ _push_ok: bool | None = None
 
 
 def push_supported() -> bool:
-    """PUSH_ENABLED and a connex-rs with ``Engine.put_chain`` (after 0.1.3);
+    """PUSH_ENABLED and a connex-rs with ``Engine.put_chain`` (connex-rs>=0.1.4);
     without it cross-host receives wait on the CPU.
     Both ends of a hop are assumed to run the same install."""
     global _push_ok
