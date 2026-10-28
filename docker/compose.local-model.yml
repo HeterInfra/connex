@@ -5,6 +5,7 @@
 # daemon or docker-in-docker, a path on the daemon host).
 #   MODEL_DIR=/path/to/Llama-3-8B docker compose -f docker/docker-compose.yml \
 #       -f docker/compose.local-model.yml up -d
+# (legacy fork demo: docker-compose.fork.yml with compose.local-model.fork.yml)
 x-local-model: &local_model
   volumes:
     - ${MODEL_DIR:?set MODEL_DIR to a local model directory}:/model:ro
@@ -14,5 +15,4 @@ x-local-model: &local_model
 services:
   stage0: *local_model
   stage1: *local_model
-  stage0-r1: *local_model
   stage1-r1: *local_model

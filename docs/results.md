@@ -612,7 +612,7 @@ token ids.
 
 As on vLLM, routing every replica costs decode throughput and one routed
 replica per expert (the other warm standby) does not. Before the routing
-fix of the plugin (see [`ep.md`](ep.md#sglang-0522-upstream-no-fork)) all
+fix of the plugin (see [`ep.md`](ep.md#sglang-upstream-no-fork-validated-with-0522)) all
 three redundant configurations ran at 821-830 tok/s, TPOT 38 ms: SGLang's
 Qwen2-MoE ignored the replicas without an all-to-all backend and EP rank 0
 computed every expert (profile of 30 decode steps: `fused_moe_kernel`

@@ -9,7 +9,7 @@ traffic, is either SIGKILLed or SIGTERMed. B is a warm standby.
 Reproduce:
 
 The original single-container harness was tied to a local environment and is
-not shipped. The same experiment can be run with `docker/docker-compose.yml`
+not shipped. The same experiment can be run with `docker/docker-compose.fork.yml`
 (add a second stage-1 service with `REPLICA=1`) and `benchmarks/k8s/closed_loop.py`
 while killing or stopping one stage-1 container.
 

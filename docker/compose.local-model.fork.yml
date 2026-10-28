@@ -1,0 +1,18 @@
+# Overlay for docker-compose.fork.yml (legacy external-PP fork): serve a local model directory instead of a
+# Hugging Face download. MODEL_DIR must hold real files (config.json,
+# *.safetensors), not a Hugging Face cache snapshot whose files are symlinks
+# into ../../blobs, and must be visible to the Docker daemon (with a remote
+# daemon or docker-in-docker, a path on the daemon host).
+#   MODEL_DIR=/path/to/Llama-3-8B docker compose -f docker/docker-compose.fork.yml \
+#       -f docker/compose.local-model.fork.yml up -d
+x-local-model: &local_model
+  volumes:
+    - ${MODEL_DIR:?set MODEL_DIR to a local model directory}:/model:ro
+  environment:
+    MODEL_PATH: /model
+
+services:
+  stage0: *local_model
+  stage1: *local_model
+  stage0-r1: *local_model
+  stage1-r1: *local_model

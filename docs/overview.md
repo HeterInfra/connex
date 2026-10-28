@@ -106,7 +106,7 @@ chains whose stages fail over to each other.
 
 | Scenario | What exists in this repository | Status |
 |---|---|---|
-| Pipeline parallelism, many replica chains | `connex.pp` core, vLLM adapter and engine patches, SGLang communication prototype, compose and k8s deployment; on upstream vLLM: `connex.adapters.vllm.pp` (PP group, stage server, executor with replicas and failover) | **Implemented and validated** on GPUs (vLLM fork); on vLLM main with the three changes of RFC vllm#63818: PP 2/3/4, PP 2 x TP 2, one and two hosts, 0 off-argmax tokens, TPOT within run-to-run noise of NCCL on one host; downstream replica kills complete every in-flight request (stock vLLM loses them and is down about 60 s), including PP 2 x TP 2 with the stage restarted in place ([`results.md` section 13](results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork)); SGLang adapter is communication-side only |
+| Pipeline parallelism, many replica chains | on upstream vLLM: `connex.adapters.vllm.pp` (PP group, stage server, executor with replicas and failover), compose and k8s deployment; `connex.pp` core with the legacy fork's adapter and engine patches; SGLang communication prototype | **Implemented and validated** on vLLM main with the three changes of RFC vllm#63818 (the default): PP 2/3/4, PP 2 x TP 2, one and two hosts, 0 off-argmax tokens, TPOT within run-to-run noise of NCCL on one host; downstream replica kills complete every in-flight request (stock vLLM loses them and is down about 60 s), including PP 2 x TP 2 with the stage restarted in place ([`results.md` section 13](results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork)); also validated on the legacy external-PP fork; SGLang adapter is communication-side only |
 | Elasticity: scale up / down | front-router registration, leases and membership events; `ElasticPeerSet`; sticky replica-aligned chains in `connex.pp` | **Implemented and validated**: replicas join and leave a running deployment (`docs/design/elastic-scaling-performance.md`) |
 | Failover with in-flight request handover across replicas | correlation ids, idempotent retried steps, fast handover, re-prefill (`connex.pp`); resume proxy (`connex.serving.proxy`) | **Implemented and validated** for pipeline stages (all requests complete, greedy output correct, 2-3 s handover) |
 | Endpoint migration (same identity, new address) | re-registration with `address_changed`; MIGRATE handling in `ElasticPeerSet`; cutover state machine and shadow connections | Implemented, partly unit-tested; **not validated at scale** (re-adding a stage under the same identity has a known Mooncake limitation, see Limitations) |
@@ -126,7 +126,7 @@ chains whose stages fail over to each other.
 | mobility | `connex.elastic`, `connex.cutover_fsm`, `connex.mobility_control`, `connex.route_table` | elastic peer sets, versioned routes, cutover state machine, shadow connections |
 | transports | [connex-rs](https://github.com/HeterInfra/connex-rs) (default data plane with RDMA; submodule `third_party/connex-rs`), `connex.pp.endpoint`, `connex.ucx_transport`, `connex.mooncake_integration` | tensor transport over RDMA or TCP; KV block transfer for PD |
 | step protocol | `connex.pp` | `PipelineEndpoint`, correlation ids, K in flight, idempotent retries, sticky failover, handover, the `EngineHooks` protocol, wire format |
-| engine adapters | `connex.adapters.vllm`, `connex.adapters.sglang` | vLLM communicator for the fork's external pipeline mode (plus patches in `integrations/vllm/patches`); SGLang `pp_group` replacement (prototype); PD: vLLM `ConnexConnector` and SGLang `connex` transfer backend for upstream engines |
+| engine adapters | `connex.adapters.vllm`, `connex.adapters.sglang` | PP on upstream vLLM: `connex.adapters.vllm.pp`; legacy: communicator for the fork's external pipeline mode (plus patches in `integrations/vllm/patches`); SGLang `pp_group` replacement (prototype); PD: vLLM `ConnexConnector` and SGLang `connex` transfer backend for upstream engines |
 | PD transfer | `connex.pd` | engine-neutral KV transfer with renewable holds, data planes, PD pool membership |
 | expert parallelism | `connex.ep` | expert placement table and epochs, expert weight moves, EP controller, EP-group supervisor, vLLM and SGLang glue |
 | serving | `connex.serving.proxy`, `connex.serving.pd_router` | optional request retry/resume proxy; PD router (prefill then decode, elastic pools, failover) |
@@ -207,6 +207,53 @@ requests, and recompute requests reported missing
 
 ## Integration: multi-replica pipeline-parallel serving with vLLM
 
+Connex pipeline parallelism runs on the latest vLLM main as a plugin,
+`connex.adapters.vllm.pp`, selected by class name on the vLLM command line.
+It needs three small vLLM changes proposed in RFC
+[vllm#63818](https://github.com/vllm-project/vllm/issues/63818) (pluggable PP
+transport); until they are merged, vLLM is built from main with the branches
+of `https://github.com/yanyinglin/vllm` merged in: <!-- release-scan: allow -->
+
+| vLLM change | Branch |
+|---|---|
+| `--pp-group-cls`: a plugin supplies the PP `GroupCoordinator` ([vllm#63897](https://github.com/vllm-project/vllm/pull/63897)) | `feat/pluggable-pp-group` |
+| `--pipeline-stage-rank`: one stage per vLLM instance ([vllm#63898](https://github.com/vllm-project/vllm/pull/63898)) | `feat/external-pp-stages` |
+| `KVConnectorOutput.lost_kv_req_ids` / `lost_all_kv`: requests whose KV was lost are recomputed ([vllm#63899](https://github.com/vllm-project/vllm/pull/63899)) | `feat/recompute-lost-kv` |
+
+The image build (`docker/Dockerfile`, default `PP_ENGINE=upstream`) does
+this. Two modes:
+
+* **In-process:** stock vLLM PP (`-pp N`) with only the PP group replaced,
+  so hidden states and sampled tokens go over connex-rs instead of NCCL
+  (CUDA IPC between GPUs of one host, UCX/RDMA between hosts).
+* **One stage per instance:** stage 0 serves the API and schedules; it sends
+  each step to one replica of every downstream stage. When a replica on the
+  route dies (connex-rs peer-failure event, or a step timeout confirmed by a
+  ping), stage 0 moves the route to another replica, completes the steps in
+  flight as lost and reports the lost KV, so vLLM's scheduler recomputes the
+  running requests on the new route. Clients see a delay, not an error, and
+  a restarted replica rejoins as a spare.
+
+Quick start on one host with three GPUs (a 2-stage Llama-3-8B pipeline whose
+stage 1 has two replicas):
+
+```bash
+make image IMAGE=connex-vllm:dev
+export CONNEX_IMAGE=connex-vllm:dev HF_TOKEN=hf_...
+docker compose -f docker/docker-compose.yml up -d
+docker/smoke_test.sh
+docker compose -f docker/docker-compose.yml kill stage1   # requests continue on stage1-r1
+```
+
+Commands, variables and the comparison with the fork path:
+[`integrations/vllm/README.md`](../integrations/vllm/README.md#upstream-vllm-no-fork);
+results: [`results.md` section 13](results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork).
+[`docs/deploy.md`](deploy.md) covers every tier with copy-pasteable
+commands: CPU-only demo, one GPU box (docker compose), several hosts with
+RDMA or TCP, and Kubernetes (`deploy/k8s/manifests.py`).
+
+### Legacy: external-PP fork
+
 Each pipeline stage runs as its own vLLM process and registers as a LID
 `(model, stage, 0, replica)`. Several replica chains share one front-router;
 a stage-0 replica keeps its traffic on its own chain and, when a downstream
@@ -222,10 +269,9 @@ Clients reach stage 0 of either replica directly or through the optional
 resume proxy; every stage registers, heartbeats and receives membership
 events through the Connex front-router (routes, leases, health).
 
-It needs a vLLM fork with an **external pipeline mode**
-(`--pipeline-stage-mode external`, one process per stage); upstream vLLM has
-neither the mode nor a plugin hook for pipeline communicators. The image
-build (`docker/Dockerfile`) installs the fork, copies the communicators and
+This path needs the external-PP vLLM fork (commit `380186d57`,
+`--pipeline-stage-mode external`, one process per stage). The image build
+with `PP_ENGINE=fork` (`docker/Dockerfile`) installs the fork, copies the communicators and
 applies the engine patches (K steps in flight, re-prefill, downstream CUDA
 graphs and external-PP fixes); see
 [`integrations/vllm/README.md`](../integrations/vllm/README.md).
@@ -234,26 +280,22 @@ graphs and external-PP fixes); see
 > repository and is not yet published, so the image build has no default for
 > it: `VLLM_FORK_REPO` is a placeholder for the git URL of a copy of that
 > fork you can access (the integration is validated at fork commit
-> `380186d57`, the default `VLLM_FORK_REF`). The library, the CPU-only demo
-> and the test suite need neither the fork nor a GPU.
+> `380186d57`, the default `VLLM_FORK_REF`).
 
-Quick start on one host with GPUs (two replicas of a 2-stage Llama-3-8B
+Quick start for the fork path on one host with GPUs (two replicas of a 2-stage Llama-3-8B
 pipeline; four GPUs, or two GPUs of 40 GB or more with `GPU2=0 GPU3=1
-GPU_MEM_UTIL=0.4`, started one replica after the other as in `docs/deploy.md`):
+GPU_MEM_UTIL=0.4`, started one replica after the other as in `docs/deploy.md`, section Legacy):
 
 ```bash
-make image IMAGE=connex-vllm:dev VLLM_FORK_REPO=<git URL of the external-PP vLLM fork>
-export CONNEX_IMAGE=connex-vllm:dev HF_TOKEN=hf_...
-docker compose -f docker/docker-compose.yml --profile proxy up -d
+make image PP_ENGINE=fork IMAGE=connex-vllm:fork VLLM_FORK_REPO=<git URL of the external-PP vLLM fork> \
+    BASE_IMAGE=<vLLM image matching the fork's torch>
+export CONNEX_IMAGE=connex-vllm:fork HF_TOKEN=hf_...
+docker compose -f docker/docker-compose.fork.yml --profile proxy up -d
 docker/smoke_test.sh                          # replica 0
 docker/smoke_test.sh http://127.0.0.1:8010    # replica 1
 docker/smoke_test.sh http://127.0.0.1:5199    # through the resume proxy
-docker compose -f docker/docker-compose.yml kill stage1-r1   # replica 1's requests hand over to replica 0's stage 1
+docker compose -f docker/docker-compose.fork.yml kill stage1-r1   # replica 1's requests hand over to replica 0's stage 1
 ```
-
-[`docs/deploy.md`](deploy.md) covers every tier with copy-pasteable
-commands: CPU-only demo, one GPU box (docker compose), several hosts with
-RDMA or TCP, and Kubernetes (`deploy/k8s/manifests.py`).
 
 
 ## Limitations
@@ -262,9 +304,12 @@ RDMA or TCP, and Kubernetes (`deploy/k8s/manifests.py`).
   PD runs on upstream vLLM and SGLang as plugins, validated on one host and
   across hosts (see [`docs/pd-disaggregation.md`](pd-disaggregation.md) for
   its limits); attention-FFN disaggregation is roadmap.
-- **vLLM fork required.** vLLM support needs the external-PP vLLM fork. The
-  communicators and patches use vLLM internals and are not a plugin for
-  upstream vLLM.
+- **Upstream PP needs three proposed vLLM changes.** Pipeline parallelism
+  runs on vLLM main plus vllm#63897, #63898 and #63899 (built from their
+  branches until they are merged). Compared with the legacy fork path, a
+  failover recomputes every running request of the pipeline, a replica
+  serves one pipeline at a time, and membership is a static list
+  (`CONNEX_PP_STAGES`) rather than the front-router.
 - **Handover after a process death is well under 1 s with connex-rs**
   (transport event), **2-3 s with Mooncake** (router lease or a 3 s
   data-path timeout, plus probe). A hung or partitioned peer (alive kernel,
@@ -273,19 +318,20 @@ RDMA or TCP, and Kubernetes (`deploy/k8s/manifests.py`).
 - **SGLang is a prototype.** `connex.adapters.sglang` covers the
   communication side; the engine side (state report, re-prefill on the
   scheduling rank) is not implemented.
-- **Stage-0 deaths need the proxy.** Without it, requests on a dying stage-0
+- **Stage-0 deaths need the proxy** (fork path; on the upstream path stage 0
+  has no replica yet). Without it, requests on a dying stage-0
   replica are lost. The proxy runs as a single replica, and its retry budget
   (`--max-attempts`, spent in under 0.5 s) does not span a ~1 s outage of the
   only endpoint; give it at least two stage-0 replicas.
 - **UCX in TCP mode uses the eager protocol only**, so an abrupt peer kill
   can drop messages still in flight; retry at the request level. UCX is
   initialised once per process; run one `UCXTransport` per process.
-- Stages may run with tensor parallelism > 1 (engine patch 16, TP rank 0 is
+- Fork path: stages may run with tensor parallelism > 1 (engine patch 16, TP rank 0 is
   the stage's endpoint) only with `CONNEX_PP_INFLIGHT=1`; validated on one
   host with Mooncake over TCP and RDMA ([`docs/tp.md`](tp.md)). Speculative decoding and
   structured output are not covered. A request is aborted after more than
   `CONNEX_PP_REPREFILL_MAX` (8) failovers.
-- With Mooncake, re-adding a single killed stage under the same replica
+- Fork path with Mooncake: re-adding a single killed stage under the same replica
   identity can break its peers; restart the whole replica chain. connex-rs
   supports single-stage rejoin.
 - connex-rs without RDMA works but is slow (UCX emulates one-sided reads over

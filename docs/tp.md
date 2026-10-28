@@ -4,8 +4,11 @@ Connex treats a tensor-parallel (TP) group as **one mobile endpoint**. The
 all-reduce inside the group stays on NCCL/NVLink; Connex moves data between
 groups (prefill to decode, stage to stage) and decides when a group as a
 whole joins, fails or comes back. This page covers prefill-decode
-disaggregation with TP > 1 (vLLM 0.32 and SGLang 0.5.22, both as plugins on
-upstream engines), pipeline stages with TP > 1 (the external-PP vLLM fork),
+disaggregation with TP > 1 (vLLM and SGLang, both as plugins on upstream
+engines; validated with vLLM 0.32 and SGLang 0.5.22), pipeline stages with
+TP > 1 (on upstream vLLM with `connex.adapters.vllm.pp`, see
+[`integrations/vllm/README.md`](../integrations/vllm/README.md#upstream-vllm-no-fork);
+the sections below on pipeline stages describe the legacy external-PP fork),
 and what happens when one rank of a group dies. Measurements are in
 [`results.md` section 11](results.md#11-tensor-parallelism).
 
@@ -106,7 +109,7 @@ python -m connex.serving.pd_router --front-router tcp://<router>:15555 --model <
 #        "http_url": "http://<host>:<port>", "replica": <i>}
 ```
 
-## Pipeline stages with TP > 1
+## Pipeline stages with TP > 1 (legacy external-PP fork)
 
 Engine patch 16 (`integrations/vllm/patches/patch_external_pp_tp.py`,
 applied by `apply_all.py`) lets an external-PP stage run with

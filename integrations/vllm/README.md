@@ -1,31 +1,48 @@
 # vLLM integration
 
-There are two ways to run Connex pipeline parallelism on vLLM:
+Connex pipeline parallelism runs on the latest vLLM main as a plugin,
+`connex.adapters.vllm.pp`, selected by class name on the vLLM command line.
+It needs three small changes to vLLM that are proposed upstream (below);
+everything else (transport, replicas, failover) lives in Connex. This is the
+default path, and the image in `docker/Dockerfile` builds it.
 
-* **Upstream vLLM, no fork** (`connex.adapters.vllm.pp`, this section): a
-  plugin selected by class name on the vLLM command line. It needs three
-  small changes to vLLM that are proposed upstream (below); everything else
-  (transport, replicas, failover) lives in Connex.
-* **The external-PP fork with engine patches** (the files listed further
-  down): the original path, still supported, with features the upstream
-  path does not have yet (see the comparison table).
+The original path, the external-PP vLLM fork with engine patches, is kept as
+a legacy option ([below](#legacy-external-pp-fork)).
 
 ## Upstream vLLM (no fork)
 
 ### What vLLM needs
 
 Part of the vLLM RFC [#63818](https://github.com/vllm-project/vllm/issues/63818)
-(pluggable PP transport). Until these are merged, build vLLM from the
-branches (each is one or two commits on vLLM main):
+(pluggable PP transport). Until these are merged, build vLLM from main with
+the branches of `https://github.com/yanyinglin/vllm` merged in (each is one <!-- release-scan: allow -->
+or two commits on vLLM main):
 
-| vLLM change | Branch | Needed for |
-|---|---|---|
-| `--pp-group-cls`: a plugin supplies the PP `GroupCoordinator`, including the V2 model runner's sampled-token broadcast (`sibling_broadcast`) | `feat/pluggable-pp-group` | both modes |
-| `--pipeline-stage-rank`: one stage per vLLM instance, torch world without PP; executors given by import path may declare `supports_pp` | `feat/external-pp-stages` (on top of the first) | separate stages |
-| `KVConnectorOutput.lost_kv_req_ids` / `lost_all_kv`: the scheduler preempts the requests, drops their in-flight outputs and evicts their blocks from the prefix cache, so they are recomputed | `feat/recompute-lost-kv` | failover |
+| vLLM change | PR | Branch | Needed for |
+|---|---|---|---|
+| `--pp-group-cls`: a plugin supplies the PP `GroupCoordinator`, including the V2 model runner's sampled-token broadcast (`sibling_broadcast`) | [vllm#63897](https://github.com/vllm-project/vllm/pull/63897) | `feat/pluggable-pp-group` | both modes |
+| `--pipeline-stage-rank`: one stage per vLLM instance, torch world without PP; executors given by import path may declare `supports_pp` | [vllm#63898](https://github.com/vllm-project/vllm/pull/63898) | `feat/external-pp-stages` (on top of the first) | separate stages |
+| `KVConnectorOutput.lost_kv_req_ids` / `lost_all_kv`: the scheduler preempts the requests, drops their in-flight outputs and evicts their blocks from the prefix cache, so they are recomputed | [vllm#63899](https://github.com/vllm-project/vllm/pull/63899) | `feat/recompute-lost-kv` | failover |
 
-The branches are linked from the RFC; they were validated on vLLM main as
-of 2026-10-26 with the V2 model runner (the default).
+By hand (the changes are Python only, so the compiled kernels of a vLLM
+main nightly wheel can be reused):
+
+```bash
+PP_BRANCHES=https://github.com/yanyinglin/vllm.git   # release-scan: allow
+git clone https://github.com/vllm-project/vllm.git && cd vllm
+git fetch $PP_BRANCHES feat/external-pp-stages:pp-stages feat/recompute-lost-kv:lost-kv
+git merge --no-edit pp-stages && git merge --no-edit lost-kv
+VLLM_USE_PRECOMPILED=1 pip install -e .
+pip install "connex-ai[vllm,rs]"
+```
+
+`make image` (`docker/Dockerfile`, default `PP_ENGINE=upstream`) does the
+same on top of `vllm/vllm-openai:latest`; `docker/launch_stage.sh` starts a
+stage of either mode from environment variables, and
+`docker/docker-compose.yml` and `deploy/k8s/manifests.py` deploy a pipeline
+with downstream replicas (see `docs/deploy.md`). The results in
+`docs/results.md` section 13 were measured on vLLM main as of 2026-10-26
+with the V2 model runner (the default).
 
 ### Mode 1: stock vLLM PP, inter-stage traffic over connex-rs instead of NCCL
 
@@ -133,7 +150,15 @@ Across two hosts this is on par with NCCL (`docs/results.md` section 13).
 The first messages from a new sender (before the receiver's announcement
 reached it) go the old way, a one-sided read waited for on the CPU.
 
-## The external-PP fork
+## Legacy: external-PP fork
+
+The original integration: each stage runs as its own process on the
+external-PP vLLM fork (commit `380186d57`, `--pipeline-stage-mode
+external`) with 16 engine patches. It still works and has features the
+upstream path does not have yet (see the comparison above). Build it with
+`make image PP_ENGINE=fork VLLM_FORK_REPO=<git URL of the fork>
+BASE_IMAGE=<vLLM image matching the fork's torch>`; deployment:
+`docs/deploy.md`, section "Legacy: external-PP fork".
 
 | File | Purpose |
 |---|---|
@@ -143,7 +168,7 @@ reached it) go the old way, a one-sided read waited for on the CPU.
 | `pipeline_comm_metrics.py` | Prometheus metrics for pipeline communication (same as the fork's copy) |
 | `patches/` | engine patches for the external-PP fork; `apply_all.py` applies them in order |
 
-## Status
+### Status
 
 This is a reference integration, not an installable plugin. It targets the
 **external-PP vLLM fork at commit `380186d57`** (stages run as separate
@@ -151,10 +176,10 @@ processes with `--pipeline-stage-mode external`) and imports vLLM internals
 (`vllm.distributed.parallel_state`, `vllm.utils.network_utils`, the v1
 worker/scheduler), which change between vLLM releases.
 
-## Installing
+### Installing
 
-The easiest way is the image in `docker/Dockerfile`, which does all of this
-at build time. By hand:
+The easiest way is the image in `docker/Dockerfile` built with
+`PP_ENGINE=fork`, which does all of this at build time. By hand:
 
 1. `pip install connex-ai` (or `pip install -e /path/to/connex` from a
    checkout; the communicators import `connex.*`;
