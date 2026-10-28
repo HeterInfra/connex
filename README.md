@@ -44,7 +44,10 @@ PD, TP, EP, RL and agent support run on upstream engines as plugins, without
 a fork. Upstream PRs:
 vLLM ConnexConnector for PD ([vllm#63804](https://github.com/vllm-project/vllm/pull/63804)),
 vLLM Connex weight transfer backend for RL ([vllm#63805](https://github.com/vllm-project/vllm/pull/63805)),
-SGLang connex KV transfer backend ([sglang#46599](https://github.com/sgl-project/sglang/pull/46599)).
+SGLang connex KV transfer backend ([sglang#46599](https://github.com/sgl-project/sglang/pull/46599)),
+vLLM pluggable PP group via `--pp-group-cls` ([vllm#63897](https://github.com/vllm-project/vllm/pull/63897)),
+vLLM `--pipeline-stage-rank` for external PP stages ([vllm#63898](https://github.com/vllm-project/vllm/pull/63898)),
+vLLM recompute of lost KV requests ([vllm#63899](https://github.com/vllm-project/vllm/pull/63899)).
 Pipeline parallelism without a fork is proposed in [vllm#63818](https://github.com/vllm-project/vllm/issues/63818) (RFC: pluggable PP transport); the plugin `connex.adapters.vllm.pp` already runs on vLLM main with the three changes it proposes ([`integrations/vllm/README.md`](integrations/vllm/README.md#upstream-vllm-no-fork), results in [`docs/results.md`](docs/results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork)).
 Limits per scenario: [Scenarios and status](docs/overview.md#scenarios-and-status).
 
