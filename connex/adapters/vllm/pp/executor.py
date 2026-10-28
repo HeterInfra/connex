@@ -175,7 +175,10 @@ class ConnexPPExecutor(MultiprocExecutor):
         self.num_stages = pc.pipeline_parallel_size
         self.head = self.stage == 0
         endpoints = self.collective_rpc("connex_pp_endpoint")
-        self.local_data_url = endpoints[0]
+        # One endpoint per TP rank when every rank has one (group.py
+        # TP_ENDPOINTS), ";"-separated; else TP rank 0's.
+        self.local_data_url = (";".join(endpoints) if len(endpoints) > 1 and all(endpoints)
+                               else endpoints[0])
         if self.head:
             self._init_head()
 
@@ -356,7 +359,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                                    "t": time.time(), "lost_steps": len(lost),
                                    "choose_s": time.monotonic() - t0})
         # Release every endpoint still waiting for data of older epochs.
-        for u in urls:
+        for u in [e for u in urls for e in u.split(";")]:
             self.ctl.send(u, None, raw=pickle.dumps((3, epoch)))  # link.ABORT
         log.warning("connex-pp: route now %s",
                     [f"s{x.stage}r{x.idx}" if x else None for x in self.route])
@@ -475,7 +478,7 @@ class ConnexPPExecutor(MultiprocExecutor):
         kvo = out.kv_connector_output or KVConnectorOutput()
         kvo.lost_all_kv = True
         out.kv_connector_output = kvo
-        for u in urls:
+        for u in [e for u in urls for e in u.split(";")]:
             self.ctl.send(u, None, raw=pickle.dumps((3, epoch)))
 
     def connex_pp_failovers(self) -> list[dict]:

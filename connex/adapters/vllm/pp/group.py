@@ -23,8 +23,14 @@ Two modes:
   reports stage k of N; the peers of each step come from the step's route,
   which the executor attaches to the SchedulerOutput and the worker
   (:mod:`connex.adapters.vllm.pp.worker`) hands to :meth:`begin_step`.
-  With TP > 1, TP rank 0 is the stage's endpoint and shares what it
-  receives with the other TP ranks over the TP group.
+  With TP > 1 every TP rank is an endpoint and exchanges the hidden states
+  with the same TP rank of the neighbour stage (the stage reports one URL per
+  rank); TP rank 0 receives the sampled tokens and shares them over the TP
+  group.
+
+Between hosts the receiver owns the buffers and the sender's NIC writes
+them, flag after data (:mod:`rdmachan`), so like the same-host CUDA IPC path
+(:mod:`ipcchan`) no Python thread of either side releases a stream wait.
 """
 
 from __future__ import annotations
@@ -44,11 +50,22 @@ from connex.adapters.vllm.pp.link import StageLink
 log = logging.getLogger("vllm.connex_pp")
 
 MODEL_ID = os.getenv("CONNEX_PP_MODEL_ID", "cxpp")
-# Between hosts, let streams wait for data that a Python thread releases
-# (faster: about 5 ms per token at PP=2, C=1 here, but a CUDA call that holds
-# the GIL and waits for the device, e.g. a first kernel load, can deadlock
-# against it). Default: wait on the CPU instead.
+# Between hosts, for messages that do not come over a push channel (the
+# first ones from a new sender, or with CONNEX_PP_RDMA_PUSH=0): let streams
+# wait for data that a Python thread releases instead of waiting on the CPU
+# (faster, but a CUDA call that holds the GIL and waits for the device, e.g.
+# a first kernel load, can deadlock against it).
 XHOST_STREAM_WAIT = os.getenv("CONNEX_PP_XHOST_STREAM_WAIT", "0") == "1"
+# Sampled tokens across hosts go over a receiver-owned push channel from the
+# PUSH_MARGIN-th step of an (epoch, sender) on; before that (the channel is
+# announced on the first step) they come the slow way, filled on the CPU.
+PUSH_MARGIN = int(os.getenv("CONNEX_PP_PUSH_MARGIN", "8"))
+_SAMPLED_SLOTS = 64
+# One stage per instance with TP > 1: every TP rank is a pipeline endpoint
+# and exchanges the hidden states with the same TP rank of the neighbour
+# stage (the route lists one URL per rank, ";"-separated). Off: TP rank 0
+# receives and broadcasts to the other ranks over the TP group.
+TP_ENDPOINTS = os.getenv("CONNEX_PP_TP_ENDPOINTS", "1") == "1"
 
 
 class ConnexPPGroup(GroupCoordinator):
@@ -86,6 +103,8 @@ class ConnexPPGroup(GroupCoordinator):
         self._pending_slots: dict[tuple, int] = {}
         self._deferred: deque = deque()
         self._step_count = 0
+        self._push_first: dict[tuple, int] = {}   # (sender url, epoch) -> first key
+        self._push_pending: deque = deque()       # (key, channel, value) posted on push
         self._local_step = self.stage_rank is not None
         # While set (warmup), receives wait on the CPU instead of queueing a
         # stream wait: a stream wait that only a Python thread of this
@@ -103,11 +122,15 @@ class ConnexPPGroup(GroupCoordinator):
             self.world_size = num_stages
             self.ranks = [self.rank if i == self.stage_rank else -1 - i
                           for i in range(num_stages)]
+            # TP rank 0 handles the sampled tokens (and, without per-rank
+            # endpoints, the hidden states) for the whole stage.
             self.is_endpoint = self.tp_rank == 0
             replica = int(os.getenv("CONNEX_PP_REPLICA", "0"))
             port = int(os.getenv("CONNEX_PP_DATA_PORT", "0"))
-            if self.is_endpoint:
-                self.link = StageLink(MODEL_ID, self.stage_rank, 0, replica, self.device,
+            if port and self.tp_rank:
+                port += int(os.getenv("CONNEX_PP_TP_PORT_STRIDE", "100")) * self.tp_rank
+            if self.is_endpoint or (TP_ENDPOINTS and self.tp_size > 1):
+                self.link = StageLink(MODEL_ID, self.stage_rank, self.tp_rank, replica, self.device,
                                       port=port, ring_mb=ring_mb, ipc_slot_bytes=step_bytes,
                                       ipc_slots=max(3, parallel_config.pipeline_parallel_size + 1))
                 self.link.abort_callbacks.append(self._on_abort)
@@ -176,7 +199,12 @@ class ConnexPPGroup(GroupCoordinator):
         # Let every stream that still waits for sampled tokens of an older
         # epoch go (the requests are recomputed, the bytes are not used).
         if self.link is not None:
-            self.link.close_chans(lambda k: k[1][0] == "s" and k[1][1] < epoch)
+            self.link.close_chans(lambda k: (k[1][0] == "s" and k[1][1] < epoch) or (
+                k[1][0] == "p" and isinstance(k[1][1], tuple) and k[1][1][1] < epoch))
+            for key, _ch, _v in self._push_pending:
+                if key[0] < epoch:
+                    self.link.push_fallback.pop(key, None)
+            self._push_pending = deque(x for x in self._push_pending if x[0][0] >= epoch)
         if self._waiter is None:
             return
         for key in [k for k in self._pending_slots if k[0] < epoch]:
@@ -190,13 +218,15 @@ class ConnexPPGroup(GroupCoordinator):
         if self._local_step:
             return []
         key = self._key(sending=True)
-        if not self.is_endpoint:
-            return []
         rank = (self.rank_in_group + 1) % self.world_size if dst is None else dst
+        url = self._route[rank] if self._route else None
+        per_rank = self._per_rank(url)
+        if not (self.is_endpoint or per_rank):
+            return []
         tensors = {k: v for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)}
         meta = {k: v for k, v in tensor_dict.items() if not isinstance(v, torch.Tensor)}
         t0 = time.perf_counter()
-        self.link.send_tensors(self._route[rank], key, tensors, meta or None)
+        self.link.send_tensors(self._rank_url(url, per_rank), key, tensors, meta or None)
         self.timing["send_s"] += time.perf_counter() - t0
         return []
 
@@ -212,12 +242,15 @@ class ConnexPPGroup(GroupCoordinator):
             return self._aborted_dict(), [], []
         key = self._key(sending=False)
         td = None
-        if self.is_endpoint:
+        src = self._route[(self.rank_in_group - 1) % self.world_size] if self._route else None
+        per_rank = self._per_rank(src)
+        if self.is_endpoint or per_rank:
             t0 = time.perf_counter()
-            # From another host the bytes come through a Python thread, so
-            # do not queue a stream wait on them: wait here, on the CPU (see
+            # Messages whose bytes come through a Python thread (one-sided
+            # reads from another host, before the sender has our push
+            # channel) are waited for on the CPU, not with a stream wait (see
             # _defer_sampled for why a Python-released stream wait is unsafe).
-            src = self._route[(self.rank_in_group - 1) % self.world_size] if self._route else None
+            # Pushed and same-host messages are released by the sender.
             blocking = self.blocking or not (self._same_host(src) or XHOST_STREAM_WAIT)
             got = self.link.recv_tensors(key, blocking=blocking)
             self.timing["recv_wait_s"] += time.perf_counter() - t0
@@ -230,9 +263,26 @@ class ConnexPPGroup(GroupCoordinator):
                 if meta:
                     td.update(meta)
                 self._last_shapes = {k: (v.shape[1:], v.dtype) for k, v in tensors.items()}
-        if self.external and self.tp_size > 1:
+        if self.external and self.tp_size > 1 and not per_rank:
             td = self.tp.broadcast_tensor_dict(td, src=0)
         return td, [], []
+
+    def _per_rank(self, peer: str | None) -> bool:
+        """Hidden states to/from ``peer`` go TP rank to TP rank: both this
+        stage and the peer list one endpoint per TP rank (the same answer
+        on both sides and on every rank)."""
+        if not (self.external and self.tp_size > 1 and peer and self._route):
+            return False
+        own = self._route[self.rank_in_group] if len(self._route) > self.rank_in_group else None
+        return bool(own) and (len(peer.split(";")) == self.tp_size
+                              and len(own.split(";")) == self.tp_size)
+
+    def _rank_url(self, url: str | None, per_rank: bool = False) -> str | None:
+        """The endpoint of ``url`` (a route entry) this rank talks to."""
+        if not url:
+            return url
+        parts = url.split(";")
+        return parts[self.tp_rank] if per_rank else parts[0]
 
     def recv_tensor_dict(self, src=None, all_gather_group=None, all_gather_tensors=None):
         return self.irecv_tensor_dict(src, all_gather_group, all_gather_tensors)[0]
@@ -281,24 +331,41 @@ class ConnexPPGroup(GroupCoordinator):
             return
         stream = torch.cuda.current_stream(self.device)
         if all(u and self.link.same_host(u) for u in self._route[:self.world_size - 1]):
-            for url in self._route[:self.world_size - 1]:
+            for url in [self._rank_url(u) for u in self._route[:self.world_size - 1]]:
                 self._push_sampled(url, key[0], tensor)
             return
-        host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
-        host.copy_(tensor, non_blocking=True)
-        ev = torch.cuda.Event()
-        ev.record(stream)
         num = self.world_size - 1
-        peers = self._route[:num]
+        peers = [self._rank_url(u) for u in self._route[:num]]
+        staged: list = []
 
-        def payload(host=host):
-            return host.numpy().tobytes()
+        def payload(staged=staged):
+            return staged[0].numpy().tobytes()
+
+        def slow(url):
+            if not staged:
+                host = torch.empty(tensor.shape, dtype=tensor.dtype, pin_memory=True)
+                host.copy_(tensor, non_blocking=True)
+                ev = torch.cuda.Event()
+                ev.record(stream)
+                staged.extend((host, ev))
+            self.link.send_bytes(url, key, payload, event=staged[1])
+
+        from connex.adapters.vllm.pp.link import _peer_id
 
         for url in peers:
             if url and self.link.same_host(url):
                 self._push_sampled(url, key[0], tensor)
-            else:
-                self.link.send_bytes(url, key, payload, event=ev)
+                continue
+            tx = self.link._tx_chans.get((_peer_id(url), ("p", ("s", key[0]))))
+            if tx is not None and not tx.dead and key[1] >= tx.extra and key[2] < 4:
+                try:
+                    tx.push_staged(key[1] * 4 + key[2],
+                                   [tensor.contiguous().view(-1).view(torch.uint8)])
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    log.warning("connex-pp: sampled-token push to %s failed: %s", url, e)
+                    tx.dead = True
+            slow(url)
 
     _SAMPLED_SLOT = 1 << 16
 
@@ -317,7 +384,7 @@ class ConnexPPGroup(GroupCoordinator):
 
     def _recv_sampled(self, tensor: torch.Tensor) -> None:
         key = self._bkey()
-        src = self._route[self.world_size - 1] if self._route else None
+        src = self._rank_url(self._route[self.world_size - 1]) if self._route else None
         if self._same_host(src):
             if self.is_endpoint:
                 self._pop_sampled(src, key[0], tensor)
@@ -330,6 +397,12 @@ class ConnexPPGroup(GroupCoordinator):
                 if data is not None:
                     tensor.view(-1).view(torch.uint8).copy_(
                         torch.frombuffer(bytearray(data), dtype=torch.uint8))
+            if self.external and self.tp_size > 1:
+                torch.distributed.broadcast(tensor, src=self.tp.ranks[0],
+                                            group=self._tp_sibling)
+        elif self._push_ok(src, key):
+            if self.is_endpoint:
+                self._pull_pushed(src, key, tensor)
             if self.external and self.tp_size > 1:
                 torch.distributed.broadcast(tensor, src=self.tp.ranks[0],
                                             group=self._tp_sibling)
@@ -347,6 +420,40 @@ class ConnexPPGroup(GroupCoordinator):
                                             group=self._tp_sibling)
         else:
             self._defer_sampled(key, tensor)
+
+    def _push_ok(self, src: str | None, key: tuple) -> bool:
+        """Whether this cross-host receive waits on the push channel. The
+        same answer on every TP rank (it depends only on the route and the
+        keys): from the PUSH_MARGIN-th step of an (epoch, sender) on."""
+        from connex.adapters.vllm.pp.link import push_supported
+
+        if not (src and push_supported()) or key[2] >= 4:
+            return False
+        first = self._push_first.setdefault((src, key[0]), key[1])
+        if first == key[1] and self.is_endpoint and self.link is not None:
+            from connex.adapters.vllm.pp.link import _peer_id
+
+            # Announce now; the sender pushes from first + margin on.
+            self.link.push_rx(_peer_id(src), ("s", key[0]), _SAMPLED_SLOTS, self._SAMPLED_SLOT,
+                              host=True, announce=first + PUSH_MARGIN)
+        return key[1] >= first + PUSH_MARGIN
+
+    def _pull_pushed(self, src: str, key: tuple, tensor: torch.Tensor) -> None:
+        from connex.adapters.vllm.pp.link import _peer_id
+
+        ch = self.link._rx_chans.get((_peer_id(src), ("p", ("s", key[0]))))
+        if ch is None or ch.retired:
+            return  # the sender is gone (its epoch is being aborted)
+        v = key[1] * 4 + key[2]
+        self.link.push_fallback[key] = (ch, v)
+        self._push_pending.append((key, ch, v))
+        while len(self._push_pending) > 4 * _SAMPLED_SLOTS:
+            k, _, _ = self._push_pending.popleft()
+            self.link.push_fallback.pop(k, None)
+        buf = ch.wait(v)
+        n = tensor.numel() * tensor.element_size()
+        tensor.view(-1).view(torch.uint8).copy_(buf[:n], non_blocking=True)
+        ch.done(v)
 
     def _defer_sampled(self, key: tuple, tensor: torch.Tensor) -> None:
         """From another host: queue nothing on the GPU now. The tensor is

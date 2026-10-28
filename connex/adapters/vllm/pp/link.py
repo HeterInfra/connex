@@ -6,10 +6,18 @@ One :class:`StageLink` per process (per TP rank 0 of a stage, or per rank in
 the in-process mode). It moves two kinds of traffic:
 
 * tensor dicts (hidden states + residual between stages): the sender copies
-  the tensors into a registered GPU ring and sends a small header; the
-  receiver pulls the bytes with one one-sided read (GPUDirect RDMA when the
-  NIC supports it) into its own registered ring and acks, which frees the
-  sender's slot;
+  the tensors into a registered GPU ring and sends a small header (at launch
+  time, before the GPU has computed them). Then, by peer:
+
+  - same host: CUDA IPC channel (ipcchan), the GPUs synchronise on flags;
+  - another host, once the receiver has announced a push channel (rdmachan):
+    the sender's connex-rs writes the bytes and a flag into the receiver's
+    ring when the sender's stream rings a doorbell; the receiving stream
+    waits on the flag;
+  - otherwise (the first message from a new sender): the receiver pulls the
+    bytes with one one-sided read (GPUDirect RDMA when the NIC supports it)
+    into its own registered ring and acks, which frees the sender's slot;
+    the receiving side waits on the CPU;
 * small byte messages (the sampled-token broadcast of the V2 model runner,
   control): inline in the message.
 
@@ -47,9 +55,30 @@ BYTES = 2
 ABORT = 3
 CONTROL = 4
 READY = 5     # the data of an announced tensor dict is in place
+CHAN = 6      # a receiver's push channel (rdmachan) for the sender to use
 
 # Same-host stage pairs copy over CUDA IPC (CONNEX_PP_CUDA_IPC=0: RDMA loopback).
 IPC_ENABLED = os.getenv("CONNEX_PP_CUDA_IPC", "1") == "1"
+# Cross-host pairs: the sender's NIC writes our ring and flag (rdmachan), so
+# the receiving stream can wait without a Python thread on the path.
+# CONNEX_PP_RDMA_PUSH=0: receive with one-sided reads, waiting on the CPU.
+PUSH_ENABLED = os.getenv("CONNEX_PP_RDMA_PUSH", "1") == "1"
+_push_ok: bool | None = None
+
+
+def push_supported() -> bool:
+    """PUSH_ENABLED and a connex-rs with ``Engine.put_chain`` (after 0.1.3);
+    without it cross-host receives wait on the CPU.
+    Both ends of a hop are assumed to run the same install."""
+    global _push_ok
+    if _push_ok is None:
+        try:
+            import connex_rs  # type: ignore
+
+            _push_ok = PUSH_ENABLED and hasattr(connex_rs.Engine, "put_chain")
+        except ImportError:
+            _push_ok = False
+    return _push_ok
 
 
 READ_TIMEOUT_MS = int(os.getenv("CONNEX_PP_READ_TIMEOUT_MS", "10000"))
@@ -235,6 +264,12 @@ class StageLink:
         self._waiter = None
         self._outstanding: dict[int, tuple] = {}
         self._msg_id = 0
+        # push channels (rdmachan): ours by id, and who announced what
+        self._push_rx: dict[int, Any] = {}
+        self._announced: set = set()
+        self.nonce = os.urandom(8).hex()
+        self._reap: queue.Queue = queue.Queue()
+        self.push_fallback: dict[tuple, tuple] = {}
         self._tx: queue.Queue = queue.Queue()
         self._closed = False
         self.stats = {"sent": 0, "recv": 0, "bytes_sent": 0, "bytes_recv": 0,
@@ -242,7 +277,8 @@ class StageLink:
         # connex-rs releases the GIL while waiting; these threads only parse
         # headers and post reads.
         for target, name in ((self._rx_loop, "cx-pp-rx"), (self._tx_loop, "cx-pp-tx"),
-                             (self._event_loop, "cx-pp-ev"), (_orphan_watch, "cx-pp-orphan")):
+                             (self._event_loop, "cx-pp-ev"), (_orphan_watch, "cx-pp-orphan"),
+                             (self._reap_loop, "cx-pp-reap")):
             threading.Thread(target=target, name=name, daemon=True).start()
 
     # ------------------------------------------------------------------ send
@@ -257,6 +293,10 @@ class StageLink:
         if self.same_host(peer_url) and total <= self.ipc_slot_bytes:
             self._send_ipc(peer_url, key, tensors, layout, total, meta)
             return
+        tx = self._tx_chans.get((_peer_id(peer_url), ("p", "h")))
+        if tx is not None and not tx.dead and total <= tx.slot_bytes:
+            if self._send_push(tx, peer_url, key, tensors, layout, total, meta):
+                return
         off = self.send_ring.alloc(max(total, _ALIGN))
         base = self.send_buf[off:off + total]
         for lay in layout:
@@ -275,8 +315,9 @@ class StageLink:
         # vLLM's metadata send), so the receiver can set up its step; the
         # data is announced once the copy is done.
         lay = [(x.name, str(x.dtype), x.shape, x.offset, x.nbytes) for x in layout]
+        path = ("rdma", self.nonce) if push_supported() and self.ipc_slot_bytes > 0 else None
         try:
-            self.engine.send_msg(peer_url, pickle.dumps((TENSORS, key, lay, total, meta),
+            self.engine.send_msg(peer_url, pickle.dumps((TENSORS, key, lay, total, meta, path),
                                                         protocol=pickle.HIGHEST_PROTOCOL))
         except Exception as e:  # noqa: BLE001  (peer failed / unknown)
             log.warning("connex-pp: send to %s failed: %s", peer_url, e)
@@ -284,6 +325,89 @@ class StageLink:
             return
         self._tx.put((ev, peer_url, (READY, key, self.url, self.send_buf.data_ptr() + off,
                                      mid, total)))
+
+    def _send_push(self, tx, peer_url, key, tensors, layout, total, meta) -> bool:
+        """Cross host, receiver-driven: copy into our registered ring, ring
+        the doorbell on the stream; connex-rs puts the bytes into the
+        receiver's slot and sets its flag once the copy is done."""
+        off = self.send_ring.alloc(max(total, _ALIGN))
+        base = self.send_buf[off:off + total]
+        for lay in layout:
+            t = tensors[lay.name]
+            base[lay.offset:lay.offset + lay.nbytes].copy_(
+                t.contiguous().view(-1).view(torch.uint8), non_blocking=True)
+        i = tx.i
+        gate = i - tx.n + 1 if i >= tx.n else None
+        try:
+            t = tx.push(i, self.send_buf.data_ptr() + off, total, gate)
+        except Exception as e:  # noqa: BLE001
+            log.warning("connex-pp: push to %s failed: %s", peer_url, e)
+            self.send_ring.free(off)   # nothing was armed; the copy is stream-ordered
+            tx.dead = True
+            return False
+        tx.i += 1
+        self._reap.put((t, off))
+        lay = [(x.name, str(x.dtype), x.shape, x.offset, x.nbytes) for x in layout]
+        try:
+            self.engine.send_msg(peer_url, pickle.dumps(
+                (TENSORS, key, lay, total, meta, ("push", tx.cid, i)),
+                protocol=pickle.HIGHEST_PROTOCOL))
+        except Exception as e:  # noqa: BLE001
+            log.warning("connex-pp: send to %s failed: %s", peer_url, e)
+        self.stats["sent"] += 1
+        self.stats["bytes_sent"] += total
+        self.stats["push"] = self.stats.get("push", 0) + 1
+        return True
+
+    def _reap_loop(self) -> None:
+        """Free the ring space of pushed messages once connex-rs is done
+        with them (memory reuse only; nothing waits for this on the data
+        path)."""
+        while not self._closed:
+            item = self._reap.get()
+            if item is None:
+                return
+            t, off = item
+            try:
+                t.wait()
+            except Exception:  # noqa: BLE001  (peer gone / canceled)
+                pass
+            self.send_ring.free(off)
+
+    def push_rx(self, peer: tuple, tag: str, slots: int, slot_bytes: int,
+                host: bool = False, announce: Any = None):
+        """A new receive channel for pushes from ``peer`` (replacing the
+        previous one for ``tag``), announced to the peer."""
+        from connex.adapters.vllm.pp.rdmachan import PushRx
+
+        k = (tuple(peer), ("p", tag))
+        if k in self._rx_chans:
+            self.close_chans(lambda kk, k=k: kk == k)
+        ch = PushRx(self.engine, self.url, self.device, slots, slot_bytes, host=host)
+        self._rx_chans[k] = ch
+        self._push_rx[ch.cid] = ch
+        try:
+            self.engine.send_msg(tuple(peer), pickle.dumps((CHAN, tag, ch.info, announce)))
+        except Exception as e:  # noqa: BLE001
+            log.warning("connex-pp: announcing a channel to %s failed: %s", peer, e)
+        return ch
+
+    def _on_chan(self, peer, tag, info, extra) -> None:
+        from connex.adapters.vllm.pp.rdmachan import PushTx
+
+        torch.cuda.set_device(self.device)
+        k = (tuple(peer), ("p", tag))
+        tx = PushTx(self.engine, self.device, info, staging=(tag != "h"),
+                    host_staging=(tag != "h"), timeout_ms=READ_TIMEOUT_MS)
+        tx.extra = extra
+        old = self._tx_chans.get(k)
+        self._tx_chans[k] = tx
+        if old is not None:
+            if self._graveyard is None:
+                from connex.adapters.vllm.pp.ipcchan import Graveyard
+
+                self._graveyard = Graveyard()
+            self._graveyard.add(old)
 
     def same_host(self, url: str) -> bool:
         return (bool(url) and IPC_ENABLED and self.ipc_slot_bytes > 0
@@ -413,10 +537,22 @@ class StageLink:
             _, key, layout, total, meta = hdr[:5]
             ipc = hdr[5] if len(hdr) > 5 else None
             self._deliver(key, _Header(layout, total, meta, ipc, tuple(peer)))
+        elif kind == CHAN:
+            try:
+                self._on_chan(peer, hdr[1], hdr[2], hdr[3])
+            except Exception:  # noqa: BLE001
+                log.exception("connex-pp: opening a push channel to %s failed", peer)
         elif kind == READY:
             self._on_ready(peer, hdr)
         elif kind == BYTES:
             _, key, _src, payload = hdr
+            fb = self.push_fallback.pop(key, None)
+            if fb is not None:
+                # The sender had no channel yet for a message we wait for
+                # on one: deliver it into the slot from here.
+                log.warning("connex-pp: %s came without push; filling from the CPU", key)
+                fb[0].fill(fb[1], payload)
+                return
             self._deliver(key, payload)
         elif kind == ABORT:
             self.abort(hdr[1])
@@ -515,7 +651,32 @@ class StageLink:
             self._rx_done = None
         if item is None:
             return None
-        if item.ipc is not None:
+        path = item.ipc[0] if item.ipc is not None else None
+        if path == "push":
+            _, cid, i = item.ipc
+            ch = self._push_rx.get(cid)
+            if ch is None or ch.retired:
+                log.warning("connex-pp: push for unknown channel %s from %s", cid, item.peer)
+                return None
+            for j in range(max(ch.last + 1, i - ch.n), i):
+                ch.done(j)   # messages of aborted steps we never consumed
+            ch.last = i
+            buf = ch.wait(i)   # released by the sender's NIC: safe even in warmup
+            self._rx_done = (ch, i)
+            self.stats["recv"] += 1
+            self.stats["bytes_recv"] += item.total
+            self.stats["push"] = self.stats.get("push", 0) + 1
+            out = {}
+            for name, dtype, shape, loff, n in item.layout:
+                dt = _DTYPES.get(dtype) or getattr(torch, dtype.replace("torch.", ""))
+                out[name] = buf[loff:loff + n].view(dt).view(shape)
+            return out, item.meta
+        if path == "rdma":
+            # A sender that can push but has no channel of ours yet.
+            if (item.peer, item.ipc[1]) not in self._announced and self.ipc_slot_bytes > 0:
+                self._announced.add((item.peer, item.ipc[1]))
+                self.push_rx(item.peer, "h", self.ipc_slots, self.ipc_slot_bytes)
+        elif item.ipc is not None:
             _, info, i = item.ipc
             ch = self.rx_chan(item.peer, ("h",), info)
             last = self._rx_last.get(info[0], -1)
@@ -634,6 +795,7 @@ class StageLink:
     def close(self) -> None:
         self._closed = True
         self._tx.put(None)
+        self._reap.put(None)
         try:
             self.engine.close()
         except Exception:  # noqa: BLE001

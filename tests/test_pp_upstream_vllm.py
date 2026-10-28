@@ -49,7 +49,89 @@ def test_peer_id_from_url():
     assert _peer_id("bad") == ()
 
 
+def _push_pair():
+    """Two connex-rs engines in this process (sender, receiver), or skip."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU (stream wait/write on the flags)")
+    connex_rs = pytest.importorskip("connex_rs")
+    if not hasattr(connex_rs.Engine, "put_chain"):
+        pytest.skip("connex-rs without put_chain")
+    from connex.adapters.vllm.pp.link import make_engine
+
+    try:
+        return make_engine("cxtest", 0, 0, 0), make_engine("cxtest", 1, 0, 0)
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"no connex-rs engine here: {e}")
+
+
+def test_push_channel_delivers_in_order_and_reuses_slots():
+    from connex.adapters.vllm.pp.rdmachan import PushRx, PushTx
+
+    a, b = _push_pair()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    rx = PushRx(b, b.local_url, dev, num_slots=2, slot_bytes=1 << 16)
+    tx = PushTx(a, dev, rx.info)
+    src = torch.empty(4 << 16, dtype=torch.uint8, device=dev)
+    assert a.register_memory(src.data_ptr(), src.numel()) == 0
+    got = []
+    for v in range(6):   # 3x around a 2-slot ring: the gate must hold the sender
+        off = (v % 4) << 16
+        src[off:off + 4096].fill_(v + 1)
+        tx.push(v, src.data_ptr() + off, 4096, gate=v - rx.n + 1 if v >= rx.n else None)
+        buf = rx.wait(v)
+        got.append(buf[:4096].clone())
+        rx.done(v)
+    torch.cuda.synchronize()
+    assert [int(t.float().mean().item()) for t in got] == [1, 2, 3, 4, 5, 6]
+
+
+def test_push_channel_host_ring_and_cpu_release():
+    from connex.adapters.vllm.pp.rdmachan import PushRx, PushTx
+
+    a, b = _push_pair()
+    dev = torch.device("cuda", torch.cuda.current_device())
+    rx = PushRx(b, b.local_url, dev, num_slots=8, slot_bytes=4096, host=True)
+    tx = PushTx(a, dev, rx.info, staging=True, host_staging=True)
+    tokens = torch.arange(16, dtype=torch.int64, device=dev)
+    tx.push_staged(40, [tokens.view(torch.uint8)])
+    out = torch.zeros_like(tokens)
+    out.view(torch.uint8).copy_(rx.wait(40)[:128], non_blocking=True)
+    torch.cuda.synchronize()
+    assert torch.equal(out, tokens)
+    # a payload that came the slow way, delivered from the CPU
+    payload = (tokens + 1).cpu().numpy().tobytes()   # before the wait (a copy to the
+    side = torch.cuda.Stream(dev)                       # host would wait for it)
+    out2 = torch.zeros_like(tokens)
+    side.wait_stream(torch.cuda.current_stream(dev))
+    with torch.cuda.stream(side):
+        out2.view(torch.uint8).copy_(rx.wait(41)[:128], non_blocking=True)
+    rx.fill(41, payload)
+    side.synchronize()
+    assert torch.equal(out2, tokens + 1)
+    # a sender that is gone: release lets the stream go
+    with torch.cuda.stream(side):
+        rx.wait(1000)
+    rx.release_all()
+    side.synchronize()
+
+
 vllm = pytest.importorskip("vllm")
+
+
+def test_tp_endpoints_route_entries():
+    from connex.adapters.vllm.pp.group import ConnexPPGroup
+
+    g = SimpleNamespace(external=True, tp_size=2, tp_rank=1, rank_in_group=1,
+                        _route=["h0:1#m|0|0|0;h0:2#m|0|1|0", "h1:1#m|1|0|0;h1:2#m|1|1|0"])
+    per_rank = ConnexPPGroup._per_rank.__get__(g)
+    rank_url = ConnexPPGroup._rank_url.__get__(g)
+    assert per_rank(g._route[0])
+    assert rank_url(g._route[0], True) == "h0:2#m|0|1|0"
+    assert rank_url(g._route[0]) == "h0:1#m|0|0|0"      # sampled tokens: TP rank 0
+    g._route = ["h0:1#m|0|0|0", g._route[1]]            # peer with one endpoint
+    assert not per_rank(g._route[0])
+    g._route = [g._route[0], "h1:1#m|1|0|0"]            # we have one endpoint
+    assert not per_rank("h0:1#m|0|0|0;h0:2#m|0|1|0")
 
 
 def _executor_stub(replicas, route, replica_id=0):
