@@ -105,11 +105,28 @@ def env_list(d):
     return [{"name": k, "value": str(v)} for k, v in d.items()]
 
 
+def _ports():
+    """connex/adapters/vllm/pp/ports.py, loaded by path (no torch/vLLM, and
+    this script also runs without connex installed)."""
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "connex",
+                        "adapters", "vllm", "pp", "ports.py")
+    spec = importlib.util.spec_from_file_location("connex_pp_ports", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+PORTS = _ports()
+
+
 def control_port(idx, replica):
     """Upstream: control port of downstream stage `idx`, replica `replica`
-    (data port = control port + 1); distinct per stage and replica so any
-    placement works on the host network."""
-    return 47020 + 100 * idx + 2 * replica
+    (data port of TP rank r = control port + 1 + r); the one layout of
+    connex.adapters.vllm.pp.ports, distinct per stage, replica and TP rank so
+    any placement works on the host network."""
+    return PORTS.control_port(idx, replica)
 
 
 def upstream_env(c, prefix, idx, replica):

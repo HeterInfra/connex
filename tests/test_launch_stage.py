@@ -93,8 +93,8 @@ def test_upstream_downstream_stage_ports(tmp_path):
     out = _upstream(tmp_path, STAGE=2, REPLICA=1)
     assert out.returncode == 0, out.stderr
     line = [l for l in out.stdout.splitlines() if l.startswith("STAGE ")][0]
-    assert "--connex-control-port 47222 --connex-replica 1" in line and "--pipeline-stage-rank 2" in line
-    assert "DATA=47223" in line and "RS_IP=10.0.0.5" in line
+    assert "--connex-control-port 49016 --connex-replica 1" in line and "--pipeline-stage-rank 2" in line
+    assert "DATA=49017" in line and "RS_IP=10.0.0.5" in line
     # stage 0 without PP_STAGES and the fork without a router fail clearly
     assert "PP_STAGES is required" in _upstream(tmp_path, STAGE=0).stderr
     assert "ROUTER_ADDR is required" in _upstream(tmp_path, STAGE=1, PP_ENGINE="fork").stderr

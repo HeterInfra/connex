@@ -64,7 +64,7 @@ services:
       <<: *stage_env
       STAGE: "1"
       REPLICA: "0"
-      CONTROL_PORT: "47120"
+      CONTROL_PORT: "48000"
     deploy:
       resources:
         reservations:
@@ -76,7 +76,7 @@ services:
       <<: *stage_env
       STAGE: "1"
       REPLICA: "1"
-      CONTROL_PORT: "47122"
+      CONTROL_PORT: "48016"
     deploy:
       resources:
         reservations:
@@ -90,7 +90,7 @@ services:
       <<: *stage_env
       STAGE: "0"
       API_PORT: "8000"
-      PP_STAGES: '[["127.0.0.1:47120","127.0.0.1:47122"]]'
+      PP_STAGES: '[["127.0.0.1:48000","127.0.0.1:48016"]]'
     deploy:
       resources:
         reservations:

@@ -2,8 +2,39 @@
 
 ## Unreleased
 
-- `connex-ai[rs]` requires `connex-rs>=0.1.4,<0.2` (`Engine.put_chain` for
-  the cross-host PP push channel); submodule at connex-rs v0.1.4.
+- `connex-ai[rs]` requires `connex-rs>=0.1.5,<0.2` (`Engine.put_chain` with a
+  cancel word and cyclic comparisons, GPU RMA below the zero-copy threshold
+  rejected); submodule at connex-rs 0.1.5 (unreleased).
+
+**PP on upstream vLLM: review fixes** ([`docs/results.md`](docs/results.md#13-pipeline-parallelism-on-upstream-vllm-no-fork))
+- Cross-host pushes and reads from GPU memory are padded to 4 KB: smaller
+  ones segfaulted in UCX (seen with Qwen2.5-0.5B at batch 1).
+- A failed push chain is reported to the receiver (CHANFAIL; a hidden-state
+  hop stops the receiving stage so the pipeline fails over, sampled tokens
+  are resent the slow way); a failed read or a push on an unknown channel
+  of a live epoch no longer runs on garbage; a same-host sampled-token
+  channel timeout raises.
+- Stage 0's watchdog also fails over a stage that answers pings but is
+  stuck on a step. Ring frees no longer wait behind one stuck chain; ring
+  allocation and chains have deadlines; channels to peers that leave the
+  route are retired; aborted epochs release channel waits and cancel their
+  pending pushes.
+- Sampled-token push channels: one per sender (not per epoch), with flow
+  control (gate) and no reuse of a staging slot still being read; a payload
+  that arrives before its receive registers is no longer lost.
+- Flag counters wrap safely (cyclic comparisons, releases written ahead of
+  every awaited count and re-asserted while streams still use a retired
+  channel; no cancel value inside the counter range).
+- One port layout (`connex.adapters.vllm.pp.ports`): TP rank 1 of stage k no
+  longer collides with stage k+1. Default ports changed (control
+  47000 + 1000·stage + 16·replica, data + 1 + TP rank).
+- Faster failover: the route's endpoints warm the hops to spares, ABORT is
+  sent asynchronously, the last stage compiles the top-k/top-p kernels at
+  start, a restarted replica announces itself to stage 0. Largest
+  no-token window across hosts 0.4-0.5 s (TP=2: 0.9-1.1 s; was up to 2.6 s).
+- Pruned leaking state (retired push channels, announcements, stale inbox
+  items). `failover_load.py` reports `no_token_window_s`.
+- Benchmarks re-run with the same KV size for NCCL and Connex: TTFT on par.
 
 **Upstream vLLM is the default for pipeline parallelism** ([`docs/deploy.md`](docs/deploy.md))
 - `docker/Dockerfile` (`PP_ENGINE=upstream`, default) builds on

@@ -115,7 +115,7 @@ token differed from the greedy reference in any failure run.
 | Scenario | Steady state | Kill a process under load |
 |---|---|---|
 | Pipeline, 4 stages × 2 replicas | same latency as Mooncake TE | next token 0.01-0.83 s after the kill (Mooncake: 2-3 s) |
-| Pipeline on upstream vLLM, one host or across hosts | on par with NCCL: 2 hosts, PP=2 TPOT 28.32 ms vs 28.28 ms at C=1, 41.3-41.9 ms vs 41.6 ms at C=32; PP2×TP2 within 1 % | every in-flight request completes, gap 0.4-2.5 s with a spare, about 29 s restarted in place (NCCL: all in-flight requests lost, down 57-63 s) |
+| Pipeline on upstream vLLM, one host or across hosts | on par with NCCL at matched KV size: 2 hosts, PP=2 TPOT 28.40 ms vs 28.28 ms at C=1, 42.4 ms vs 41.9 ms at C=32 (within the run-to-run spread); PP2×TP2 within 1 %; mean TTFT within 4 % of NCCL | every in-flight request completes; largest no-token window 0.4-0.5 s with a spare (PP2×TP2 across hosts 0.9-1.1 s), about 32 s restarted in place (NCCL: all in-flight requests lost, down 57-63 s) |
 | PD disaggregation, one host or across nodes | on par with NIXL (vLLM) and Mooncake (SGLang) | decode kill: KV re-pulled, max stall 0.63 s |
 | Tensor parallelism 2 | PD 1061 tok/s, TPOT 16 ms | one rank killed: whole group out in 0.16-0.57 s, stall 0.4 s |
 | Expert parallelism | 2,307 tok/s vs 2,338 for vLLM's EP | rank failure detected in 0.05 s, max stall 0.18 s (across nodes: 0.29 s, 0.37 s) |

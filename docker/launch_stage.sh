@@ -21,8 +21,9 @@
 #                  CONNEX_PP_STAGES.
 #   ROUTER_ADDR    (fork) Connex front-router API address HOST:PORT
 # Upstream env (defaults in brackets):
-#   CONTROL_PORT   control port of a downstream stage [47020 + 100*STAGE + 2*REPLICA]
-#   DATA_PORT      data port of a downstream stage [CONTROL_PORT + 1]
+#   CONTROL_PORT   control port of a downstream stage [47000 + 1000*STAGE + 16*REPLICA]
+#   DATA_PORT      data port of TP rank 0 of a downstream stage [CONTROL_PORT + 1];
+#                  TP rank r listens on DATA_PORT + r (connex.adapters.vllm.pp.ports)
 #   NUM_GPU_BLOCKS --num-gpu-blocks-override, the same on every stage [8192]
 # Common env (defaults in brackets):
 #   BACKEND        (fork) connexte | connex [connexte]
@@ -143,7 +144,9 @@ PY
     # shellcheck disable=SC2086
     exec vllm serve "$MODEL_PATH" --port "$API_PORT" "${args[@]}" ${EXTRA_ARGS:-}
   fi
-  CONTROL_PORT=${CONTROL_PORT:-$((47020 + 100 * STAGE + 2 * REPLICA))}
+  # One port layout everywhere (connex/adapters/vllm/pp/ports.py): no two
+  # (stage, replica, TP rank) share a port on a host network.
+  CONTROL_PORT=${CONTROL_PORT:-$(python3 -m connex.adapters.vllm.pp.ports control "$STAGE" "$REPLICA")}
   export CONNEX_PP_DATA_PORT=${DATA_PORT:-$((CONTROL_PORT + 1))}
   # shellcheck disable=SC2086
   exec python3 -m connex.adapters.vllm.pp.stage --model "$MODEL_PATH" "${args[@]}" \

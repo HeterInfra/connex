@@ -16,7 +16,16 @@ thread can release deadlocks against CUDA calls that hold the GIL and wait
 for the device (a first Triton kernel load does), see hostwait.py.
 
 Python only touches the flags on failure (``release_all``), to let streams
-go that wait for a peer that died.
+go that wait for a peer that died, and on an aborted epoch
+(``release_below``).
+
+Flag values are message counts modulo 2^32: every wait is the cyclic
+``CU_STREAM_WAIT_VALUE_GEQ`` (``(int32)(flag - value) >= 0``), so counters may
+wrap. A release writes a value 2^30 ahead of every count anyone waits for,
+not a fixed "cancel" value (a fixed value would be passed by a long-running
+counter). A peer's stream write still queued at the release can lower the
+flag again, so a retired channel re-asserts its release until every stream
+that used it has passed it (``Graveyard.drain``).
 """
 
 from __future__ import annotations
@@ -29,6 +38,13 @@ import numpy as np
 import torch
 
 _ALIGN = 256
+MASK = 0xFFFFFFFF
+AHEAD = 1 << 30   # a release writes this far past the highest awaited count
+
+
+def reached(word: int, val: int) -> bool:
+    """``word`` has reached ``val`` in the cyclic u32 order (as the GPU waits)."""
+    return ((int(word) - int(val)) & MASK) < 0x80000000
 
 
 def _cu():
@@ -59,7 +75,7 @@ class _Flags:
             fd = os.open(path, os.O_RDWR)
         self.mm = mmap.mmap(fd, 4096)
         os.close(fd)
-        self.arr = np.frombuffer(self.mm, dtype=np.int32, count=2 * n)
+        self.arr = np.frombuffer(self.mm, dtype=np.uint32, count=2 * n)
         cu = _cu()
         self.host_ptr = np.frombuffer(self.mm, dtype=np.uint8).ctypes.data
         flags = (cu.CU_MEMHOSTREGISTER_DEVICEMAP | cu.CU_MEMHOSTREGISTER_PORTABLE)
@@ -89,7 +105,7 @@ class _Flags:
 def _wait(stream: torch.cuda.Stream, addr: int, value: int) -> None:
     cu = _cu()
     _check(cu.cuStreamWaitValue32(cu.CUstream(stream.cuda_stream), cu.CUdeviceptr(addr),
-                                  value & 0x7FFFFFFF,
+                                  value & MASK,
                                   cu.CUstreamWaitValue_flags.CU_STREAM_WAIT_VALUE_GEQ),
            "cuStreamWaitValue32")
 
@@ -97,7 +113,7 @@ def _wait(stream: torch.cuda.Stream, addr: int, value: int) -> None:
 def _write(stream: torch.cuda.Stream, addr: int, value: int) -> None:
     cu = _cu()
     _check(cu.cuStreamWriteValue32(cu.CUstream(stream.cuda_stream), cu.CUdeviceptr(addr),
-                                   value & 0x7FFFFFFF,
+                                   value & MASK,
                                    cu.CUstreamWriteValue_flags.CU_STREAM_WRITE_VALUE_DEFAULT),
            "cuStreamWriteValue32")
 
@@ -167,8 +183,11 @@ class TxChannel:
         return i
 
     def release_all(self) -> None:
-        """The receiver is gone: let pending pushes go."""
-        self.flags.arr[self.n:] = 0x7FFFFFFF
+        """The receiver is gone: let pending pushes go (they wait for free
+        counts up to ``self.i``)."""
+        self.flags.arr[self.n:] = (self.i + AHEAD) & MASK
+
+    reassert = release_all
 
     def retire(self) -> list:
         """Let pending pushes go; returns events after which the channel's
@@ -194,18 +213,20 @@ class RxChannel:
             storage, 0, (storage.nbytes(),))
         self.device = device
         self.i = 0  # next index for counted receives
-        self.pending: set[int] = set()
+        self.pending: dict[int, int] = {}   # message index -> epoch, waited for
+        self.hi = 0                          # highest count waited for
         self.streams: dict[int, torch.cuda.Stream] = {}
         self.retired = False
 
-    def wait(self, i: int) -> torch.Tensor:
+    def wait(self, i: int, epoch: int = 0) -> torch.Tensor:
         """Queue a wait for message ``i`` on the current stream; returns the
         slot's bytes (valid until ``done(i)``)."""
         s = i % self.n
         stream = torch.cuda.current_stream(self.device)
         self.streams[stream.cuda_stream] = stream
         _wait(stream, self.flags.ready_addr(s), i + 1)
-        self.pending.add(i)
+        self.pending[i] = epoch
+        self.hi = max(self.hi, i + 1)
         return self.ring[s * self.slot_bytes:(s + 1) * self.slot_bytes]
 
     def done(self, i: int) -> None:
@@ -213,11 +234,27 @@ class RxChannel:
         if self.retired:
             return
         _write(torch.cuda.current_stream(self.device), self.flags.free_addr(i % self.n), i + 1)
-        self.pending.discard(i)
+        for j in [j for j in self.pending if j <= i]:
+            del self.pending[j]
+
+    def release_below(self, epoch: int) -> int:
+        """Let the waits for messages of epochs before ``epoch`` go (their
+        sender may never send them: it was replaced, or hangs). Returns how
+        many were released."""
+        n = 0
+        for i, ep in list(self.pending.items()):
+            if ep < epoch:
+                s = i % self.n
+                if not reached(self.flags.arr[s], i + 1):
+                    self.flags.arr[s] = (i + 1) & MASK
+                n += 1
+        return n
 
     def release_all(self) -> None:
         """The sender is gone: let pending waits go (the data is garbage)."""
-        self.flags.arr[:self.n] = 0x7FFFFFFF
+        self.flags.arr[:self.n] = (self.hi + AHEAD) & MASK
+
+    reassert = release_all
 
     def retire(self) -> list:
         """Let pending waits go; returns events after which the mapping of
@@ -262,5 +299,14 @@ class Graveyard:
             for ch, evs in self.items:
                 (done if all(e.query() for e in evs) else keep).append((ch, evs))
             self.items = keep
+        for ch, _ in keep:
+            # A write the peer had queued before the release (a stream write
+            # of a flag, or a NIC put) may have lowered a flag again.
+            reassert = getattr(ch, "reassert", None)
+            if reassert is not None:
+                try:
+                    reassert()
+                except Exception:  # noqa: BLE001
+                    pass
         for ch, _ in done:
             ch.close()

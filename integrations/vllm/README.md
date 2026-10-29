@@ -76,13 +76,14 @@ ARGS="--pipeline-parallel-size 2 --num-gpu-blocks-override 8192 \
   --distributed-executor-backend connex.adapters.vllm.pp.executor.ConnexPPExecutor"
 
 # stage 1, two replicas (any hosts); fixed ports so a restarted replica rejoins
-CONNEX_PP_DATA_PORT=47021 python -m connex.adapters.vllm.pp.stage --model $MODEL $ARGS \
-  --pipeline-stage-rank 1 --connex-control-port 47020 --connex-replica 0
-CONNEX_PP_DATA_PORT=47023 python -m connex.adapters.vllm.pp.stage --model $MODEL $ARGS \
-  --pipeline-stage-rank 1 --connex-control-port 47022 --connex-replica 1
+# (python -m connex.adapters.vllm.pp.ports control|data STAGE REPLICA prints them)
+CONNEX_PP_DATA_PORT=48001 python -m connex.adapters.vllm.pp.stage --model $MODEL $ARGS \
+  --pipeline-stage-rank 1 --connex-control-port 48000 --connex-replica 0
+CONNEX_PP_DATA_PORT=48017 python -m connex.adapters.vllm.pp.stage --model $MODEL $ARGS \
+  --pipeline-stage-rank 1 --connex-control-port 48016 --connex-replica 1
 
 # stage 0 (API server)
-CONNEX_PP_STAGES='[["10.0.0.2:47020","10.0.0.3:47022"]]' \
+CONNEX_PP_STAGES='[["10.0.0.2:48000","10.0.0.3:48016"]]' \
   vllm serve $MODEL $ARGS --pipeline-stage-rank 0
 ```
 
@@ -90,23 +91,31 @@ All stages take the same engine arguments (the block ids in the steps are
 stage 0's, so `--num-gpu-blocks-override` must be the same everywhere);
 tensor parallelism per stage works (`-tp 2`; every TP rank is an endpoint
 and exchanges the hidden states with the same rank of the next stage, TP
-rank r listens on `CONNEX_PP_DATA_PORT` + 100·r). Restarting a killed replica with the same command makes it a
-spare again.
+rank r listens on `CONNEX_PP_DATA_PORT` + r). The port layout
+(`connex.adapters.vllm.pp.ports`) is control = 47000 + 1000·stage +
+16·replica, data of TP rank r = control + 1 + r, so no two stages, replicas
+or TP ranks collide on a host network. Restarting a killed replica with the
+same command makes it a spare again (it announces itself to the stage-0
+instances it served as soon as it is ready).
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `CONNEX_PP_STAGES` | (stage 0, required) | JSON list, one entry per downstream stage, of the stage servers' control addresses; list position = replica index |
 | `CONNEX_PP_REPLICA` | 0 | this instance's replica index (stage 0: preferred replica of each stage) |
-| `CONNEX_PP_DATA_PORT` | ephemeral | port of the stage's data endpoint |
+| `CONNEX_PP_DATA_PORT` | ephemeral | data port of the stage's TP rank 0 (rank r: + r) |
 | `CONNEX_RS_LOCAL_IP` | vLLM's host IP | address to listen on (use the RDMA interface's) |
 | `CONNEX_PP_RING_MB` | from the config | registered GPU buffer per direction for RDMA ((PP+1) steps of hidden states) |
 | `CONNEX_PP_CUDA_IPC` | 1 | same-host stage pairs over CUDA IPC (0: RDMA loopback) |
-| `CONNEX_PP_RDMA_PUSH` | 1 | between hosts, the sender's NIC writes the receiver's ring and flag (needs connex-rs>=0.1.4, `Engine.put_chain`); 0: one-sided reads, the receiver waits on the CPU |
+| `CONNEX_PP_RDMA_PUSH` | 1 | between hosts, the sender's NIC writes the receiver's ring and flag (needs connex-rs>=0.1.5, `Engine.put_chain`); 0: one-sided reads, the receiver waits on the CPU |
 | `CONNEX_PP_PUSH_MARGIN` | 8 | sampled tokens from a new (epoch, sender) use the push channel from this many steps on (the channel is announced on the first) |
 | `CONNEX_PP_TP_ENDPOINTS` | 1 | one stage per instance with TP > 1: one endpoint per TP rank (0: TP rank 0 receives and broadcasts over the TP group) |
-| `CONNEX_PP_TP_PORT_STRIDE` | 100 | data port of TP rank r = `CONNEX_PP_DATA_PORT` + stride·r |
+| `CONNEX_PP_PORT_BASE` | 47000 | base of the port layout above |
+| `CONNEX_PP_WARM_SPARES` | 1 | the route's endpoints connect to the spares and open the push channels a spare would use, ahead of a failover |
+| `CONNEX_PP_WARM_TOPP` | 1 | the last stage compiles the top-k/top-p sampling kernels at start (else on the first top-p request) |
+| `CONNEX_PP_CHAIN_ARM_TIMEOUT_MS` | 60000 | a push whose doorbell (the sender's own stream) does not ring in this long fails |
+| `CONNEX_PP_STATE_DIR` | /dev/shm | where a stage server keeps the stage-0 URLs it announces itself to after a restart |
 | `CONNEX_PP_XHOST_STREAM_WAIT` | 0 | between hosts, for messages that do not come over a push channel: let streams wait for data a Python thread releases (can deadlock against GIL-holding device syncs) |
-| `CONNEX_PP_STEP_TIMEOUT_S` | 60 | a step without reply after this long triggers a ping; no pong = failover |
+| `CONNEX_PP_STEP_TIMEOUT_S` | 60 | a step without reply after this long triggers a ping; the stage without a pong is failed over, else the first one behind on the step (a hung GPU still answers pings) |
 | `CONNEX_PP_REPLACE_TIMEOUT_S` | 120 | how long stage 0 waits for a live replacement |
 | `CONNEX_RS_HEARTBEAT_MS` / `_TIMEOUT_MS` | 1000 / 3000 | connex-rs heartbeat for hung peers |
 
@@ -134,7 +143,7 @@ and its memory is unmapped once the local streams have passed that point,
 so a replica restarted on the same GPU finds its memory free.
 
 Between hosts the same contract holds over RDMA
-(`connex.adapters.vllm.pp.rdmachan`, needs connex-rs>=0.1.4): the receiver owns a ring (GPU memory
+(`connex.adapters.vllm.pp.rdmachan`, needs connex-rs>=0.1.5): the receiver owns a ring (GPU memory
 for hidden states, pinned host memory for sampled tokens) and flags in
 pinned host memory, registered with connex-rs, and announces them to the
 sender. The sender's stream copies into its registered buffer and writes a

@@ -9,7 +9,7 @@ proposed PP changes and the plugin `connex.adapters.vllm.pp`
 ([`integrations/vllm/README.md`](../../integrations/vllm/README.md)): stage 0
 serves the API and drives one replica of every downstream stage. Each
 downstream replica is reachable through a headless Service `PREFIX-sK-rR`
-(control port `47020 + 100*K + 2*R`, data port one above); stage 0 lists them
+(control port `47000 + 1000*K + 16*R`, data port one above); stage 0 lists them
 in `PP_STAGES` and resolves them at start. No front-router is needed.
 
 ## Quick start

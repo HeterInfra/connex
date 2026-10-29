@@ -1296,6 +1296,80 @@ every TP rank evaluates the same way. From doorbell to flag, a 16 KB
 transfer takes about 20 µs (RDMA loopback, median of 200). Results: the
 two-host table above.
 
+**Review fixes and re-measurement (2026-10-29).** A code review found
+failure paths that could hang or use wrong data, and a benchmark mismatch.
+Fixed: a cross-host push or read of less than 4 KB from GPU memory
+segfaulted in UCX (`uct_rc_mlx5_ep_put_short` / `put_bcopy`: below
+`UCX_ZCOPY_THRESH` UCX copies with the CPU); every GPU RMA is now padded to
+4 KB and connex-rs 0.1.5 rejects smaller ones instead of crashing. With
+Qwen2.5-0.5B (hidden size 896, one decode token is 3.5 KB) at batch 1 over
+RDMA, the previous version crashed stage 0 on the first decode step, this
+one answers. A failed push chain is now reported to the receiver (a hidden
+state hop stops the receiving stage so the pipeline fails over; sampled
+tokens are resent the slow way), the stage-0 watchdog also fails over a
+stage that answers pings but is stuck on a step, chains have deadlines and
+are cancelled through a CPU-only word per epoch, flag counters compare
+cyclically (no collision with the old cancel value at 2^31-2), a sampled
+token that arrived before its receive registered is no longer lost, a
+same-host channel timeout and an unknown push channel raise instead of
+decoding on garbage, and the data ports of TP ranks no longer collide with
+the next stage (`connex.adapters.vllm.pp.ports`: control 47000 + 1000·stage +
+16·replica, TP rank r at control + 1 + r).
+
+The TTFT comparisons above ran Connex with `--num-gpu-blocks-override 8192`
+and NCCL with vLLM's default KV size, and the PP=2 one-stage-per-instance
+row used GPUs 1 and 2 (across NUMA nodes) against NCCL on GPUs 2 and 3.
+Re-run with 8192 blocks everywhere, the same GPUs per pair of rows, one
+discarded warm-up run per cell, then 3 runs (mean ±std; median TPOT ms /
+p99 TPOT ms / mean TTFT ms / tok/s):
+
+| setup | C=1 | C=32 |
+|---|---|---|
+| one host, PP=2, NCCL | 28.24 / 28.26 / 93 / 34.8 | 40.57 ±0.54 / 45.06 / 677 / 698 ±5 |
+| one host, PP=2, in-process Connex | 28.21 / 28.23 / 92 / 34.8 | 41.00 ±1.19 / 45.20 / 661 / 696 ±11 |
+| one host, PP=2, one stage per instance | 28.24 / 28.32 / 93 / 34.8 | 41.00 ±0.38 / 45.59 / 660 / 695 ±7 |
+| one host, PP=4, NCCL | 28.33 / 28.35 / 90 / 34.7 | 40.54 ±0.11 / 44.16 / 536 / 717 ±2 |
+| one host, PP=4, one stage per instance | 28.36 / 28.38 / 94 / 34.6 | 40.21 ±0.81 / 43.84 / 558 / 719 ±10 |
+| one host, PP=2 x TP=2, NCCL | 15.54 / 15.55 / 75 / 62.5 | 22.60 ±0.20 / 26.25 / 551 / 1191 ±7 |
+| one host, PP=2 x TP=2, one stage per instance | 15.53 / 15.55 / 77 / 62.4 | 22.48 ±0.28 / 26.24 / 553 / 1195 ±5 |
+| one host, PP=2 x TP=2, per instance, TP rank 0 + broadcast | 15.60 / 15.61 / 75 / 62.3 | 22.80 ±0.23 / 26.36 / 540 / 1184 ±6 |
+| two hosts, PP=2, NCCL | 28.28 / 28.29 / 95 / 34.7 | 41.92 ±0.58 / 46.73 / 685 / 680 ±6 |
+| two hosts, PP=2, in-process Connex | 28.37 / 28.39 / 95 / 34.6 | 42.10 ±0.10 / 46.66 / 649 / 683 ±3 |
+| two hosts, PP=2, one stage per instance | 28.40 / 28.44 / 95 / 34.6 | 42.37 ±0.74 / 46.63 / 655 / 680 ±6 |
+| two hosts, PP=2 x TP=2, NCCL | 15.54 / 15.55 / 75 / 62.5 | 23.52 ±0.04 / 26.98 / 526 / 1166 ±3 |
+| two hosts, PP=2 x TP=2, one stage per instance | 15.65 / 15.68 / 76 / 62.0 | 23.08 ±0.51 / 26.40 / 524 / 1185 ±13 |
+
+With the KV size matched, the TTFT gap reported above (17-30 %) is gone:
+one stage per instance is within 4 % of NCCL's mean TTFT in every cell,
+mostly below it. TPOT at C=1 is within 0.4 % of NCCL (0.12 ms across
+hosts), C=32 within the run-to-run spread. 0 of 3,200 greedy tokens off the
+argmax in every configuration.
+
+Failover, same load as above. The gap is now the largest window after the
+kill in which *no* stream got a token (the per-request gap missed requests
+that started after the kill and waited for their first token; with that
+metric the earlier version's worst cross-host run was 2.6 s, not 2.5 s).
+Spare hops are warmed before a failover (the route's endpoints connect to
+the spares and open the push channels a spare would use, with one dummy
+chain each), ABORT is sent off the failover path, the last stage compiles
+its top-k/top-p kernels at start, and a restarted replica announces itself
+to stage 0 when ready:
+
+| setup, what is killed | kills (load + greedy) | load requests completed | greedy tokens off the argmax | largest no-token window per load run |
+|---|---|---|---|---|
+| PP=2, three hosts, active replica | 3 + 3 | 1,056 / 1,056 | 0 / 9,600 | 0.44, 0.42, 0.46 s |
+| PP=2 x TP=2, three hosts, one TP rank of the active replica | 2 + 2 | 1,216 / 1,216 | 0 / 6,400 | 0.89, 1.11 s |
+| PP=2, one host, RDMA push (CUDA IPC off), active replica | 4 + 4 | 1,389 / 1,389 | 0 / 12,800 | 0.29, 0.41, 0.41, 0.40 s |
+| PP=2 x TP=2, one host, one TP rank, no spare (restarted in place) | 2 + 2 | 416 / 416 | 0 / 6,400 | 32.9, 32.0 s |
+
+22 kills (10 across hosts): every request completed (3 TP=2 load requests
+streamed 127 chunks with a normal end, as before), 0 of 35,200 greedy tokens
+off the argmax. The worst cross-host gap went from 2.6 s to 0.46 s at TP=1
+and to 1.1 s at TP=2 (the 0.7 s target is met at TP=1, not at TP=2).
+Restarting in place got slower, 32-33 s instead of about 29 s: the stage
+server now compiles the top-k/top-p kernels at start (part of the restart),
+which the earlier version did on the first request instead.
+
 **Not covered.** A replica shared by several pipelines (the fork path
 supports it; here a replica serves one stage 0 at a time), more than one
 failure at a time, stage 0

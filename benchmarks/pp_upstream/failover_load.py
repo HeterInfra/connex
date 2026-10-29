@@ -6,7 +6,10 @@ C closed-loop clients stream greedy completions (ignore_eos, fixed length)
 from stage 0. KILL_AFTER seconds in, a shell command kills a replica. For
 every request in flight at the kill, the handover is the time from the kill
 to its first token after the kill; the stall is its largest gap between two
-tokens around the kill. Requests that fail are counted (they should be 0).
+tokens around the kill. ``no_token_window_s`` is the service-level gap: the
+longest time after the kill during which no stream got a token (requests
+that start after the kill and wait for their first token count too, unlike
+the per-request stall). Requests that fail are counted (they should be 0).
 
     python failover_load.py --url http://127.0.0.1:8200 --clients 32 \\
         --duration 40 --kill "kill -9 -- -<pgid>" --kill-after 15 --out kill.json
@@ -100,6 +103,18 @@ async def probe(s, a, stop, probes):
         await asyncio.sleep(0.25)
 
 
+def no_token_window(out, t_kill, horizon=60.0):
+    """Longest interval, from the last token before the kill to 60 s after
+    it, with no token on any stream."""
+    ts = sorted(t for r in out for t in r["times"])
+    before = [t for t in ts if t <= t_kill]
+    after = [t for t in ts if t_kill < t <= t_kill + horizon]
+    seq = before[-1:] + after
+    if len(seq) < 2:
+        return None
+    return round(max(b - x for x, b in zip(seq, seq[1:])), 3)
+
+
 def summarize(start, t_kill, out, a, probes=()):
     done = [r for r in out if r["ok"]]
     failed = [r for r in out if not r["ok"]]
@@ -126,6 +141,7 @@ def summarize(start, t_kill, out, a, probes=()):
             if gaps:
                 stall.append(max(gaps))
         q = lambda v, p: round(sorted(v)[min(len(v) - 1, int(p * len(v)))], 3) if v else None  # noqa: E731
+        res["no_token_window_s"] = no_token_window(out, t_kill)
         down = [t for t, ok in probes if not ok]
         up_after = [t for t, ok in probes if ok and down and t > down[0]]
         window = [r for r in out if r["t0"] >= t_kill - 0 and r["t0"] < t_kill + a.window]

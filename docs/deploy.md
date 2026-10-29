@@ -135,14 +135,14 @@ COMMON="--network host --ipc host --shm-size 16g
   -e MODEL_PATH=meta-llama/Meta-Llama-3-8B -e MODEL_NAME=llama3 -e NUM_STAGES=3"
 RDMA="--device /dev/infiniband --cap-add IPC_LOCK"   # omit for TCP
 
-# downstream replicas: control port 47020 + 100*STAGE + 2*REPLICA (data port +1)
+# downstream replicas: control port 47000 + 1000*STAGE + 16*REPLICA (data port of TP rank r: +1+r)
 docker run -d --name s1r0 $COMMON $RDMA --gpus device=0 -e STAGE=1 -e REPLICA=0 -e HOST_IP=HOST_B_IP $IMG
 docker run -d --name s2r0 $COMMON $RDMA --gpus device=1 -e STAGE=2 -e REPLICA=0 -e HOST_IP=HOST_B_IP $IMG
 docker run -d --name s1r1 $COMMON $RDMA --gpus device=0 -e STAGE=1 -e REPLICA=1 -e HOST_IP=HOST_C_IP $IMG
 docker run -d --name s2r1 $COMMON $RDMA --gpus device=1 -e STAGE=2 -e REPLICA=1 -e HOST_IP=HOST_C_IP $IMG
 # host A: stage 0, OpenAI API on :5100
 docker run -d --name s0 $COMMON $RDMA --gpus device=0 -e STAGE=0 -e HOST_IP=HOST_A_IP \
-  -e PP_STAGES='[["HOST_B_IP:47120","HOST_C_IP:47122"],["HOST_B_IP:47220","HOST_C_IP:47222"]]' $IMG
+  -e PP_STAGES='[["HOST_B_IP:48000","HOST_C_IP:48016"],["HOST_B_IP:49000","HOST_C_IP:49016"]]' $IMG
 
 docker/smoke_test.sh http://HOST_A_IP:5100 llama3
 ```

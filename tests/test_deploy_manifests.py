@@ -56,13 +56,13 @@ def test_upstream_pipeline_defaults():
     s0 = _env(d["items"][0])
     assert s0["PP_ENGINE"] == "upstream" and "ROUTER_ADDR" not in s0
     assert json.loads(s0["PP_STAGES"]) == [
-        ["cte-s1-r0.connex.svc.cluster.local:47120", "cte-s1-r1.connex.svc.cluster.local:47122"],
-        ["cte-s2-r0.connex.svc.cluster.local:47220", "cte-s2-r1.connex.svc.cluster.local:47222"]]
+        ["cte-s1-r0.connex.svc.cluster.local:48000", "cte-s1-r1.connex.svc.cluster.local:48016"],
+        ["cte-s2-r0.connex.svc.cluster.local:49000", "cte-s2-r1.connex.svc.cluster.local:49016"]]
     s1r1 = _env(d["items"][4])
-    assert s1r1["CONTROL_PORT"] == "47122" and s1r1["NUM_GPU_BLOCKS"] == s0["NUM_GPU_BLOCKS"]
+    assert s1r1["CONTROL_PORT"] == "48016" and s1r1["NUM_GPU_BLOCKS"] == s0["NUM_GPU_BLOCKS"]
     svc = d["items"][5]
     assert svc["spec"]["clusterIP"] == "None"
-    assert [p["port"] for p in svc["spec"]["ports"]] == [47122, 47123]
+    assert [p["port"] for p in svc["spec"]["ports"]] == [48016, 48017]
 
 
 def test_errors():

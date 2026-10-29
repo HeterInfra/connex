@@ -17,10 +17,16 @@ step's ModelRunnerOutput back to stage 0. All stages must use the same
 A replica serves one pipeline (stage-0 instance) at a time. When its owner
 goes away, the first other pipeline that sends it a step takes it over
 (after it dropped the old owner's requests).
+
+Stage 0 sends its control URL with its HELLO; the server keeps the URLs in
+a small state file (``CONNEX_PP_STATE_DIR``, default /dev/shm, per control
+port), so that after a restart it announces itself to them as soon as it is
+ready instead of waiting for stage 0's next periodic HELLO.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -48,17 +54,51 @@ class StageServer:
         self.live_reqs: set[str] = set()
         self.q: queue.Queue = queue.Queue()
         self.out_q: queue.Queue = queue.Queue()
+        self.done_seq = -1      # last step whose results came back (reported with PONG)
+        self.state_path = os.path.join(os.getenv("CONNEX_PP_STATE_DIR", "/dev/shm"),
+                                       f"connex-pp-heads-{control_port}.json")
+        self.heads: list[str] = self._load_heads()
         self.ctl = ControlLink(self.stage, CTL_SHARD, replica, port=control_port,
                                on_message=self._on_message, on_failed=self._on_failed)
         log.info("connex-pp: stage %d replica %d: control %s, data %s", self.stage, replica,
                  self.ctl.url, self.data_url)
 
+    def _load_heads(self) -> list[str]:
+        try:
+            with open(self.state_path) as f:
+                return [u for u in json.load(f) if isinstance(u, str)][-8:]
+        except (OSError, ValueError):
+            return []
+
+    def _remember_head(self, url: str) -> None:
+        if not url or url in self.heads:
+            return
+        self.heads = (self.heads + [url])[-8:]
+        try:
+            tmp = self.state_path + f".{os.getpid()}"
+            with open(tmp, "w") as f:
+                json.dump(self.heads, f)
+            os.replace(tmp, self.state_path)
+        except OSError as e:
+            log.warning("connex-pp: cannot keep stage-0 URLs in %s: %s", self.state_path, e)
+
+    def announce(self) -> None:
+        """Tell the stage-0 instances we have served (before a restart) that
+        we are ready; they answer with a HELLO."""
+        def run(heads=list(self.heads)):
+            for url in heads:   # a gone one may take a connect timeout
+                self.ctl.send(url, ("READY",), quiet=True)
+
+        threading.Thread(target=run, name="cx-stage-announce", daemon=True).start()
+
     def _on_message(self, peer, msg) -> None:
         kind = msg[0]
         if kind == "HELLO":
+            if len(msg) > 2:
+                self._remember_head(msg[2])
             self.ctl.send(peer, ("HELLO_OK", self.data_url, self.owner))
         elif kind == "PING":
-            self.ctl.send(peer, ("PONG",))
+            self.ctl.send(peer, ("PONG", self.done_seq))
         elif kind in ("EXEC", "SAMPLE"):
             self.q.put((peer, msg))
 
@@ -129,6 +169,8 @@ class StageServer:
             except Exception:  # noqa: BLE001
                 log.exception("connex-pp: stage %d step %d failed; exiting", self.stage, seq)
                 os._exit(1)
+            if kind == "S":
+                self.done_seq = max(self.done_seq, seq)
             if kind == "S" and self.last:
                 self.ctl.send(peer, ("OUT", seq, epoch, out))
 
@@ -157,6 +199,7 @@ def main(argv: list[str] | None = None) -> None:
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     print(f"CONNEX_PP_STAGE_READY stage={server.stage} replica={args.connex_replica} "
           f"control={server.ctl.url}", flush=True)
+    server.announce()
     server.serve_forever()
 
 

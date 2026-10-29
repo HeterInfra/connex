@@ -56,11 +56,15 @@ MODEL_ID = os.getenv("CONNEX_PP_MODEL_ID", "cxpp")
 # (faster, but a CUDA call that holds the GIL and waits for the device, e.g.
 # a first kernel load, can deadlock against it).
 XHOST_STREAM_WAIT = os.getenv("CONNEX_PP_XHOST_STREAM_WAIT", "0") == "1"
-# Sampled tokens across hosts go over a receiver-owned push channel from the
-# PUSH_MARGIN-th step of an (epoch, sender) on; before that (the channel is
-# announced on the first step) they come the slow way, filled on the CPU.
+# Sampled tokens across hosts go over a receiver-owned push channel (one per
+# sender) from the PUSH_MARGIN-th step of an (epoch, sender) on; before that
+# (the receiver tells the sender the boundary on the first step) they come
+# the slow way, filled on the CPU.
 PUSH_MARGIN = int(os.getenv("CONNEX_PP_PUSH_MARGIN", "8"))
 _SAMPLED_SLOTS = 64
+_SAMPLED_SLOT = 1 << 16
+# Inbox items of the current epoch older than this many steps are dropped.
+_INBOX_HORIZON = 4096
 # One stage per instance with TP > 1: every TP rank is a pipeline endpoint
 # and exchanges the hidden states with the same TP rank of the neighbour
 # stage (the route lists one URL per rank, ";"-separated). Off: TP rank 0
@@ -104,7 +108,9 @@ class ConnexPPGroup(GroupCoordinator):
         self._deferred: deque = deque()
         self._step_count = 0
         self._push_first: dict[tuple, int] = {}   # (sender url, epoch) -> first key
-        self._push_pending: deque = deque()       # (key, channel, value) posted on push
+        self._push_pending: deque = deque()       # keys whose receive waits on a push
+        self._route_peers: tuple | None = None    # (route, spares) last seen
+        self._warm_thread = None
         self._local_step = self.stage_rank is not None
         # While set (warmup), receives wait on the CPU instead of queueing a
         # stream wait: a stream wait that only a Python thread of this
@@ -126,13 +132,17 @@ class ConnexPPGroup(GroupCoordinator):
             # endpoints, the hidden states) for the whole stage.
             self.is_endpoint = self.tp_rank == 0
             replica = int(os.getenv("CONNEX_PP_REPLICA", "0"))
-            port = int(os.getenv("CONNEX_PP_DATA_PORT", "0"))
-            if port and self.tp_rank:
-                port += int(os.getenv("CONNEX_PP_TP_PORT_STRIDE", "100")) * self.tp_rank
+            # CONNEX_PP_DATA_PORT is TP rank 0's data port; rank r listens on
+            # the next ones (ports.py: no overlap with other stages/replicas).
+            from connex.adapters.vllm.pp.ports import rank_port
+
+            port = rank_port(int(os.getenv("CONNEX_PP_DATA_PORT", "0")), self.tp_rank)
             if self.is_endpoint or (TP_ENDPOINTS and self.tp_size > 1):
                 self.link = StageLink(MODEL_ID, self.stage_rank, self.tp_rank, replica, self.device,
                                       port=port, ring_mb=ring_mb, ipc_slot_bytes=step_bytes,
-                                      ipc_slots=max(3, parallel_config.pipeline_parallel_size + 1))
+                                      ipc_slots=max(3, parallel_config.pipeline_parallel_size + 1),
+                                      sampled_slots=_SAMPLED_SLOTS,
+                                      sampled_slot_bytes=_SAMPLED_SLOT)
                 self.link.abort_callbacks.append(self._on_abort)
             log.info("Connex PP group: stage %d of %d, TP rank %d%s", self.stage_rank,
                      num_stages, self.tp_rank,
@@ -143,7 +153,9 @@ class ConnexPPGroup(GroupCoordinator):
             if self.world_size > 1:
                 self.link = StageLink(MODEL_ID, self.rank_in_group, self.tp_rank, 0,
                                       self.device, ring_mb=ring_mb, ipc_slot_bytes=step_bytes,
-                                      ipc_slots=max(3, self.world_size + 1))
+                                      ipc_slots=max(3, self.world_size + 1),
+                                      sampled_slots=_SAMPLED_SLOTS,
+                                      sampled_slot_bytes=_SAMPLED_SLOT)
                 urls: list[Any] = [None] * self.world_size
                 torch.distributed.all_gather_object(urls, self.link.url, group=self.cpu_group)
                 self._route = list(urls)
@@ -181,6 +193,80 @@ class ConnexPPGroup(GroupCoordinator):
         self._route = route
         self._bcast_idx = 0
         self._max_tokens = meta.get("max_tokens", 1)
+        if self.link is not None:
+            spares = meta.get("spares") or {}
+            peers = (tuple(route), tuple(sorted((k, tuple(v)) for k, v in spares.items())))
+            if peers != self._route_peers:
+                self._route_peers = peers
+                self._route_changed(route, spares)
+            if seq % 256 == 0:
+                self.link.prune_inbox(epoch, seq - _INBOX_HORIZON)
+
+    def _route_changed(self, route: list, spares: dict) -> None:
+        """The route or its spares changed: retire our channels to peers that
+        are neither (#3: they would hold ring space and polls), and warm the
+        hops a spare would take over (connection, keys, the push channels),
+        so a failover does not pay for them on its first steps."""
+        from connex.adapters.vllm.pp.link import _peer_id
+
+        def eps(entry):
+            if not entry:
+                return []
+            per_rank = self._per_rank(entry)
+            if per_rank:
+                return [self._rank_url(entry, True)]
+            return [self._rank_url(entry)] if self.is_endpoint else []
+
+        keep = set()
+        for e in route:
+            for u in eps(e):
+                keep.add(_peer_id(u))
+        for lst in spares.values():
+            for e in lst:
+                for u in eps(e):
+                    keep.add(_peer_id(u))
+        try:
+            self.link.retain_tx(keep)
+        except Exception:  # noqa: BLE001
+            log.exception("connex-pp: retiring channels failed")
+        if not spares or os.getenv("CONNEX_PP_WARM_SPARES", "1") != "1":
+            return
+        me, last = self.rank_in_group, self.world_size - 1
+        todo = []
+        for st, lst in spares.items():
+            st = int(st)
+            for e in lst:
+                if not e or self._same_host(e.split(";")[0]):
+                    continue   # same host: CUDA IPC, nothing to warm
+                for u in eps(e):
+                    if st == me + 1:
+                        todo.append(("want", u, "h"))      # we would send it hidden states
+                    elif st == me - 1:
+                        todo.append(("announce", u, "h"))  # it would send us hidden states
+                    if self.is_endpoint and u == self._rank_url(e):
+                        if st == last and me != last:
+                            todo.append(("announce", u, "s"))  # its sampled tokens to us
+                        elif me == last and st != last:
+                            todo.append(("want", u, "s"))      # ours to it
+        if not todo:
+            return
+        import threading
+
+        def warm(todo=todo, link=self.link, dev=self.device):
+            torch.cuda.set_device(dev)
+            for what, u, tag in todo:
+                try:
+                    if what == "want":
+                        link.want_chan(u, tag)
+                    else:
+                        link.connect(u)
+                        link.announce(_peer_id(u), tag)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("connex-pp: warming the hop to spare %s failed: %s", u, e)
+            log.info("connex-pp: warmed %d hop(s) to spares", len(todo))
+
+        self._warm_thread = threading.Thread(target=warm, name="cx-pp-warm", daemon=True)
+        self._warm_thread.start()
 
     # Keys are (epoch, seq, idx): idx -1 for the hidden states of a step,
     # 0.. for the sampled-token broadcasts within it.
@@ -199,12 +285,14 @@ class ConnexPPGroup(GroupCoordinator):
         # Let every stream that still waits for sampled tokens of an older
         # epoch go (the requests are recomputed, the bytes are not used).
         if self.link is not None:
-            self.link.close_chans(lambda k: (k[1][0] == "s" and k[1][1] < epoch) or (
-                k[1][0] == "p" and isinstance(k[1][1], tuple) and k[1][1][1] < epoch))
-            for key, _ch, _v in self._push_pending:
+            # same-host sampled-token channels are per epoch
+            self.link.close_chans(lambda k: k[1][0] == "s" and k[1][1] < epoch)
+            for key in self._push_pending:
                 if key[0] < epoch:
-                    self.link.push_fallback.pop(key, None)
-            self._push_pending = deque(x for x in self._push_pending if x[0][0] >= epoch)
+                    self.link.forget_push(key)
+            self._push_pending = deque(k for k in self._push_pending if k[0] >= epoch)
+        for k in [k for k in self._push_first if k[1] < epoch]:
+            del self._push_first[k]
         if self._waiter is None:
             return
         for key in [k for k in self._pending_slots if k[0] < epoch]:
@@ -356,18 +444,18 @@ class ConnexPPGroup(GroupCoordinator):
             if url and self.link.same_host(url):
                 self._push_sampled(url, key[0], tensor)
                 continue
-            tx = self.link._tx_chans.get((_peer_id(url), ("p", ("s", key[0]))))
-            if tx is not None and not tx.dead and key[1] >= tx.extra and key[2] < 4:
-                try:
-                    tx.push_staged(key[1] * 4 + key[2],
-                                   [tensor.contiguous().view(-1).view(torch.uint8)])
+            # The receiver's channel carries this key when it told us so for
+            # this epoch (extra = (epoch, first seq)).
+            tx = self.link._tx_chans.get((_peer_id(url), ("p", "s")))
+            ex = getattr(tx, "extra", None)
+            if (tx is not None and not tx.dead and ex is not None and key[0] == ex[0]
+                    and key[1] >= ex[1] and key[2] < 4):
+                if self.link.push_sampled(tx, url, key,
+                                          [tensor.contiguous().view(-1).view(torch.uint8)]):
                     continue
-                except Exception as e:  # noqa: BLE001
-                    log.warning("connex-pp: sampled-token push to %s failed: %s", url, e)
-                    tx.dead = True
             slow(url)
 
-    _SAMPLED_SLOT = 1 << 16
+    _SAMPLED_SLOT = _SAMPLED_SLOT
 
     def _push_sampled(self, url: str, epoch: int, tensor: torch.Tensor) -> None:
         ch, new = self.link.tx_chan(url, ("s", epoch), self._SAMPLED_SLOT, 16)
@@ -433,25 +521,43 @@ class ConnexPPGroup(GroupCoordinator):
         if first == key[1] and self.is_endpoint and self.link is not None:
             from connex.adapters.vllm.pp.link import _peer_id
 
-            # Announce now; the sender pushes from first + margin on.
-            self.link.push_rx(_peer_id(src), ("s", key[0]), _SAMPLED_SLOTS, self._SAMPLED_SLOT,
-                              host=True, announce=first + PUSH_MARGIN)
+            # Tell the sender now; it pushes from first + margin on. One
+            # channel per sender: a new one only when there is none yet (a
+            # spare's was announced ahead, see _route_changed).
+            frm = (key[0], first + PUSH_MARGIN)
+            ch = self.link._rx_chans.get((_peer_id(src), ("p", "s")))
+            if ch is None or ch.retired:
+                self.link.push_rx(_peer_id(src), "s", announce=frm)
+            else:
+                self.link.update_chan(ch, frm)
         return key[1] >= first + PUSH_MARGIN
 
     def _pull_pushed(self, src: str, key: tuple, tensor: torch.Tensor) -> None:
         from connex.adapters.vllm.pp.link import _peer_id
 
-        ch = self.link._rx_chans.get((_peer_id(src), ("p", ("s", key[0]))))
-        if ch is None or ch.retired:
-            return  # the sender is gone (its epoch is being aborted)
-        v = key[1] * 4 + key[2]
-        self.link.push_fallback[key] = (ch, v)
-        self._push_pending.append((key, ch, v))
-        while len(self._push_pending) > 4 * _SAMPLED_SLOTS:
-            k, _, _ = self._push_pending.popleft()
-            self.link.push_fallback.pop(k, None)
-        buf = ch.wait(v)
+        ch = self.link._rx_chans.get((_peer_id(src), ("p", "s")))
         n = tensor.numel() * tensor.element_size()
+        if ch is None or ch.retired:
+            # No channel (the sender failed and its epoch is being aborted,
+            # or ours was given up): the sender sends the slow way. Take it on
+            # the CPU; never leave the tensor as it is.
+            data = self.link.take(key, timeout=60.0)
+            if data is None:
+                if key[0] < self.link.min_epoch:
+                    return   # aborted: the step is recomputed
+                raise RuntimeError(f"connex-pp: sampled tokens {key} from {src} never came")
+            tensor.view(-1).view(torch.uint8).copy_(
+                torch.frombuffer(bytearray(data), dtype=torch.uint8)[:n])
+            return
+        v = key[1] * 4 + key[2]
+        ch.skip_to(v)
+        buf = ch.wait(v, key[0])
+        # If the sender sends this one the slow way after all (it got the
+        # boundary late, or its push failed), the rx thread fills the slot.
+        self.link.expect_push(key, ch, v)
+        self._push_pending.append(key)
+        while len(self._push_pending) > 4 * _SAMPLED_SLOTS:
+            self.link.forget_push(self._push_pending.popleft())
         tensor.view(-1).view(torch.uint8).copy_(buf[:n], non_blocking=True)
         ch.done(v)
 
@@ -476,6 +582,9 @@ class ConnexPPGroup(GroupCoordinator):
                 if data is not None:
                     host = torch.frombuffer(bytearray(data), dtype=torch.uint8)
                     tensor.view(-1).view(torch.uint8).copy_(host, non_blocking=False)
+                elif key[0] >= self.link.min_epoch:
+                    # not aborted, just never came: do not decode on garbage
+                    raise RuntimeError(f"connex-pp: sampled tokens {key} never came")
             if self.external and self.tp_size > 1:
                 self.tp.broadcast(tensor, src=0)
 
@@ -490,11 +599,12 @@ class ConnexPPGroup(GroupCoordinator):
         if ch is None:
             msg = self.link.take((epoch, -1, -2), timeout=30.0)
             if msg is None:
-                # epoch aborted (the requests are recomputed), or the sender
-                # never came: do not hold the worker forever
-                if epoch >= self.link.min_epoch:
-                    log.warning("connex-pp: no sampled-token channel for epoch %d", epoch)
-                return
+                if epoch < self.link.min_epoch:
+                    return   # epoch aborted: the requests are recomputed
+                # The sender never announced its channel: reading on would
+                # use garbage tokens and leave ch.i one behind the sender.
+                raise RuntimeError(f"connex-pp: no sampled-token channel from {src} for "
+                                   f"epoch {epoch}")
             ch = self.link.rx_chan(peer, ("s", epoch), msg[1])
         i = ch.i
         ch.i += 1

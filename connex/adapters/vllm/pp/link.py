@@ -27,6 +27,12 @@ caller still waits for in an older epoch, so a stage whose upstream died
 never blocks forever.
 
 Peer-failure events from connex-rs are passed to ``on_peer_failed``.
+
+Failures never turn into silently wrong data: a hop whose bytes cannot be
+delivered for a live epoch (a failed read, a failed push chain, a push on a
+channel we do not know) stops this process (``fatal``), so the pipeline
+fails over and the step is recomputed; for an aborted epoch they are
+dropped.
 """
 
 from __future__ import annotations
@@ -56,6 +62,9 @@ ABORT = 3
 CONTROL = 4
 READY = 5     # the data of an announced tensor dict is in place
 CHAN = 6      # a receiver's push channel (rdmachan) for the sender to use
+WANT = 7      # a sender asks for a push channel (warming a spare's hop)
+CHANX = 8     # a receiver updates what a push channel carries (sampled tokens)
+CHANFAIL = 9  # a sender's chain into one of our channels failed
 
 # Same-host stage pairs copy over CUDA IPC (CONNEX_PP_CUDA_IPC=0: RDMA loopback).
 IPC_ENABLED = os.getenv("CONNEX_PP_CUDA_IPC", "1") == "1"
@@ -67,21 +76,32 @@ _push_ok: bool | None = None
 
 
 def push_supported() -> bool:
-    """PUSH_ENABLED and a connex-rs with ``Engine.put_chain`` (connex-rs>=0.1.4);
-    without it cross-host receives wait on the CPU.
-    Both ends of a hop are assumed to run the same install."""
+    """PUSH_ENABLED and a connex-rs whose ``Engine.put_chain`` takes a cancel
+    word and compares cyclically (connex-rs>=0.1.5); without it cross-host
+    receives wait on the CPU. Both ends of a hop are assumed to run the same
+    install."""
     global _push_ok
     if _push_ok is None:
         try:
             import connex_rs  # type: ignore
 
-            _push_ok = PUSH_ENABLED and hasattr(connex_rs.Engine, "put_chain")
+            sig = getattr(getattr(connex_rs.Engine, "put_chain", None), "__text_signature__", "")
+            _push_ok = PUSH_ENABLED and "cancel" in (sig or "")
         except ImportError:
             _push_ok = False
     return _push_ok
 
 
 READ_TIMEOUT_MS = int(os.getenv("CONNEX_PP_READ_TIMEOUT_MS", "10000"))
+# A push chain whose doorbell (the sender's own stream) does not ring in
+# this long fails (a hung GPU), instead of holding its queue forever.
+CHAIN_ARM_TIMEOUT_MS = int(os.getenv("CONNEX_PP_CHAIN_ARM_TIMEOUT_MS", "60000"))
+# Waiting for space in the send ring longer than this raises.
+RING_TIMEOUT_S = float(os.getenv("CONNEX_PP_RING_TIMEOUT_S", "60"))
+# Re-announce a push channel to a sender that still sends without it.
+REANNOUNCE_S = 1.0
+# RMA on GPU memory is at least this long (see rdmachan.ZCOPY_MIN).
+ZCOPY_MIN = ZCOPY_THRESH
 _DTYPES = {str(d): d for d in (torch.float16, torch.bfloat16, torch.float32, torch.int64,
                                torch.int32, torch.uint8, torch.float8_e4m3fn)}
 
@@ -172,7 +192,8 @@ class _Ring:
                     return off
                 rem = None if deadline is None else deadline - time.monotonic()
                 if rem is not None and rem <= 0:
-                    raise TimeoutError("ring full")
+                    raise TimeoutError(f"ring full for {timeout:.1f} s ({len(self.live)} "
+                                       "messages held)")
                 self.cv.wait(0.002)
                 self.cv.release()
                 try:
@@ -218,7 +239,8 @@ class StageLink:
                  device: torch.device, port: int = 0, ring_mb: int | None = None,
                  on_peer_failed: Callable[[tuple], None] | None = None,
                  on_control: Callable[[tuple, Any], None] | None = None,
-                 ipc_slot_bytes: int = 0, ipc_slots: int = 3):
+                 ipc_slot_bytes: int = 0, ipc_slots: int = 3,
+                 sampled_slots: int = 64, sampled_slot_bytes: int = 1 << 16):
         self.device = device
         si = float(os.getenv("CONNEX_PP_SWITCH_INTERVAL_US", "0"))
         if si > 0:
@@ -243,6 +265,8 @@ class StageLink:
         self.copy_stream = torch.cuda.Stream(device)
         self.on_peer_failed = on_peer_failed
         self.on_control = on_control
+        # Called with a reason when this process must stop (see fatal()).
+        self.on_fatal: Callable[[str], None] | None = None
         self.min_epoch = 0
         self.abort_callbacks: list[Callable[[int], None]] = []
         self.inbox = _Inbox()
@@ -255,6 +279,10 @@ class StageLink:
         # GPU-driven same-host channels (ipcchan): ours to each peer, and
         # the peers' to us; plus the receive whose slot is released next.
         self.ipc_slot_bytes, self.ipc_slots = ipc_slot_bytes, ipc_slots
+        # What a push channel of each tag looks like: (slots, slot bytes, host ring)
+        self.chan_specs = {"h": (ipc_slots, ipc_slot_bytes, False),
+                           "s": (sampled_slots, sampled_slot_bytes, True)}
+        self._chan_lock = threading.RLock()
         self._tx_chans: dict[tuple, Any] = {}
         self._rx_chans: dict[tuple, Any] = {}
         self._rx_done: tuple | None = None
@@ -264,22 +292,40 @@ class StageLink:
         self._waiter = None
         self._outstanding: dict[int, tuple] = {}
         self._msg_id = 0
-        # push channels (rdmachan): ours by id, and who announced what
+        # push channels (rdmachan) we receive on, by id (the current one of
+        # a (peer, tag) and up to one older one whose pushes may still be
+        # consumed), and when we last announced one to a sender incarnation
         self._push_rx: dict[int, Any] = {}
-        self._announced: set = set()
+        self._retired_cids: deque = deque(maxlen=256)
+        self._announced: dict[tuple, float] = {}
         self.nonce = os.urandom(8).hex()
         self._reap: queue.Queue = queue.Queue()
         self.push_fallback: dict[tuple, tuple] = {}
         self._tx: queue.Queue = queue.Queue()
         self._closed = False
+        self._fatal = False
         self.stats = {"sent": 0, "recv": 0, "bytes_sent": 0, "bytes_recv": 0,
-                      "read_s": 0.0}
+                      "read_s": 0.0, "chain_err": 0, "fallback_fill": 0}
         # connex-rs releases the GIL while waiting; these threads only parse
         # headers and post reads.
         for target, name in ((self._rx_loop, "cx-pp-rx"), (self._tx_loop, "cx-pp-tx"),
                              (self._event_loop, "cx-pp-ev"), (_orphan_watch, "cx-pp-orphan"),
                              (self._reap_loop, "cx-pp-reap")):
             threading.Thread(target=target, name=name, daemon=True).start()
+
+    # ---------------------------------------------------------------- failure
+    def fatal(self, reason: str) -> None:
+        """This hop cannot deliver the data of a live step: stop the process
+        (its stage fails over, the step is recomputed) rather than letting a
+        stream go on with bytes that never arrived. ``on_fatal`` may
+        override (tests)."""
+        log.critical("connex-pp: %s; stopping this process so the pipeline fails over", reason)
+        self._fatal = True
+        if self.on_fatal is not None:
+            self.on_fatal(reason)
+            return
+        logging.shutdown()
+        os._exit(70)
 
     # ------------------------------------------------------------------ send
     def send_tensors(self, peer_url: str, key: tuple, tensors: dict[str, torch.Tensor],
@@ -297,7 +343,8 @@ class StageLink:
         if tx is not None and not tx.dead and total <= tx.slot_bytes:
             if self._send_push(tx, peer_url, key, tensors, layout, total, meta):
                 return
-        off = self.send_ring.alloc(max(total, _ALIGN))
+        # At least ZCOPY_MIN bytes: the receiver reads that much (GPU RMA).
+        off = self.send_ring.alloc(max(total, ZCOPY_MIN), timeout=RING_TIMEOUT_S)
         base = self.send_buf[off:off + total]
         for lay in layout:
             t = tensors[lay.name]
@@ -330,7 +377,9 @@ class StageLink:
         """Cross host, receiver-driven: copy into our registered ring, ring
         the doorbell on the stream; connex-rs puts the bytes into the
         receiver's slot and sets its flag once the copy is done."""
-        off = self.send_ring.alloc(max(total, _ALIGN))
+        # The chain puts at least ZCOPY_MIN bytes (GPU RMA below UCX's
+        # zero-copy threshold crashes in UCX): allocate that much.
+        off = self.send_ring.alloc(max(total, ZCOPY_MIN), timeout=RING_TIMEOUT_S)
         base = self.send_buf[off:off + total]
         for lay in layout:
             t = tensors[lay.name]
@@ -339,14 +388,14 @@ class StageLink:
         i = tx.i
         gate = i - tx.n + 1 if i >= tx.n else None
         try:
-            t = tx.push(i, self.send_buf.data_ptr() + off, total, gate)
+            t = tx.push(i, self.send_buf.data_ptr() + off, total, gate, epoch=key[0])
         except Exception as e:  # noqa: BLE001
             log.warning("connex-pp: push to %s failed: %s", peer_url, e)
             self.send_ring.free(off)   # nothing was armed; the copy is stream-ordered
             tx.dead = True
             return False
         tx.i += 1
-        self._reap.put((t, off))
+        self._reap.put(_Reap(t, off, tx, peer_url, key, "h", i))
         lay = [(x.name, str(x.dtype), x.shape, x.offset, x.nbytes) for x in layout]
         try:
             self.engine.send_msg(peer_url, pickle.dumps(
@@ -359,55 +408,207 @@ class StageLink:
         self.stats["push"] = self.stats.get("push", 0) + 1
         return True
 
+    def push_sampled(self, tx, peer_url: str, key: tuple, chunks: list) -> bool:
+        """Sampled tokens over a receiver's host-ring push channel (see
+        group._send_sampled); False when the channel cannot take it."""
+        v = key[1] * 4 + key[2]
+        gate = v - tx.n + 1 if v >= tx.n else None
+        try:
+            t = tx.push_staged(v, chunks, gate=gate, epoch=key[0])
+        except Exception as e:  # noqa: BLE001
+            log.warning("connex-pp: sampled-token push to %s failed: %s", peer_url, e)
+            tx.dead = True
+            return False
+        nbytes = sum(c.numel() for c in chunks)
+        self._reap.put(_Reap(t, None, tx, peer_url, key, "s", v, nbytes))
+        return True
+
     def _reap_loop(self) -> None:
         """Free the ring space of pushed messages once connex-rs is done
-        with them (memory reuse only; nothing waits for this on the data
-        path)."""
+        with them, in completion order (one stuck chain must not hold the
+        others' space), and handle failed chains (see _chain_failed)."""
+        pending: list = []
         while not self._closed:
-            item = self._reap.get()
-            if item is None:
-                return
-            t, off = item
             try:
-                t.wait()
-            except Exception:  # noqa: BLE001  (peer gone / canceled)
+                item = self._reap.get(timeout=None if not pending else 0.001)
+                if item is None:
+                    return
+                pending.append(item)
+                while True:   # take whatever else is queued
+                    item = self._reap.get_nowait()
+                    if item is None:
+                        return
+                    pending.append(item)
+            except queue.Empty:
                 pass
-            self.send_ring.free(off)
+            keep = []
+            for r in pending:
+                if not r.t.done():
+                    keep.append(r)
+                    continue
+                err = None
+                try:
+                    r.t.wait(0)
+                except Exception as e:  # noqa: BLE001
+                    err = e
+                if r.off is not None:
+                    self.send_ring.free(r.off)
+                if err is None:
+                    if r.tx.first_done is None:
+                        r.tx.first_done = time.monotonic()
+                        log.info("connex-pp: first chain on push channel %s to %s done "
+                                 "%.1f ms after it opened", r.tx.cid, r.peer_url,
+                                 (r.tx.first_done - r.tx.created) * 1e3)
+                elif not (isinstance(err, RuntimeError) and "canceled" in str(err)):
+                    self._chain_failed(r, err)
+            pending = keep
 
-    def push_rx(self, peer: tuple, tag: str, slots: int, slot_bytes: int,
-                host: bool = False, announce: Any = None):
+    def _chain_failed(self, r: "_Reap", err: Exception) -> None:
+        """A push chain failed (no connection, a failed put/flush/read, a
+        lost key, a doorbell or gate that timed out). The channel is not used
+        again (later messages go the read path, and the receiver announces a
+        new channel). The message itself: dropped when its epoch is aborted;
+        sampled tokens are sent again the slow way (the receiver fills its
+        slot from the CPU); hidden states tell the receiver, which cannot use
+        the step (CHANFAIL)."""
+        r.tx.dead = True
+        self.stats["chain_err"] += 1
+        if r.kind == "w":
+            log.warning("connex-pp: warm-up chain on push channel %s to %s failed: %r",
+                        r.tx.cid, r.peer_url, err)
+            return
+        if r.key[0] < self.min_epoch:
+            return
+        log.warning("connex-pp: push of %s to %s failed: %r", r.key, r.peer_url, err)
+        if r.kind == "s":
+            try:
+                payload = r.tx.staged_bytes(r.v, r.nbytes)
+            except Exception:  # noqa: BLE001
+                payload = None
+            if payload is not None:
+                self._tx.put((None, r.peer_url, (BYTES, r.key, self.url, payload)))
+            return
+        try:
+            self.engine.send_msg(r.peer_url, pickle.dumps((CHANFAIL, r.tx.cid, r.v, r.key,
+                                                           repr(err)[:200])))
+        except Exception as e:  # noqa: BLE001
+            log.warning("connex-pp: telling %s about the failed push failed: %s", r.peer_url, e)
+
+    def push_rx(self, peer: tuple, tag: str, slots: int | None = None,
+                slot_bytes: int | None = None, host: bool | None = None,
+                announce: Any = None):
         """A new receive channel for pushes from ``peer`` (replacing the
         previous one for ``tag``), announced to the peer."""
         from connex.adapters.vllm.pp.rdmachan import PushRx
 
+        d_slots, d_bytes, d_host = self.chan_specs[tag if isinstance(tag, str) else tag[0]]
+        slots = slots or d_slots
+        slot_bytes = slot_bytes or d_bytes
+        host = d_host if host is None else host
+        torch.cuda.set_device(self.device)
         k = (tuple(peer), ("p", tag))
-        if k in self._rx_chans:
-            self.close_chans(lambda kk, k=k: kk == k)
         ch = PushRx(self.engine, self.url, self.device, slots, slot_bytes, host=host)
-        self._rx_chans[k] = ch
-        self._push_rx[ch.cid] = ch
+        ch.from_key = announce
+        with self._chan_lock:
+            old = self._rx_chans.get(k)
+            self._rx_chans[k] = ch
+            self._push_rx[ch.cid] = ch
+            # Pushes into the previous channel may still be consumed (the
+            # sender switches when it gets ours): keep it; retire the one
+            # before it.
+            older = [c for c in self._push_rx.values()
+                     if c is not ch and c is not old and getattr(c, "key", None) == k]
+            ch.key = k
+        for c in older:
+            self._retire_rx(c)
         try:
             self.engine.send_msg(tuple(peer), pickle.dumps((CHAN, tag, ch.info, announce)))
         except Exception as e:  # noqa: BLE001
             log.warning("connex-pp: announcing a channel to %s failed: %s", peer, e)
         return ch
 
+    def _retire_rx(self, ch) -> None:
+        with self._chan_lock:
+            self._push_rx.pop(ch.cid, None)
+            for k in [k for k, c in self._rx_chans.items() if c is ch]:
+                del self._rx_chans[k]
+        self._bury(ch)
+
+    def _bury(self, ch) -> None:
+        if hasattr(ch, "from_key"):   # a PushRx of ours
+            self._retired_cids.append(ch.cid)
+        if self._graveyard is None:
+            from connex.adapters.vllm.pp.ipcchan import Graveyard
+
+            self._graveyard = Graveyard()
+        self._graveyard.add(ch)
+
+    def announce(self, peer: tuple, tag: str, announce: Any = None):
+        """``push_rx`` unless a live channel for (peer, tag) exists."""
+        ch = self._rx_chans.get((tuple(peer), ("p", tag)))
+        if ch is not None and not ch.retired:
+            return ch
+        return self.push_rx(peer, tag, announce=announce)
+
+    def update_chan(self, ch, extra: Any) -> None:
+        """Tell the sender of push channel ``ch`` what it now carries."""
+        ch.from_key = extra
+        try:
+            self.engine.send_msg(ch.key[0], pickle.dumps((CHANX, ch.cid, extra)))
+        except Exception as e:  # noqa: BLE001
+            log.warning("connex-pp: updating a channel of %s failed: %s", ch.key[0], e)
+
+    def want_chan(self, url: str, tag: str) -> None:
+        """Ask ``url`` (a receiver of ours) for a push channel of ``tag`` now,
+        so that the first message to it does not go the slow way."""
+        if (_peer_id(url), ("p", tag)) in self._tx_chans:
+            return
+        self._tx.put((None, url, (WANT, tag)))
+
     def _on_chan(self, peer, tag, info, extra) -> None:
         from connex.adapters.vllm.pp.rdmachan import PushTx
 
         torch.cuda.set_device(self.device)
         k = (tuple(peer), ("p", tag))
-        tx = PushTx(self.engine, self.device, info, staging=(tag != "h"),
-                    host_staging=(tag != "h"), timeout_ms=READ_TIMEOUT_MS)
+        host = tag != "h"
+        tx = PushTx(self.engine, self.device, info, staging=host, host_staging=host,
+                    timeout_ms=READ_TIMEOUT_MS, arm_timeout_ms=CHAIN_ARM_TIMEOUT_MS)
         tx.extra = extra
-        old = self._tx_chans.get(k)
-        self._tx_chans[k] = tx
+        log.info("connex-pp: push channel %s (%s) to %s opened", tx.cid, tag, peer)
+        with self._chan_lock:
+            old = self._tx_chans.get(k)
+            self._tx_chans[k] = tx
         if old is not None:
-            if self._graveyard is None:
-                from connex.adapters.vllm.pp.ipcchan import Graveyard
+            self._bury(old)
+        # A first chain now: connection, keys and the path are warm before a
+        # step depends on them.
+        try:
+            if tx.staging is not None:
+                self._reap.put(_Reap(tx.warm(), None, tx, peer, (self.min_epoch, -1, -1),
+                                     "w", 0))
+            else:
+                off = self.send_ring.alloc(ZCOPY_MIN, timeout=1.0)
+                self._reap.put(_Reap(tx.warm(self.send_buf.data_ptr() + off), off, tx, peer,
+                                     (self.min_epoch, -1, -1), "w", 0))
+        except Exception as e:  # noqa: BLE001
+            log.warning("connex-pp: warming push channel %s failed: %s", tx.cid, e)
 
-                self._graveyard = Graveyard()
-            self._graveyard.add(old)
+    def _on_chanx(self, peer, cid, extra) -> None:
+        with self._chan_lock:
+            for (p, _tag), tx in self._tx_chans.items():
+                if p == tuple(peer) and getattr(tx, "cid", None) == cid:
+                    tx.extra = extra
+                    return
+
+    def _on_chanfail(self, peer, cid, v, key, err) -> None:
+        if key[0] < self.min_epoch:
+            return   # an aborted step: nobody uses it
+        ch = self._push_rx.get(cid)
+        if (ch is not None and ch.retired) or cid in self._retired_cids:
+            return   # we gave that channel up (its waits were released)
+        # The step's stream waits for bytes that will not come; letting it go
+        # would compute on garbage. Stop: the pipeline fails over.
+        self.fatal(f"push of {key} from {peer} into channel {cid} failed ({err})")
 
     def same_host(self, url: str) -> bool:
         return (bool(url) and IPC_ENABLED and self.ipc_slot_bytes > 0
@@ -436,14 +637,28 @@ class StageLink:
         return ch
 
     def close_chans(self, pred) -> None:
-        from connex.adapters.vllm.pp.ipcchan import Graveyard
+        with self._chan_lock:
+            gone = []
+            for d in (self._tx_chans, self._rx_chans):
+                for k in [k for k in d if pred(k)]:
+                    gone.append(d.pop(k))
+            for ch in gone:
+                if getattr(ch, "cid", None) in self._push_rx and \
+                        self._push_rx[ch.cid] is ch:
+                    del self._push_rx[ch.cid]
+            # older push channels of the same keys
+            for cid, ch in list(self._push_rx.items()):
+                if getattr(ch, "key", None) is not None and pred(ch.key):
+                    gone.append(self._push_rx.pop(cid))
+        for ch in gone:
+            self._bury(ch)
+        self.drain_chans()
 
-        if self._graveyard is None:
-            self._graveyard = Graveyard()
-        for d in (self._tx_chans, self._rx_chans):
-            for k in [k for k in d if pred(k)]:
-                self._graveyard.add(d.pop(k))
-        self._graveyard.drain()
+    def retain_tx(self, keep: set) -> None:
+        """Retire our channels to peers outside ``keep`` (peers that left the
+        route and are no spares): their chains are cancelled and the memory
+        released, instead of holding ring space and polls."""
+        self.close_chans(lambda k: k in self._tx_chans and k[0] and k[0] not in keep)
 
     def drain_chans(self) -> None:
         if self._graveyard is not None:
@@ -542,18 +757,32 @@ class StageLink:
                 self._on_chan(peer, hdr[1], hdr[2], hdr[3])
             except Exception:  # noqa: BLE001
                 log.exception("connex-pp: opening a push channel to %s failed", peer)
+        elif kind == CHANX:
+            self._on_chanx(peer, hdr[1], hdr[2])
+        elif kind == WANT:
+            if push_supported() and not self._closed:
+                try:
+                    self.announce(tuple(peer), hdr[1])
+                except Exception:  # noqa: BLE001
+                    log.exception("connex-pp: announcing a channel to %s failed", peer)
+        elif kind == CHANFAIL:
+            self._on_chanfail(tuple(peer), *hdr[1:5])
         elif kind == READY:
             self._on_ready(peer, hdr)
         elif kind == BYTES:
             _, key, _src, payload = hdr
-            fb = self.push_fallback.pop(key, None)
-            if fb is not None:
-                # The sender had no channel yet for a message we wait for
-                # on one: deliver it into the slot from here.
-                log.warning("connex-pp: %s came without push; filling from the CPU", key)
-                fb[0].fill(fb[1], payload)
-                return
-            self._deliver(key, payload)
+            with self.inbox.cv:
+                fb = self.push_fallback.pop(key, None)
+                if fb is None:
+                    if key[0] >= self.min_epoch:
+                        self.inbox.items[key] = payload
+                        self.inbox.cv.notify_all()
+                    return
+                # The sender had no channel yet (or its push failed) for a
+                # message we wait for on one: deliver it into the slot from
+                # here. Under the inbox lock, so that a receive registering
+                # its fallback (expect_push) sees either this or the item.
+                self._fill_fallback(key, fb, payload)
         elif kind == ABORT:
             self.abort(hdr[1])
         elif kind == CONTROL:
@@ -562,6 +791,27 @@ class StageLink:
                     self.on_control(peer, hdr[1])
                 except Exception:  # noqa: BLE001
                     log.exception("connex-pp: control handler failed")
+
+    def _fill_fallback(self, key, fb, payload) -> None:
+        log.warning("connex-pp: %s came without push; filling from the CPU", key)
+        self.stats["fallback_fill"] += 1
+        fb[0].fill(fb[1], payload)
+
+    def expect_push(self, key: tuple, ch, v: int) -> None:
+        """A receive of ``key`` waits on push channel ``ch`` for message
+        ``v``. If the sender sends it the slow way instead (no channel yet,
+        or a failed chain), fill the slot from the CPU: now when it is
+        already here, else when it arrives. One lock with _handle(BYTES)."""
+        with self.inbox.cv:
+            payload = self.inbox.items.pop(key, None)
+            if payload is None:
+                self.push_fallback[key] = (ch, v)
+                return
+        self._fill_fallback(key, (ch, v), payload)
+
+    def forget_push(self, key: tuple) -> None:
+        with self.inbox.cv:
+            self.push_fallback.pop(key, None)
 
     def _on_ready(self, peer, hdr) -> None:
         _, key, src_url, src_ptr, mid, total = hdr[:6]
@@ -587,13 +837,21 @@ class StageLink:
     def _read_into(self, peer, hdr, posted) -> None:
         _, key, src_url, src_ptr, mid, total = hdr[:6]
         off, slot = posted
+        # Both rings hold at least ZCOPY_MIN bytes for the message (GPU RMA
+        # below UCX's zero-copy threshold crashes in UCX).
         rc = self.engine.transfer_sync_read(src_url, self.recv_buf.data_ptr() + off, src_ptr,
-                                            total, READ_TIMEOUT_MS)
+                                            max(total, ZCOPY_MIN), READ_TIMEOUT_MS)
         # The sender's slot is free once the read is done; ack off the
         # critical path.
         self._ack(peer, mid)
         if rc != 0:
-            log.warning("connex-pp: read of %d bytes from %s failed (%d)", total, src_url, rc)
+            if key[0] < self.min_epoch:
+                self._waiter.fill(slot, None)   # aborted: nobody uses the data
+                return
+            # Do not let the stream (or the blocking receive) go on with
+            # bytes that never arrived.
+            self.fatal(f"read of {total} bytes for {key} from {src_url} failed ({rc})")
+            return
         self.stats["recv"] += 1
         self.stats["bytes_recv"] += total
         self._waiter.fill(slot, None)   # the stream may use the data now
@@ -608,6 +866,18 @@ class StageLink:
                 return
             self.inbox.items[key] = item
             self.inbox.cv.notify_all()
+
+    def prune_inbox(self, epoch: int, seq_floor: int) -> int:
+        """Drop items of ``epoch`` older than ``seq_floor`` nobody took (a
+        payload that also came over a push channel, a channel message of a
+        step that ran locally): they would stay forever otherwise."""
+        with self.inbox.cv:
+            old = [k for k in self.inbox.items if k[0] == epoch and 0 <= k[1] < seq_floor]
+            for k in old:
+                del self.inbox.items[k]
+            for k in [k for k in self.push_fallback if k[0] == epoch and k[1] < seq_floor]:
+                del self.push_fallback[k]
+        return len(old)
 
     def take(self, key: tuple, timeout: float | None = None):
         """Block until the item for ``key`` arrives. Returns None when the
@@ -656,12 +926,14 @@ class StageLink:
             _, cid, i = item.ipc
             ch = self._push_rx.get(cid)
             if ch is None or ch.retired:
-                log.warning("connex-pp: push for unknown channel %s from %s", cid, item.peer)
-                return None
-            for j in range(max(ch.last + 1, i - ch.n), i):
-                ch.done(j)   # messages of aborted steps we never consumed
-            ch.last = i
-            buf = ch.wait(i)   # released by the sender's NIC: safe even in warmup
+                if key[0] < self.min_epoch:
+                    return None
+                # Its bytes went into a channel we no longer have: they
+                # cannot be waited for, and the stream must not use garbage.
+                raise RuntimeError(f"connex-pp: push for {key} on unknown channel {cid} "
+                                   f"from {item.peer}")
+            ch.skip_to(i)   # messages of aborted steps we never consumed
+            buf = ch.wait(i, key[0])   # released by the sender's NIC: safe even in warmup
             self._rx_done = (ch, i)
             self.stats["recv"] += 1
             self.stats["bytes_recv"] += item.total
@@ -672,10 +944,14 @@ class StageLink:
                 out[name] = buf[loff:loff + n].view(dt).view(shape)
             return out, item.meta
         if path == "rdma":
-            # A sender that can push but has no channel of ours yet.
-            if (item.peer, item.ipc[1]) not in self._announced and self.ipc_slot_bytes > 0:
-                self._announced.add((item.peer, item.ipc[1]))
-                self.push_rx(item.peer, "h", self.ipc_slots, self.ipc_slot_bytes)
+            # A sender that can push but has no channel of ours (yet, or any
+            # more: it gave a failed one up). Announce one; again after a
+            # while if it keeps sending without.
+            ak = (item.peer, item.ipc[1])
+            now = time.monotonic()
+            if self.ipc_slot_bytes > 0 and now - self._announced.get(ak, -1e9) > REANNOUNCE_S:
+                self._announced[ak] = now
+                self.push_rx(item.peer, "h")
         elif item.ipc is not None:
             _, info, i = item.ipc
             ch = self.rx_chan(item.peer, ("h",), info)
@@ -683,7 +959,7 @@ class StageLink:
             for j in range(max(last + 1, i - ch.n), i):
                 ch.done(j)   # messages of aborted steps we never consumed
             self._rx_last[info[0]] = i
-            buf = ch.wait(i)
+            buf = ch.wait(i, key[0])
             if blocking:
                 stream.synchronize()  # released by the sender's GPU, not by us
             self._rx_done = (ch, i)
@@ -698,7 +974,7 @@ class StageLink:
             from connex.adapters.vllm.pp.hostwait import HostFlagWaiter
 
             self._waiter = HostFlagWaiter(self.device)
-        off = self.recv_ring.alloc(max(item.total, _ALIGN))
+        off = self.recv_ring.alloc(max(item.total, ZCOPY_MIN), timeout=RING_TIMEOUT_S)
         slot = self._waiter.post_wait() if not blocking else self._waiter.no_wait()
         self._prev_off = off
         with self._post_lock:
@@ -725,6 +1001,8 @@ class StageLink:
             self.min_epoch = epoch
             for key in [k for k in self.inbox.items if k[0] < epoch]:
                 self._release(self.inbox.items.pop(key))
+            for key in [k for k in self.push_fallback if k[0] < epoch]:
+                del self.push_fallback[key]
             self.inbox.cv.notify_all()
         with self._post_lock:
             gone = [k for k in self._posted if k[0] < epoch]
@@ -734,6 +1012,21 @@ class StageLink:
             self._waiter.fill(slot, None)
         for peer, hdr in stale:
             self._ack(peer, hdr[4])
+        # Streams waiting on channels for messages of older epochs: their
+        # sender may never send them (replaced, or hung while alive).
+        with self._chan_lock:
+            rx = list(self._push_rx.values()) + [c for c in self._rx_chans.values()
+                                                 if hasattr(c, "release_below")]
+            tx = [c for c in self._tx_chans.values() if hasattr(c, "cancel_below")]
+        n = 0
+        for ch in {id(c): c for c in rx}.values():
+            n += ch.release_below(epoch)
+        if n:
+            log.info("connex-pp: released %d channel wait(s) of epochs < %d", n, epoch)
+        # Pushes of older epochs that still wait for their doorbell or gate
+        # are dropped (they would hold their queue).
+        for ch in tx:
+            ch.cancel_below(epoch)
         # Sends of older epochs will not be needed (a live receiver drops
         # them); a dead one never acks.
         self._release_sent_where(lambda ent: ent[1] < epoch)
@@ -751,7 +1044,7 @@ class StageLink:
             except Exception:  # noqa: BLE001
                 log.exception("connex-pp: releasing channels failed")
             try:
-                ev = self.engine.wait_event(timeout_ms=500)
+                ev = self.engine.wait_event(timeout_ms=200)
             except Exception:  # noqa: BLE001
                 return
             if ev is None:
@@ -767,6 +1060,8 @@ class StageLink:
             with self.inbox.cv:
                 self.up_peers.discard(peer)
             self.close_chans(lambda k, peer=peer: k[0] == peer)
+            for ak in [ak for ak in self._announced if ak[0] == peer]:
+                self._announced.pop(ak, None)
             n = self._release_sent_where(lambda ent: ent[2] == peer)
             if n:
                 log.warning("connex-pp: released %d send slot(s) of failed peer %s", n, peer)
@@ -800,6 +1095,19 @@ class StageLink:
             self.engine.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+@dataclass
+class _Reap:
+    """A push chain whose completion frees ``off`` of the send ring."""
+    t: Any
+    off: int | None
+    tx: Any
+    peer_url: Any
+    key: tuple
+    kind: str        # "h" hidden states, "s" sampled tokens, "w" warm-up
+    v: int
+    nbytes: int = 0
 
 
 @dataclass

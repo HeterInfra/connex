@@ -28,7 +28,9 @@ Configuration (stage 0):
                          position = replica index), e.g.
                          '[["10.0.0.2:47001","10.0.0.3:47001"]]'
   CONNEX_PP_REPLICA      this pipeline's replica index (preferred route)
-  CONNEX_PP_STEP_TIMEOUT_S   backstop for a step without reply (60)
+  CONNEX_PP_STEP_TIMEOUT_S   backstop for a step without reply (60): the
+                         stage that does not answer a ping, else the first
+                         one behind on the step, is failed over
   CONNEX_PP_REPLACE_TIMEOUT_S how long to wait for a live replica (120)
 """
 
@@ -144,6 +146,8 @@ class Replica:
     busy: bool = False          # owned by another pipeline
     pong: float = 0.0
     alive_since: float = 0.0
+    done_seq: int = -1          # last step it reported done (with the pong)
+    quarantine_until: float = 0.0   # failed over for a hung step: not chosen before
 
 
 @dataclass
@@ -155,6 +159,24 @@ class Pending:
     output: ModelRunnerOutput | None = None
     t_send: float = 0.0
     lost: bool = False
+
+
+def pick_stuck(route: list, late: list, t_ping: float) -> tuple:
+    """The replica to fail over for steps ``late`` (not completed within the
+    step timeout), after a ping sent at ``t_ping``: one that did not answer;
+    else, since a hung GPU (or a stream waiting for data that will not come)
+    still answers, the first stage behind on the oldest late step, else the
+    last one. A wrong guess costs a recompute, and the next timeout tries
+    again. (None, "") when the steps completed meanwhile."""
+    if not late:
+        return None, ""
+    silent = next((r for r in route if r is not None and r.pong < t_ping), None)
+    if silent is not None:
+        return silent, "step timeout, no pong"
+    seq = min(p.seq for p in late)
+    victim = next((r for r in route if r is not None and r.done_seq < seq),
+                  next((r for r in reversed(route) if r is not None), None))
+    return victim, f"step {seq} timeout, stage answers but is stuck"
 
 
 class ConnexPPExecutor(MultiprocExecutor):
@@ -218,7 +240,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                                on_message=self._on_message, on_failed=self._on_failed)
         for lst in self.replicas:
             for r in lst:
-                self.ctl.send(r.ctl_url, ("HELLO", self.owner), quiet=True)
+                self._hello(r)
         deadline = time.monotonic() + float(os.getenv("CONNEX_PP_CONNECT_TIMEOUT_S", "600"))
         # Give every replica a moment to answer, so the preferred one is used.
         settle = time.monotonic() + float(os.getenv("CONNEX_PP_SETTLE_S", "10"))
@@ -233,7 +255,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                 for lst in self.replicas:
                     for r in lst:
                         if not r.alive:
-                            self.ctl.send(r.ctl_url, ("HELLO", self.owner), quiet=True)
+                            self._hello(r)
         threading.Thread(target=self._watchdog, name="cx-pp-watchdog", daemon=True).start()
         log.info("connex-pp: stage 0 of %d, route %s", self.num_stages,
                  [f"s{r.stage}r{r.idx}" for r in self.route])
@@ -248,13 +270,35 @@ class ConnexPPExecutor(MultiprocExecutor):
             if cur is not None and cur.alive and not cur.busy:
                 continue
             cands = [r for r in lst if r.alive and not r.busy and r.data_url]
-            cands.sort(key=lambda r: (r.idx != self.replica_id % max(1, len(lst)), r.idx))
+            # A replica failed over for a hung step answers pings; prefer
+            # any other for a while.
+            now = time.monotonic()
+            cands.sort(key=lambda r: (r.quarantine_until > now,
+                                      r.idx != self.replica_id % max(1, len(lst)), r.idx))
             self.route[k] = cands[0] if cands else None
             ok = ok and bool(cands)
         return ok
 
     def _route_urls(self) -> list[str]:
         return [self.local_data_url] + [r.data_url if r else None for r in self.route]
+
+    def _spare_urls(self) -> dict:
+        """Data URLs of the live replicas off the route, by stage: the
+        endpoints warm their hops to them (group._route_changed)."""
+        now = time.monotonic()
+        out = {}
+        for k, lst in enumerate(self.replicas):
+            cur = self.route[k]
+            urls = [r.data_url for r in lst if r is not cur and r.alive and not r.busy
+                    and r.data_url and r.quarantine_until <= now]
+            if urls:
+                out[k + 1] = urls
+        return out
+
+    def _hello(self, r: Replica) -> None:
+        # Our control URL goes along: a replica that restarts announces
+        # itself to it once ready, instead of waiting for our next HELLO.
+        self.ctl.send(r.ctl_url, ("HELLO", self.owner, self.ctl.url), quiet=True)
 
     # ------------------------------------------------------------- messages
     def _find(self, peer: tuple) -> Replica | None:
@@ -281,15 +325,23 @@ class ConnexPPExecutor(MultiprocExecutor):
         if r is None:
             return
         if kind == "HELLO_OK":
-            _, data_url, owner = msg
+            _, data_url, owner = msg[:3]
             with self.cv:
                 r.data_url = data_url
                 if not r.alive:
                     r.alive_since = time.monotonic()
+                    log.info("connex-pp: replica s%dr%d is up (%s)", r.stage, r.idx,
+                             "announced itself" if len(msg) > 3 and msg[3] else "hello")
                 r.alive = True
                 r.busy = owner not in (None, self.owner)
                 self.cv.notify_all()
+        elif kind == "READY":
+            # A (re)started replica announcing itself: confirm with a HELLO
+            # (it reports its data URL and owner in the answer).
+            self._hello(r)
         elif kind == "PONG":
+            if len(msg) > 1:
+                r.done_seq = msg[1]
             r.pong = time.monotonic()
         elif kind == "BUSY":
             log.warning("connex-pp: s%dr%d is owned by another pipeline", r.stage, r.idx)
@@ -359,10 +411,26 @@ class ConnexPPExecutor(MultiprocExecutor):
                                    "t": time.time(), "lost_steps": len(lost),
                                    "choose_s": time.monotonic() - t0})
         # Release every endpoint still waiting for data of older epochs.
+        self._send_abort(urls, epoch)
+        log.warning("connex-pp: route now %s (%.1f ms after the failure was seen)",
+                    [f"s{x.stage}r{x.idx}" if x else None for x in self.route],
+                    (time.monotonic() - t0) * 1e3)
+
+    def _send_abort(self, urls: list[str], epoch: int) -> None:
+        """ABORT of the epochs before ``epoch`` to every endpoint, off this
+        thread and not under the control send lock: a send to an endpoint
+        that needs a connection (or is gone) must not hold the failover or
+        the next step's EXEC."""
+        raw = pickle.dumps((3, epoch))  # link.ABORT
+
+        def one(u):
+            try:
+                self.ctl.engine.send_msg(u, raw)
+            except Exception as e:  # noqa: BLE001
+                log.warning("connex-pp: abort to %s failed: %s", u, e)
+
         for u in [e for u in urls for e in u.split(";")]:
-            self.ctl.send(u, None, raw=pickle.dumps((3, epoch)))  # link.ABORT
-        log.warning("connex-pp: route now %s",
-                    [f"s{x.stage}r{x.idx}" if x else None for x in self.route])
+            threading.Thread(target=one, args=(u,), name="cx-pp-abort", daemon=True).start()
 
     def _watchdog(self) -> None:
         tick = 0
@@ -371,11 +439,11 @@ class ConnexPPExecutor(MultiprocExecutor):
             tick += 1
             if tick % 2 == 0:
                 # (Re)discover replicas that are down: a restarted one becomes
-                # a spare.
+                # a spare (it also announces itself, see stage.py).
                 for lst in self.replicas:
                     for r in lst:
                         if not r.alive:
-                            self.ctl.send(r.ctl_url, ("HELLO", self.owner), quiet=True)
+                            self._hello(r)
             now = time.monotonic()
             with self.lock:
                 late = [p for p in self.pending.values()
@@ -389,12 +457,16 @@ class ConnexPPExecutor(MultiprocExecutor):
                 if r is not None:
                     self.ctl.send(r.ctl_url, ("PING",))
             time.sleep(2.0)
-            for r in route:
-                if r is not None and r.pong < t_ping:
-                    with self.lock:
-                        r.alive = False
-                    self._failover(r, "step timeout, no pong")
-                    break
+            with self.lock:
+                still = [p for p in late if not p.event.is_set()]
+            victim, why = pick_stuck(route, still, t_ping)
+            if victim is None:
+                continue
+            if "answers" in why:
+                victim.quarantine_until = time.monotonic() + 4 * self.step_timeout
+            with self.lock:
+                victim.alive = False
+            self._failover(victim, why)
 
     # --------------------------------------------------------------- steps
     def execute_model(self, scheduler_output, non_block: bool = False):
@@ -426,8 +498,10 @@ class ConnexPPExecutor(MultiprocExecutor):
                     p.lost = True
                     p.event.set()
             route = list(self.route)
+            spares = self._spare_urls()
         setattr(so, ROUTE_ATTR, {"epoch": epoch, "seq": seq, "route": route_urls,
-                                 "max_tokens": self.max_tokens, "doomed": doomed})
+                                 "max_tokens": self.max_tokens, "doomed": doomed,
+                                 "spares": spares})
         if not doomed:
             raw = ControlLink.encode(("EXEC", seq, epoch, so, self.owner))
             for r in route:
@@ -478,8 +552,7 @@ class ConnexPPExecutor(MultiprocExecutor):
         kvo = out.kv_connector_output or KVConnectorOutput()
         kvo.lost_all_kv = True
         out.kv_connector_output = kvo
-        for u in [e for u in urls for e in u.split(";")]:
-            self.ctl.send(u, None, raw=pickle.dumps((3, epoch)))
+        self._send_abort(urls, epoch)
 
     def connex_pp_failovers(self) -> list[dict]:
         return list(getattr(self, "failovers", []))
