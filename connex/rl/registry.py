@@ -31,6 +31,8 @@ class WeightRegistry:
         self.holders = {}           # version -> {member: {"url","addr","load","publisher"}}
         self.members = {}           # member -> {"url","version","last_seen"}
         self.events = []            # (t, kind, member, detail) for observability
+        self.reading = {}           # reader member -> [(version, source)] it was assigned
+        self.stale = set()          # (reader, version, source): source overwritten mid-read
 
     def _ev(self, kind, member, detail=None):
         self.events.append((time.time(), kind, member, detail))
@@ -53,6 +55,11 @@ class WeightRegistry:
     def leave(self, member, reason="leave"):
         with self.cv:
             self.members.pop(member, None)
+            # a reader that died mid-pull never releases its sources: give the
+            # load back, or the publisher / peers would wait for it forever
+            for version, source in self.reading.pop(member, []):
+                self._release(version, source)
+            self.stale = {x for x in self.stale if x[0] != member}
             for hs in self.holders.values():
                 hs.pop(member, None)
             self._ev(reason, member)
@@ -103,15 +110,37 @@ class WeightRegistry:
                 return (full, h["load"] if full else 0, h["publisher"], h["load"])
             m, h = min(hs.items(), key=key)
             h["load"] += 1
+            self.reading.setdefault(member, []).append((version, m))
             return {"member": m, "url": h["url"], "addr": h["addr"]}
 
-    def release(self, version, source):
+    def _release(self, version, source):
+        h = self.holders.get(version, {}).get(source)
+        if h and h["load"] > 0:
+            h["load"] -= 1
+
+    def release(self, version, source, member=None):
         with self.cv:
-            h = self.holders.get(version, {}).get(source)
-            if h and h["load"] > 0:
-                h["load"] -= 1
+            if member is not None:
+                rs = self.reading.get(member, [])
+                if (version, source) not in rs:
+                    return {"ok": True}         # already released (e.g. by leave)
+                rs.remove((version, source))
+                if not rs:
+                    self.reading.pop(member, None)
+            self._release(version, source)
             self.cv.notify_all()
+            if member is not None and (member, version, source) in self.stale:
+                self.stale.discard((member, version, source))
+                return {"ok": True, "stale": True}
             return {"ok": True}
+
+    def _invalidate(self, version, source):
+        """``source`` overwrites its copy of ``version`` while readers are still
+        assigned to it: their bytes may be torn, tell them on release."""
+        for reader, rs in self.reading.items():
+            for v, src in rs:
+                if src == source and (version is None or v == version):
+                    self.stale.add((reader, v, src))
 
     def report_failure(self, version, source, reporter):
         """``reporter`` could not read from ``source``: stop handing it out."""
@@ -129,7 +158,8 @@ class WeightRegistry:
         with self.cv:
             def busy():
                 return sum(h[member]["load"] for h in self.holders.values() if member in h)
-            self.cv.wait_for(lambda: busy() == 0, timeout=timeout)
+            if not self.cv.wait_for(lambda: busy() == 0, timeout=timeout):
+                self._invalidate(None, member)
             for hs in self.holders.values():
                 hs.pop(member, None)
             return {"ok": True}
@@ -139,6 +169,8 @@ class WeightRegistry:
             ok = self.cv.wait_for(
                 lambda: self.holders.get(version, {}).get(member, {"load": 0})["load"] == 0,
                 timeout=timeout)
+            if not ok:
+                self._invalidate(version, member)
             return {"ok": bool(ok)}
 
     def done(self, version, member, url, addr):

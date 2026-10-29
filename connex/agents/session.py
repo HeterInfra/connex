@@ -84,6 +84,7 @@ class SessionProxy(Proxy):
         self.sessions = {}
         self.movers = list(movers) if movers else [ReprefillMover()]
         self.ttl = session_ttl_s
+        self._next_sweep = time.monotonic() + (session_ttl_s or 0)
         self.stats.update(sessions=0, migrations=0, failovers=0)
 
     # -- routing ----------------------------------------------------------------
@@ -107,9 +108,24 @@ class SessionProxy(Proxy):
     def get_session(self, sid):
         s = self.sessions.get(sid)
         if s is None:
+            self.expire_sessions()
             s = self.sessions[sid] = Session(sid)
             self.stats["sessions"] += 1
         return s
+
+    def expire_sessions(self, now=None):
+        """Forget sessions idle (no request in flight) for longer than the
+        TTL, so their stored contexts do not accumulate forever. Runs at most
+        once per TTL/10 when a new session is created."""
+        now = time.monotonic() if now is None else now
+        if not self.ttl or now < self._next_sweep:
+            return 0
+        self._next_sweep = now + self.ttl / 10
+        dead = [sid for sid, s in self.sessions.items()
+                if not s.inflight and now - s.last_used > self.ttl]
+        for sid in dead:
+            del self.sessions[sid]
+        return len(dead)
 
     def begin(self, st):
         sid = st.body.pop("_connex_session", None)
@@ -126,6 +142,7 @@ class SessionProxy(Proxy):
         if s is None:
             return
         s.inflight.discard(st)
+        s.last_used = time.monotonic()
         if st.finish is not None:      # completed: remember the full context
             text = "".join(st.text)
             b = {k: v for k, v in st.body.items() if k not in ("stream", "stream_options")}

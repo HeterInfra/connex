@@ -122,33 +122,44 @@ class EPController:
         if not self.peers:
             self.refresh_peers()
         pending = list(moves)
-        while pending and rep["rounds"] < self.max_rounds:
-            rep["rounds"] += 1
-            t0 = time.perf_counter()
-            res = self.engine.move(pending, self.peers, self.table.slots_per_rank)
-            rep["copy_s"] += time.perf_counter() - t0
-            done = [m for m, ok, _ in res if ok]
-            failed = [(m, err) for m, ok, err in res if not ok]
-            # results for moves whose destination rank did not answer count as failed
-            seen = {(m.layer, m.dst) for m, _, _ in res}
-            failed += [(m, "no result") for m in pending if (m.layer, m.dst) not in seen]
-            self.table.finish_moves(done, ok=True)
-            rep["moves"] += len(done)
-            rep["bytes"] += sum(self._move_bytes(m) for m in done)
-            pending = []
-            for m, err in failed:
-                log.warning("move %s failed: %s", m, err)
-                rep["failed_moves"] += 1
-                src_rank = None if m.src is None else self.table.rank_of(m.src)
-                if src_rank is not None and src_rank in self.peers and "unreachable" in str(err):
-                    self.table.mark_down(src_rank)
-                if not self.table.live(self.table.rank_of(m.dst)):
-                    self.table.finish_moves([m], ok=False)
-                    continue
-                src = self.table._pick_src(m.layer, m.expert, m.dst, None)
-                if src == m.src:
-                    src = None                    # fall back to the checkpoint
-                pending.append(Move(m.layer, m.expert, m.dst, src, m.evicts))
+        try:
+            while pending and rep["rounds"] < self.max_rounds:
+                rep["rounds"] += 1
+                t0 = time.perf_counter()
+                res = self.engine.move(pending, self.peers, self.table.slots_per_rank)
+                rep["copy_s"] += time.perf_counter() - t0
+                done = [m for m, ok, _ in res if ok]
+                failed = [(m, err) for m, ok, err in res if not ok]
+                # results for moves whose destination rank did not answer count as failed
+                seen = {(m.layer, m.dst) for m, _, _ in res}
+                failed += [(m, "no result") for m in pending if (m.layer, m.dst) not in seen]
+                self.table.finish_moves(done, ok=True)
+                rep["moves"] += len(done)
+                rep["bytes"] += sum(self._move_bytes(m) for m in done)
+                pending = []
+                for m, err in failed:
+                    log.warning("move %s failed: %s", m, err)
+                    rep["failed_moves"] += 1
+                    src_rank = None if m.src is None else self.table.rank_of(m.src)
+                    if src_rank is not None and src_rank in self.peers and "unreachable" in str(err):
+                        self.table.mark_down(src_rank)
+                    if not self.table.live(self.table.rank_of(m.dst)):
+                        self.table.finish_moves([m], ok=False)
+                        continue
+                    src = self.table._pick_src(m.layer, m.expert, m.dst, None)
+                    if src == m.src:
+                        src = None                    # fall back to the checkpoint
+                    pending.append(Move(m.layer, m.expert, m.dst, src, m.evicts))
+        except BaseException:
+            # the engine call failed outright: the staged slots may be half
+            # written, so release them as empty instead of leaking them as
+            # staging forever (unroutable and never repaired)
+            self.table.finish_moves(pending, ok=False)
+            try:
+                self.push()
+            except Exception:  # noqa: BLE001
+                log.exception("ep %s: push after a failed move round failed", event)
+            raise
         if pending:
             self.table.finish_moves(pending, ok=False)
         rep["commit_s"] = self.push()             # epoch k+2: new slots live

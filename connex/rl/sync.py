@@ -51,7 +51,12 @@ class WeightPublisher:
         if slot < len(self.arenas):
             a, old = self.arenas[slot]
             if old is not None:
-                self.reg.wait_idle(version=old, member=PUBLISHER, timeout=self.idle_timeout)
+                ok = self.reg.wait_idle(version=old, member=PUBLISHER,
+                                        timeout=self.idle_timeout)
+                if not (ok or {}).get("ok", True):
+                    log.warning("publisher: readers of v%s still active after %.0fs; "
+                                "overwriting its arena (they may read torn weights)",
+                                old, self.idle_timeout)
             if a.numel() < m.total:
                 self.t.unregister(a)
                 a = torch.empty(m.total, dtype=torch.uint8, device=self.device)
@@ -121,46 +126,74 @@ class WeightSubscriber:
         # stop serving the old copy before overwriting it
         if self.arena is not None:
             self.reg.retract(member=self.member)
-        if self.arena is None or self.arena.numel() < m.total:
-            if self.arena is not None:
-                self.t.unregister(self.arena)
-            self.arena = torch.empty(m.total, dtype=torch.uint8, device=self.device)
-            self.t.register(self.arena)
-        offs = list(range(0, m.total, self.chunk))
-        failures, bad, sources = 0, set(), []
-        src = None
-        i = 0
-        while i < len(offs):
-            if src is None:
-                src = self.reg.assign(version=version, member=self.member, exclude=sorted(bad))
-                if src is None:
-                    raise RuntimeError(f"no source holds version {version}")
-                sources.append(src["member"])
-            ops = [(src["addr"] + off, off, min(self.chunk, m.total - off))
-                   for off in offs[i:i + self.window]]
-            try:
-                self.t.read_batch(src["url"], ops, self.arena)
-                i += len(ops)
-            except TransferError as e:
-                failures += 1
-                log.warning("%s: read of v%d from %s failed (%s); switching source",
-                            self.member, version, src["member"], e)
-                self.reg.report_failure(version=version, source=src["member"],
-                                        reporter=self.member)
-                self.reg.release(version=version, source=src["member"])
-                if src["member"] != PUBLISHER:
-                    bad.add(src["member"])
-                src = None
-                if failures > self.max_fail:
-                    raise
-        if src is not None:
-            self.reg.release(version=version, source=src["member"])
+        self.manifest = None      # the arena is about to be overwritten
+        for attempt in range(3):
+            stale, failures, sources = self._read(version, m)
+            if not stale:
+                break
+            log.warning("%s: a source of v%d overwrote its copy during the read; "
+                        "reading again", self.member, version)
+        else:
+            raise RuntimeError(f"v{version}: sources kept changing during the read")
         if self.arena.is_cuda:
             torch.cuda.synchronize(self.arena.device)
         self.manifest = m
         self.stats = {"version": version, "bytes": m.total, "pull_s": time.perf_counter() - t0,
                       "sources": sources, "source_failures": failures}
         return m
+
+    def _release(self, version, source):
+        r = self.reg.release(version=version, source=source, member=self.member)
+        return bool((r or {}).get("stale"))
+
+    def _read(self, version, m):
+        """Read ``version`` into the arena; returns (stale, failures, sources).
+        ``stale``: a source overwrote its copy while assigned to us."""
+        if self.arena is None or self.arena.numel() < m.total:
+            if self.arena is not None:
+                self.t.unregister(self.arena)
+            self.arena = torch.empty(m.total, dtype=torch.uint8, device=self.device)
+            self.t.register(self.arena)
+        offs = list(range(0, m.total, self.chunk))
+        stale = False
+        failures, bad, sources = 0, set(), []
+        src = None
+        i = 0
+        try:
+            while i < len(offs):
+                if src is None:
+                    src = self.reg.assign(version=version, member=self.member, exclude=sorted(bad))
+                    if src is None:
+                        raise RuntimeError(f"no source holds version {version}")
+                    sources.append(src["member"])
+                ops = [(src["addr"] + off, off, min(self.chunk, m.total - off))
+                       for off in offs[i:i + self.window]]
+                try:
+                    self.t.read_batch(src["url"], ops, self.arena)
+                    i += len(ops)
+                except TransferError as e:
+                    failures += 1
+                    log.warning("%s: read of v%d from %s failed (%s); switching source",
+                                self.member, version, src["member"], e)
+                    self.reg.report_failure(version=version, source=src["member"],
+                                            reporter=self.member)
+                    stale |= self._release(version, src["member"])
+                    if src["member"] != PUBLISHER:
+                        bad.add(src["member"])
+                    src = None
+                    if failures > self.max_fail:
+                        raise
+        except BaseException:
+            # give back the assignment we still hold (e.g. too many failures)
+            if src is not None:
+                try:
+                    self._release(version, src["member"])
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
+        if src is not None:
+            stale |= self._release(version, src["member"])
+        return stale, failures, sources
 
     def tensors(self):
         return unpack(self.arena, self.manifest)

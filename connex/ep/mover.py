@@ -37,6 +37,36 @@ def _bytes_view(t: torch.Tensor) -> torch.Tensor:
     return t.view(-1).view(torch.uint8) if t.dtype != torch.uint8 else t.view(-1)
 
 
+class _IPCUnpickler(pickle.Unpickler):
+    """Unpickler for peer IPC descriptors: they arrive over the control
+    plane (HTTP JSON), so only the globals ``reduce_tensor`` emits for CUDA
+    tensors are allowed (no arbitrary callables)."""
+
+    _FUNCS = {("torch.multiprocessing.reductions", "rebuild_cuda_tensor")}
+
+    def find_class(self, module, name):
+        if (module, name) in self._FUNCS:
+            return super().find_class(module, name)
+        if module.split(".")[0] == "torch":
+            obj = super().find_class(module, name)
+            if isinstance(obj, torch.dtype) or obj is torch.Size or (
+                    isinstance(obj, type) and (issubclass(obj, torch.Tensor)
+                                               or "Storage" in name)):
+                return obj
+        raise pickle.UnpicklingError(f"global {module}.{name} not allowed in IPC handles")
+
+
+def _load_ipc(data):
+    import io
+    rows = _IPCUnpickler(io.BytesIO(data)).load()
+    from torch.multiprocessing.reductions import rebuild_cuda_tensor
+    for ps in rows:
+        for fn, _ in ps:
+            if fn is not rebuild_cuda_tensor:
+                raise pickle.UnpicklingError("IPC handle is not a CUDA tensor")
+    return rows
+
+
 def host_id():
     """Identifies this host (and container) for the same-host fast path."""
     try:
@@ -100,7 +130,7 @@ class ExpertStore:
         key = (peer["rank"], peer.get("url"))
         if key not in self._peer_tensors:
             try:
-                rows = pickle.loads(base64.b64decode(peer["ipc"]))
+                rows = _load_ipc(base64.b64decode(peer["ipc"]))
                 self._peer_tensors[key] = [[fn(*args) for fn, args in ps] for ps in rows]
             except Exception:  # noqa: BLE001  (no P2P / IPC: use the transport)
                 self._peer_tensors[key] = None

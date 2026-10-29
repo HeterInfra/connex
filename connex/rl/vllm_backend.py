@@ -95,7 +95,10 @@ class ConnexWeightTransferEngine(
             raise RuntimeError("connex weight transfer not initialized")
         m = self.sub.pull(update_info.version)
         self.model.load_weights(self.sub.tensors())
-        torch.accelerator.synchronize()
+        # sync the worker's own device before offering the copy; a bare
+        # torch.accelerator.synchronize() fails on CPU-only workers
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
         self.sub.commit(m.version)
         self.last_stats = dict(self.sub.stats)
 
@@ -122,8 +125,9 @@ class ConnexTrainerInitInfo(TrainerInitInfo):
 class ConnexTrainerWeightTransferEngine(TrainerWeightTransferEngine[ConnexTrainerInitInfo]):
     init_info_cls = ConnexTrainerInitInfo
 
-    def __init__(self, *, client, source=None, is_sender=True, publisher=None):
+    def __init__(self, *, client, source=None, is_sender=True, rank=0, publisher=None):
         super().__init__(client=client, source=source, is_sender=is_sender)
+        self.rank = rank
         self.pub = publisher
         self.version = 0
 
@@ -140,7 +144,8 @@ class ConnexTrainerWeightTransferEngine(TrainerWeightTransferEngine[ConnexTraine
             client.init_weight_transfer_engine(asdict(ConnexWeightTransferInitInfo(
                 registry_url=init_info.registry_url, member=init_info.member,
                 transport=init_info.transport, chunk_bytes=init_info.chunk_bytes)))
-        return cls(client=client, source=source, is_sender=init_info.is_sender, publisher=pub)
+        return cls(client=client, source=source, is_sender=init_info.is_sender,
+                   rank=getattr(init_info, "rank", 0), publisher=pub)
 
     def publish(self):
         """Pack and publish the next version without driving any engine."""
