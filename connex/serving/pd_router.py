@@ -187,6 +187,9 @@ class PDRouter(Proxy):
         if front_router and not front_router_events:
             front_router_events = front_router.rsplit(":", 1)[0] + ":15560"
         self.front_router_events = front_router_events
+        import os
+
+        self.admin_token = os.getenv("CONNEX_PD_ADMIN_TOKEN") or None
         self._members: dict[tuple, str] = {}     # (role, replica) -> url, from fetch_pools
         self.stats.update({"prefills": 0, "prefill_retries": 0, "kv_reprefills": 0,
                            "kv_repulls": 0, "membership_errors": 0, "failure_events": 0})
@@ -459,7 +462,24 @@ class PDRouter(Proxy):
 
         return web.json_response({"prefill": desc(self.prefill_pool), "decode": desc(self.pool)})
 
+    def _admin_allowed(self, request) -> bool:
+        """Pool changes are admin operations: allowed from loopback, or with
+        ``Authorization: Bearer <token>`` when ``CONNEX_PD_ADMIN_TOKEN`` (or
+        ``--admin-token``) is set. Without that a router bound to 0.0.0.0
+        would let any client drain every instance."""
+        import hmac
+
+        tok = self.admin_token
+        if tok:
+            got = request.headers.get("Authorization", "")
+            if hmac.compare_digest(got.encode(), f"Bearer {tok}".encode()):
+                return True
+        remote = (request.remote or "").split("%", 1)[0]
+        return remote in ("127.0.0.1", "::1", "localhost") or remote.startswith("::ffff:127.")
+
     async def _drain_target(self, request):
+        if not self._admin_allowed(request):
+            raise web.HTTPForbidden(text="pool admin needs loopback or CONNEX_PD_ADMIN_TOKEN")
         body = await request.json()
         return body.get("url", ""), body.get("role")
 
@@ -507,6 +527,9 @@ def main():
     ap.add_argument("--max-attempts", type=int, default=4)
     ap.add_argument("--blacklist-s", type=float, default=5.0)
     ap.add_argument("--probe-interval", type=float, default=0.5)
+    ap.add_argument("--admin-token", default=None,
+                    help="bearer token for POST /pd/drain and /pd/undrain from non-loopback "
+                         "clients (default: CONNEX_PD_ADMIN_TOKEN; unset = loopback only)")
     ap.add_argument("--log-level", default="INFO")
     a = ap.parse_args()
     if a.front_router and not a.model:
@@ -522,6 +545,8 @@ def main():
                       idle_timeout=a.idle_timeout, connect_timeout=a.connect_timeout,
                       max_attempts=a.max_attempts, probe_interval=a.probe_interval,
                       first_token_timeout=a.first_token_timeout)
+    if a.admin_token:
+        router.admin_token = a.admin_token
     try:
         import uvloop
         uvloop.install()

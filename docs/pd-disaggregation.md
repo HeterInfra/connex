@@ -49,7 +49,9 @@ python -m connex.serving.pd_router --port 8000 \
 With connex-ai installed, `kv_connector_module_path` can be omitted: the
 `vllm.general_plugins` entry point registers `ConnexConnector` by name.
 `kv_connector_extra_config` keys: `backend` (`auto` | `connex-rs` |
-`mooncake`), `host`, `ctrl_port` (TP rank r uses `ctrl_port + r`), `rs_port`,
+`mooncake`), `host`, `ctrl_port` (TP rank r uses `ctrl_port + r`),
+`bind_ip` (address the unauthenticated KV control channel listens on; default
+`host` when it is an IPv4 literal, else `0.0.0.0`), `rs_port`,
 `retain_s` (hold lease, default 60 s), `release` (`on_finish` | `after_pull`),
 and `front_router` / `http_url` / `replica` to register in a front-router.
 The router also works with vLLM's NixlConnector (same `kv_transfer_params`
@@ -93,6 +95,9 @@ Instances register `LID(model, PD_STAGE[role], 0, replica)`, heartbeat, and
 deregister on a clean shutdown; a killed instance is evicted after its lease.
 Admin endpoints of the router: `GET /pd/pools`, `POST /pd/drain` and
 `/pd/undrain` (`{"url": ..., "role": "prefill"|"decode"}`), `GET /proxy/stats`.
+Drain and undrain are accepted only from loopback, or with
+`Authorization: Bearer <token>` when the router runs with `--admin-token`
+(or `CONNEX_PD_ADMIN_TOKEN`); other clients get 403.
 
 ## Running the experiments
 

@@ -129,6 +129,9 @@ class Pool:
         if not cands:
             return None
         healthy = [e for e in cands if e.healthy(now)]
+        for e in healthy:
+            if e.bad_until:   # blacklist expired without a probe: re-arm its dead event
+                self.mark_good(e)
         if not healthy:   # last resort: the one whose blacklist expires first
             return min(cands, key=lambda e: e.bad_until)
         self.rr += 1
@@ -233,7 +236,9 @@ class Resumer:
         return self.k == 0 or self.resumable
 
     def remaining(self):
-        m = self.body.get("max_tokens", self.body.get("max_completion_tokens"))
+        m = self.body.get("max_tokens")
+        if m is None:
+            m = self.body.get("max_completion_tokens")
         return None if m is None else m - self.k
 
     # -- chunk processing -------------------------------------------------------
@@ -520,9 +525,14 @@ class Proxy:
         tried = []
         last_err = "no endpoints"
         while st.attempts < self.max_attempts:
-            if st.remaining() is not None and st.remaining() <= 0 and st.k > 0:
+            if st.k > 0 and (st.finish is not None or
+                             (st.remaining() is not None and st.remaining() <= 0)):
+                # the stream broke after its last token (finish_reason seen or
+                # max_tokens reached) but before [DONE]: the request is complete;
+                # resuming would generate past the end
                 st.finish = st.finish or "length"
-                break
+                yield st
+                return
             ep = self.pick(st, tried)
             if ep is None:
                 break

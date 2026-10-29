@@ -62,6 +62,7 @@ class _Hold:
     acquired: int = 0
     released_by: set = field(default_factory=set)
     ready: object = None    # host staging: event of the device -> mirror copy
+    owner: object = None    # ``who`` of the latest acquire (single-reader release check)
 
 
 class KVProducer:
@@ -154,6 +155,8 @@ class KVProducer:
                     self.stats["unknown"] += 1
                     return {"ok": False, "why": "unknown"}
                 h.acquired += 1
+                if m.get("who"):
+                    h.owner = m.get("who")
                 h.deadline = time.monotonic() + self.retain_s
                 self.stats["acquires"] += 1
                 return {"ok": True, "blocks": h.blocks, "_wait": h.ready}
@@ -162,6 +165,13 @@ class KVProducer:
                 # several decode TP ranks may read this rank (decode TP larger
                 # than prefill TP): free once all `of` of them released
                 of = int(m.get("of") or 1)
+                who = m.get("who")
+                if h is not None and of <= 1 and who and h.owner and who != h.owner:
+                    # stale release from a decode instance the request already
+                    # moved away from: the hold now belongs to the newer reader,
+                    # freeing it would let the engine reuse blocks mid-read
+                    self.stats["stale_releases"] = self.stats.get("stale_releases", 0) + 1
+                    return {"ok": True, "stale": True}
                 if h is not None and of > 1:
                     h.released_by.add(m.get("who"))
                     if len(h.released_by) < of:
@@ -336,7 +346,7 @@ class KVConsumer:
         # is retried for a short while before it counts as gone.
         delay = 0.002
         while True:
-            r = self._call(addr, {"op": "acquire", "tid": tid})
+            r = self._call(addr, {"op": "acquire", "tid": tid, "who": self.who})
             if (r is None or r.get("ok") or r.get("why") != "unknown"
                     or time.monotonic() - t0 > self.acquire_wait_s):
                 break
@@ -397,9 +407,9 @@ class KVConsumer:
         return read_ops(self.layouts, meta.layouts, local, remote)
 
     def _release_msg(self, tid: str, src: Optional[TPSource] = None) -> dict:
-        m = {"op": "release", "tid": tid}
+        m = {"op": "release", "tid": tid, "who": self.who}
         if src is not None and src.readers > 1:
-            m.update(of=src.readers, who=f"{self.who}")
+            m.update(of=src.readers)
         return m
 
     def _outside(self, ops) -> Optional[tuple]:

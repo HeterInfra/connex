@@ -42,6 +42,8 @@ Protocol (pull based, see ``connex.pd.transfer``):
                    ``CONNEX_HOST_IP``, ``VLLM_HOST_IP``, else vLLM's ``get_ip``)
 ``ctrl_port``      base port of the KV control channel; TP rank r uses
                    ``ctrl_port + r`` (default ``kv_port``)
+``bind_ip``        address the KV control channel listens on (default: ``host``
+                   when it is an IP literal, else ``0.0.0.0``)
 ``rs_port``        base port of the connex-rs listener (default 0 = any)
 ``retain_s``       prefill hold lease, renewed by each acquire (default 60)
 ``release``        ``"on_finish"`` (default) | ``"after_pull"``
@@ -130,6 +132,22 @@ def _device_uuid() -> str:
         return str(torch.cuda.get_device_properties(torch.cuda.current_device()).uuid)
     except Exception:  # noqa: BLE001
         return ""
+
+
+def _bind_ip(extra: dict, host: str) -> str:
+    """Listen only on the advertised address (the control channel has no
+    authentication), unless ``bind_ip`` says otherwise or ``host`` is a
+    name zmq cannot bind to."""
+    if extra.get("bind_ip"):
+        return str(extra["bind_ip"])
+    import ipaddress
+
+    try:
+        if ipaddress.ip_address(host).version != 4:
+            return "0.0.0.0"
+    except ValueError:
+        return "0.0.0.0"
+    return host
 
 
 def _split(addr: str) -> tuple[str, int]:
@@ -300,10 +318,12 @@ class ConnexConnector(KVConnectorBase_V1):
                            int(self.extra["rs_port"]) + self.rank)
         log.info("ConnexConnector rank %d: %s data plane at %s, %d KV tensors",
                  self.rank, plane.name, plane.local_url, len(layouts))
+        self._plane = plane
         dev = _device_uuid()
         # one registration per process: producer and consumer share the plane
         if self.is_producer:
-            self.producer = KVProducer(plane, layouts, port=self.ctrl_base + self.rank,
+            self.producer = KVProducer(plane, layouts, bind_ip=_bind_ip(self.extra, self.host),
+                                       port=self.ctrl_base + self.rank,
                                        retain_s=float(self.extra.get("retain_s", 60.0)),
                                        engine_id=self.engine_id, block_size=self.block_size,
                                        device=dev)
@@ -424,3 +444,7 @@ class ConnexConnector(KVConnectorBase_V1):
         for x in (getattr(self, "consumer", None), getattr(self, "producer", None)):
             if x is not None:
                 x.close()
+        plane = getattr(self, "_plane", None)
+        if plane is not None:   # drops the plane's memory registrations and listener
+            self._plane = None
+            plane.close()
