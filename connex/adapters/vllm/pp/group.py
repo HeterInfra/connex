@@ -287,16 +287,22 @@ class ConnexPPGroup(GroupCoordinator):
         if self.link is not None:
             # same-host sampled-token channels are per epoch
             self.link.close_chans(lambda k: k[1][0] == "s" and k[1][1] < epoch)
-            for key in self._push_pending:
+            # Runs on the link's receive thread (an ABORT message) while the
+            # step thread appends to these: iterate snapshots (list() of a
+            # deque or dict is atomic under the GIL, a generator is not).
+            pending = list(self._push_pending)
+            for key in pending:
                 if key[0] < epoch:
                     self.link.forget_push(key)
-            self._push_pending = deque(k for k in self._push_pending if k[0] >= epoch)
-        for k in [k for k in self._push_first if k[1] < epoch]:
-            del self._push_first[k]
+            self._push_pending = deque(k for k in pending if k[0] >= epoch)
+        for k in [k for k in list(self._push_first) if k[1] < epoch]:
+            self._push_first.pop(k, None)
         if self._waiter is None:
             return
-        for key in [k for k in self._pending_slots if k[0] < epoch]:
-            self._waiter.release(self._pending_slots.pop(key))
+        for key in [k for k in list(self._pending_slots) if k[0] < epoch]:
+            slot = self._pending_slots.pop(key, None)
+            if slot is not None:
+                self._waiter.release(slot)
 
     # --------------------------------------------------- inter-stage tensors
     def isend_tensor_dict(self, tensor_dict, dst=None, all_gather_group=None,

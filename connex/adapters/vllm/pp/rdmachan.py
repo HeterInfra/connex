@@ -252,12 +252,16 @@ class PushTx:
         k = epoch % _CANCEL_WORDS
         if self.word_epoch[k] != epoch:
             self.word_epoch[k] = epoch
-            self.cancel_np[k] = 1 if self.dead else 0
+            # A chain of an epoch already aborted (a stale step still being
+            # executed) starts cancelled, even if no word existed for it yet.
+            self.cancel_np[k] = 1 if (self.dead or epoch < getattr(self, "cancel_floor", 0)) \
+                else 0
         return self.cancel.data_ptr() + 4 * k
 
     def cancel_below(self, epoch: int) -> None:
         """Drop the chains of epochs before ``epoch`` that still wait for
         their doorbell or gate (aborted steps)."""
+        self.cancel_floor = max(getattr(self, "cancel_floor", 0), epoch)
         for k, ep in enumerate(self.word_epoch):
             if 0 <= ep < epoch:
                 self.cancel_np[k] = 1

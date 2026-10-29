@@ -151,6 +151,21 @@ def test_push_channel_small_gpu_message_and_counter_wrap():
 vllm = pytest.importorskip("vllm")
 
 
+def _vllm_loads():
+    """The group/executor modules need vllm's compiled ops. A local vllm
+    build made against another torch imports, then fails on vllm._C."""
+    try:
+        import vllm.platforms.cuda  # noqa: F401
+    except ImportError as e:
+        return str(e)
+    return ""
+
+
+_VLLM_ERR = _vllm_loads()
+needs_vllm = pytest.mark.skipif(bool(_VLLM_ERR), reason=f"vllm does not load: {_VLLM_ERR}")
+
+
+@needs_vllm
 def test_tp_endpoints_route_entries():
     from connex.adapters.vllm.pp.group import ConnexPPGroup
 
@@ -175,6 +190,7 @@ def _executor_stub(replicas, route, replica_id=0):
     return ex
 
 
+@needs_vllm
 def test_route_keeps_live_members_and_prefers_own_replica():
     from connex.adapters.vllm.pp.executor import Replica
 
@@ -192,6 +208,7 @@ def test_route_keeps_live_members_and_prefers_own_replica():
     assert [r.idx for r in ex.route] == [0, 1]
 
 
+@needs_vllm
 def test_route_skips_busy_and_reports_missing_stage():
     from connex.adapters.vllm.pp.executor import Replica
 
@@ -204,6 +221,7 @@ def test_route_skips_busy_and_reports_missing_stage():
     assert ex.route[0] is s1[1]
 
 
+@needs_vllm
 def test_lost_step_reports_lost_kv_once():
     """After a failover the first lost output tells the scheduler that the
     replaced stage's KV is gone; later lost outputs only carry no tokens."""
@@ -703,6 +721,7 @@ def test_ports_never_collide():
         ports.control_port(19, 0)
 
 
+@needs_vllm
 def test_watchdog_fails_over_a_stuck_stage_that_answers_pings():
     """#2: the watchdog used to fail over only a stage without a pong; a
     stage with a hung GPU still answers PING."""
@@ -740,6 +759,7 @@ def test_no_token_window_spans_all_streams():
     assert fl.no_token_window(out, t_kill=10.0) == 2.55
 
 
+@needs_vllm
 def test_same_host_sampled_channel_timeout_is_a_failure():
     """#6: when the channel message did not come in time the step read
     garbage and ch.i fell one behind; now it raises (unless aborted)."""

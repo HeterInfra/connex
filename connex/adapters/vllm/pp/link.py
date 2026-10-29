@@ -619,21 +619,23 @@ class StageLink:
         from connex.adapters.vllm.pp.ipcchan import TxChannel
 
         k = (_peer_id(url), tag)
-        ch = self._tx_chans.get(k)
-        if ch is not None:
-            return ch, False
-        ch = self._tx_chans[k] = TxChannel(self.device, slots, slot_bytes, f"{tag[0]}")
+        with self._chan_lock:   # abort() and the event thread iterate the dict
+            ch = self._tx_chans.get(k)
+            if ch is not None:
+                return ch, False
+            ch = self._tx_chans[k] = TxChannel(self.device, slots, slot_bytes, f"{tag[0]}")
         return ch, True
 
     def rx_chan(self, peer: tuple, tag: tuple, info):
         from connex.adapters.vllm.pp.ipcchan import RxChannel
 
         k = (tuple(peer), tag)
-        ch = self._rx_chans.get(k)
-        if ch is None or ch.flags.name != info[0]:
-            if ch is not None:
-                self.close_chans(lambda kk, k=k: kk == k)
-            ch = self._rx_chans[k] = RxChannel(self.device, info)
+        with self._chan_lock:   # abort() and the event thread iterate the dict
+            ch = self._rx_chans.get(k)
+            if ch is None or ch.flags.name != info[0]:
+                if ch is not None:
+                    self.close_chans(lambda kk, k=k: kk == k)
+                ch = self._rx_chans[k] = RxChannel(self.device, info)
         return ch
 
     def close_chans(self, pred) -> None:
@@ -737,15 +739,18 @@ class StageLink:
                 time.sleep(0.05)
                 continue
             if m is not None:
-                self._handle(*m)
+                try:
+                    self._handle(*m)
+                except Exception:  # noqa: BLE001  (a malformed message must not stop receiving)
+                    log.exception("connex-pp: handling a message from %s failed", m[0])
 
     def _handle(self, peer, data) -> None:
         try:
-            hdr = pickle.loads(data)
+            hdr = loads_plain(data)
+            kind = hdr[0]
         except Exception as e:  # noqa: BLE001
             log.warning("connex-pp: bad message from %s: %s", peer, e)
             return
-        kind = hdr[0]
         if kind == ACK:
             self._release_sent(hdr[1])
         elif kind == TENSORS:
@@ -1060,7 +1065,7 @@ class StageLink:
             with self.inbox.cv:
                 self.up_peers.discard(peer)
             self.close_chans(lambda k, peer=peer: k[0] == peer)
-            for ak in [ak for ak in self._announced if ak[0] == peer]:
+            for ak in [ak for ak in list(self._announced) if ak[0] == peer]:
                 self._announced.pop(ak, None)
             n = self._release_sent_where(lambda ent: ent[2] == peer)
             if n:
@@ -1121,6 +1126,22 @@ class _Header:
 
 _pending_frees: deque = deque()
 _pending_lock = threading.Lock()
+
+
+class _PlainUnpickler(pickle.Unpickler):
+    """Unpickles only plain data (tuples, lists, dicts, str, bytes, numbers,
+    None, bool): every message of this link is built from those. Any global
+    (a class or a function) is refused, so a peer that can reach the data
+    port cannot make this process run code by sending a crafted pickle."""
+
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError(f"global {module}.{name} not allowed in a pp message")
+
+
+def loads_plain(data) -> Any:
+    import io
+
+    return _PlainUnpickler(io.BytesIO(bytes(data))).load()
 
 
 def _peer_id(url: str) -> tuple:

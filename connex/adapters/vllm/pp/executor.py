@@ -110,6 +110,9 @@ class ControlLink:
             except Exception as e:  # noqa: BLE001
                 log.warning("connex-pp: bad control message: %s", e)
                 continue
+            if not (isinstance(hdr, tuple) and len(hdr) == 2):
+                log.warning("connex-pp: malformed control message from %s", peer)
+                continue
             if hdr[0] == CONTROL and self.on_message is not None:
                 try:
                     self.on_message(tuple(peer), hdr[1])
@@ -347,7 +350,11 @@ class ConnexPPExecutor(MultiprocExecutor):
             log.warning("connex-pp: s%dr%d is owned by another pipeline", r.stage, r.idx)
             with self.lock:
                 r.busy = True
-            self._failover(r, "busy")
+            # Not on this (the control receive) thread: the failover waits
+            # for HELLO_OK of a replacement, which this thread delivers, and
+            # OUT replies of other steps must not stall behind it.
+            threading.Thread(target=self._failover, args=(r, "busy"), name="cx-pp-failover",
+                             daemon=True).start()
 
     def _on_failed(self, peer: tuple, reason) -> None:
         r = self._find(peer)
@@ -517,6 +524,9 @@ class ConnexPPExecutor(MultiprocExecutor):
             p = self.pending[seq]
             route = list(self.route)
         if not p.lost:
+            # The step can complete only from here on: the watchdog's step
+            # timeout runs from now, not from execute_model.
+            p.t_send = time.monotonic()
             raw = ControlLink.encode(("SAMPLE", seq, p.epoch, grammar_output, self.owner))
             for r in route:
                 if r is not None:

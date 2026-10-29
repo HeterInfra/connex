@@ -2493,7 +2493,20 @@ class ConnexTEEndpoint(ZmqStageBase):
         if self._epc_client is not None:
             self._epc_client.stop()
             self._epc_client = None
+        # Sender thread (K>1 async sends) first: it uses the DEALER sockets.
+        ex = getattr(self, "_signal_ex", None)
+        if ex is not None:
+            ex.shutdown(wait=True, cancel_futures=True)
+            self._signal_ex = None
         self._invalidate_peer_cache()
+        # Ack DEALERs (GPUDirect path): an unclosed socket makes
+        # Context.term() block forever.
+        for sock in getattr(self, "_ack_socks", {}).values():
+            try:
+                sock.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._ack_socks = {}
         if self._buffer_cleaner is not None:
             self._buffer_cleaner.shutdown(wait=False)
             self._buffer_cleaner = None
