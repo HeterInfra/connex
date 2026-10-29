@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+**Full review: fixes**
+- Security: `connex.ucx_transport` no longer unpickles received payloads (a
+  strict GDIR header parser; dtypes without a GDIR code go the bytes path
+  instead of being sent as float32). The PP link (`connex.adapters.vllm.pp`)
+  unpickles plain data only, and the EP mover only CUDA IPC handles.
+  `connex-directory` binds `127.0.0.1:5555` by default (pass `--bind
+  0.0.0.0:5555` for other hosts). `connex-pd-router` admin routes
+  (`/pd/drain`, `/pd/undrain`) need loopback or `--admin-token` /
+  `CONNEX_PD_ADMIN_TOKEN`. The vLLM PD connector's KV control channel binds
+  the advertised IPv4 host (`bind_ip` overrides). SECURITY.md lists every
+  listener and what is still unauthenticated (PP stage control sockets
+  still unpickle peer frames: keep them on a private network).
+- Resume proxy: a stream that breaks after the last token (finish_reason or
+  `max_tokens` reached) completes instead of resuming past the end or
+  reporting a failure; a replica whose blacklist expired is usable again
+  with probing off; `max_completion_tokens` is honoured when `max_tokens`
+  is null.
+- PD: a late release from a decode instance the request moved away from no
+  longer frees the prefill hold the new reader is pulling from; the vLLM
+  connector closes its data plane on shutdown.
+- PP: a malformed message no longer kills the link receive thread; channel
+  maps are guarded against the abort and event threads; a BUSY failover
+  runs off the control thread; the watchdog step timer starts at SAMPLE;
+  chains of an already aborted epoch start cancelled; `connex.pp`
+  endpoints with GPUDirect acks close without hanging.
+- RL: readers of an arena that the publisher overwrote after a timeout are
+  told (`stale`) and re-read instead of loading torn weights; a reader that
+  dies mid-pull gives its load back; `receive_weights` syncs only CUDA
+  devices (failed on CPU workers).
+- EP: a failed move releases its staged slots. Agent sessions honour
+  `session_ttl_s`.
+- Core: directory control calls drop late replies of timed-out requests and
+  are serialised; the front router guards cutover/abort states, applies a
+  cutover under the route lock and stops its threads before closing
+  sockets; `ProtocolHeader` round-trips; `epc_client` closes only the
+  exact replica's connections; `ElasticPeerSet.stop` closes draining
+  endpoints; dual-path cutover sets its start time.
+- Tests: vLLM-dependent PP tests skip when the local vLLM build does not
+  load; the fast-hash timing test uses best-of-N; benchmark scripts only
+  signal the caller's own processes.
+
 - `connex-ai[rs]` requires `connex-rs>=0.1.5,<0.2` (`Engine.put_chain` with a
   cancel word and cyclic comparisons, GPU RMA below the zero-copy threshold
   rejected); submodule at connex-rs 0.1.5 (unreleased).
