@@ -415,6 +415,22 @@ class RouteManager:
                 self._persistence.set(f"routes/{key}", route.to_dict())
             return route, old
     
+    def apply_cutover(
+        self, lid: LogicalEndpointID, addresses: List[str], epoch: int
+    ) -> Optional[RouteEntry]:
+        """Point a route at its migration target, under the lock, and persist."""
+        key = lid.to_key()
+        with self._lock:
+            route = self._routes.get(key)
+            if route is None:
+                return None
+            route.addresses = list(addresses)
+            route.epoch = epoch
+            route.state = RouteState.ACTIVE
+            if self._persistence:
+                self._persistence.set(f"routes/{key}", route.to_dict())
+            return route
+
     def heartbeat(self, lid: LogicalEndpointID) -> Tuple[bool, bool]:
         """Record a heartbeat. Returns (found, recovered_from_unhealthy)."""
         key = lid.to_key()
@@ -756,6 +772,10 @@ class MigrationOrchestrator:
             migration = self._pending.get(migration_id)
             if not migration:
                 return False
+            # A failed (aborted) or already completed migration must not be
+            # replayed: that would re-point the route at a stale target.
+            if migration.state not in ("pending", "preparing", "ready"):
+                return False
             
             migration.state = "cutting_over"
         
@@ -770,11 +790,9 @@ class MigrationOrchestrator:
         ))
         
         # Update route with new address
-        route = self._route_manager.get_route(migration.lid)
-        if route:
-            route.addresses = [migration.new_address]
-            route.epoch = migration.new_epoch
-            route.state = RouteState.ACTIVE
+        route = self._route_manager.apply_cutover(
+            migration.lid, [migration.new_address], migration.new_epoch
+        )
         
         # Complete migration
         with self._lock:
@@ -801,6 +819,8 @@ class MigrationOrchestrator:
         with self._lock:
             migration = self._pending.get(migration_id)
             if not migration:
+                return False
+            if migration.state in ("complete", "failed"):
                 return False
             
             migration.state = "failed"
@@ -862,9 +882,12 @@ class EventBus:
         """Stop the event bus."""
         self._running = False
         
-        if self._pub_socket:
-            self._pub_socket.close()
-            self._pub_socket = None
+        with self._lock:
+            if self._pub_socket:
+                # LINGER=0: queued messages for slow subscribers must not
+                # block context.term() forever.
+                self._pub_socket.close(linger=0)
+                self._pub_socket = None
         
         if self._context:
             self._context.term()
@@ -872,11 +895,10 @@ class EventBus:
     
     def publish(self, event: Event):
         """Publish an event to all subscribers."""
-        if not self._running or not self._pub_socket:
-            logger.warning("Event bus not running, dropping event")
-            return
-        
         with self._lock:
+            if not self._running or not self._pub_socket:
+                logger.warning("Event bus not running, dropping event")
+                return
             self._seq += 1
             event.seq = self._seq
             # Store in history
@@ -1051,9 +1073,16 @@ class FrontRouter:
         # Stop member manager
         self.member_manager.stop()
         
+        # Let the API thread leave its poll before closing its socket: ZMQ
+        # sockets are not thread-safe, and closing one under a poll in
+        # another thread can crash or hang context.term().
+        if self._api_thread is not None and self._api_thread is not threading.current_thread():
+            self._api_thread.join(timeout=5.0)
+        self._api_thread = None
+
         # Stop API server
         if self._api_socket:
-            self._api_socket.close()
+            self._api_socket.close(linger=0)
             self._api_socket = None
         
         if self._context:

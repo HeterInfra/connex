@@ -884,6 +884,9 @@ class DualPathCutoverManager:
             old_path_last_seqno=cutover_seqno - 1,
             new_path_first_seqno=cutover_seqno,
         )
+        # The switch point is fixed by cutover_seqno from now on; without this
+        # select_path() kept every message on the old path forever.
+        state.cutover_at = time.time()
         
         with self._lock:
             self._cutovers[stream_id.to_str()] = state

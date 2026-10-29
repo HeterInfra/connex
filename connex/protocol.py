@@ -274,8 +274,9 @@ class ProtocolHeader:
     - stream_hash (8B): Hash of stream_id for fast lookup
     - src_lid_hash (8B): Hash of source LID
     - dst_lid_hash (8B): Hash of destination LID
-    - timestamp (8B): Send timestamp (microseconds)
+    - timestamp (4B): Send timestamp, low 32 bits of microseconds (wraps ~71 min)
     - payload_len (4B): Payload length
+    - chunk_idx (2B), total_chunks (2B)
     - checksum (4B): Header checksum
     """
     # Protocol identification
@@ -377,7 +378,7 @@ class ProtocolHeader:
         - stream_hash: 8B (uint64)
         - src_lid_hash: 8B (uint64)
         - dst_lid_hash: 8B (uint64)
-        - timestamp: 8B (uint64)
+        - timestamp: 4B (uint32, low 32 bits of microseconds)
         - payload_len: 4B (uint32)
         - chunk_idx: 2B (uint16)
         - total_chunks: 2B (uint16)
@@ -395,7 +396,7 @@ class ProtocolHeader:
             self._stream_hash,
             self._src_lid_hash,
             self._dst_lid_hash,
-            self.timestamp_us,
+            self.timestamp_us & 0xFFFFFFFF,
             self.payload_len,
             self.chunk_idx,
             self.total_chunks,
@@ -426,7 +427,7 @@ class ProtocolHeader:
             stream_hash, src_lid_hash, dst_lid_hash,
             timestamp_us, payload_len,
             chunk_idx, total_chunks
-        ) = struct.unpack("<IHHIQBBHQQQIIHH", header_data[:56])
+        ) = struct.unpack("<IHHIQBBHQQQIIHH", header_data)
         
         if magic != 0x434F4E58:
             raise ValueError(f"Invalid magic number: {magic:08x}")
@@ -491,6 +492,10 @@ class MobilityMessage:
         """Deserialize complete message."""
         header = ProtocolHeader.deserialize(data[:64])
         payload = data[64:64 + header.payload_len]
+        if len(payload) != header.payload_len:
+            raise ValueError(
+                f"Truncated message: payload {len(payload)} bytes, header says {header.payload_len}"
+            )
         return cls(header=header, payload=payload)
     
     def is_stale(self, current_epoch: int) -> bool:

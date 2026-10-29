@@ -34,13 +34,11 @@ try:
 except ImportError:
     HAS_TORCH = False
 
-# Add services path for client import
-_SERVICES_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../services/front-router"))
-if _SERVICES_PATH not in sys.path:
-    sys.path.insert(0, _SERVICES_PATH)
-
+# Package imports only: the old code prepended a directory outside the
+# package to sys.path and imported bare ``front_router``/``epc_client``,
+# which resolves to whatever module of that name is found first.
 try:
-    from front_router import (
+    from connex.front_router import (
         LogicalEndpointID,
         RouteEntry,
         RouteState,
@@ -48,7 +46,7 @@ try:
         Event,
         TransportCapability,
     )
-    from epc_client import (
+    from connex.epc_client import (
         EPCV2Client,
         EPCV2ClientConfig,
         RouteTableCache,

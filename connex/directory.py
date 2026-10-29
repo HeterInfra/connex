@@ -161,6 +161,8 @@ class DirectoryClient:
         # ZeroMQ context and sockets
         self._ctx = zmq.Context.instance()
         self._control_socket: Optional[zmq.Socket] = None
+        # Serializes request/response pairs on the (non-thread-safe) DEALER.
+        self._control_lock = threading.Lock()
         self._sub_socket: Optional[zmq.Socket] = None
         
         # Background thread for event processing
@@ -243,8 +245,7 @@ class DirectoryClient:
         }
         
         try:
-            self._send_control_message(request)
-            response = self._recv_control_message(timeout_ms=5000)
+            response = self._control_call(request, timeout_ms=5000)
             
             if response and response.get("status") == "ok":
                 self._registered = request
@@ -286,8 +287,7 @@ class DirectoryClient:
         }
         
         try:
-            self._send_control_message(request)
-            response = self._recv_control_message(timeout_ms=5000)
+            response = self._control_call(request, timeout_ms=5000)
             
             if response and response.get("status") == "ok":
                 endpoint = EndpointInfo.from_dict(response["endpoint"])
@@ -324,8 +324,7 @@ class DirectoryClient:
         """
         request = {"type": "list_stage", "model": self.model_name, "stage": stage_idx}
         try:
-            self._send_control_message(request)
-            response = self._recv_control_message(timeout_ms=5000)
+            response = self._control_call(request, timeout_ms=5000)
         except Exception as e:
             logger.error("list_stage error for stage %d: %s", stage_idx, e)
             return []
@@ -354,8 +353,7 @@ class DirectoryClient:
         }
         
         try:
-            self._send_control_message(request)
-            response = self._recv_control_message(timeout_ms=5000)
+            response = self._control_call(request, timeout_ms=5000)
             
             if response and response.get("status") == "ok":
                 endpoint = response.get("endpoint", "")
@@ -396,8 +394,7 @@ class DirectoryClient:
         }
         
         try:
-            self._send_control_message(request)
-            response = self._recv_control_message(timeout_ms=5000)
+            response = self._control_call(request, timeout_ms=5000)
             
             if response and response.get("status") == "ok":
                 with self._epoch_lock:
@@ -431,8 +428,7 @@ class DirectoryClient:
         }
 
         try:
-            self._send_control_message(request)
-            response = self._recv_control_message(timeout_ms=5000)
+            response = self._control_call(request, timeout_ms=5000)
 
             if response and response.get("status") == "ok":
                 self._registered = None
@@ -456,8 +452,7 @@ class DirectoryClient:
         """
         request = {"type": "report_failure", "lid": list(target_lid)}
         try:
-            self._send_control_message(request)
-            response = self._recv_control_message(timeout_ms=2000)
+            response = self._control_call(request, timeout_ms=2000)
         except Exception as e:
             logger.error("report_failure error for LID=%s: %s", target_lid, e)
             return False
@@ -486,6 +481,7 @@ class DirectoryClient:
         sock.connect(f"tcp://{self.front_router_addr}")
 
         def call(msg: dict[str, Any]) -> Optional[dict[str, Any]]:
+            self._drain_stale_replies(sock)
             sock.send(msgpack.packb(msg, use_bin_type=True))
             if sock.poll(int(interval_s * 2000)):
                 return msgpack.unpackb(sock.recv(), raw=False)
@@ -518,8 +514,7 @@ class DirectoryClient:
             return True
         if event_address is None:
             try:
-                self._send_control_message({"type": "info"})
-                info = self._recv_control_message(timeout_ms=2000)
+                info = self._control_call({"type": "info"}, timeout_ms=2000)
             except Exception as e:
                 logger.error("Directory info request failed: %s", e)
                 return False
@@ -607,6 +602,28 @@ class DirectoryClient:
             else:
                 self._endpoint_cache.clear()
                 
+    def _control_call(self, message: dict[str, Any],
+                      timeout_ms: int = 5000) -> Optional[dict[str, Any]]:
+        """Send one request and wait for its reply.
+
+        Replies that arrived after an earlier call timed out are discarded
+        first, so a stale reply is never taken as the answer to this request.
+        """
+        with self._control_lock:
+            self._drain_stale_replies(self._control_socket)
+            self._send_control_message(message)
+            return self._recv_control_message(timeout_ms=timeout_ms)
+
+    @staticmethod
+    def _drain_stale_replies(sock: Optional[zmq.Socket]) -> None:
+        if sock is None:
+            return
+        while True:
+            try:
+                sock.recv(zmq.NOBLOCK)
+            except zmq.Again:
+                return
+
     def _send_control_message(self, message: dict[str, Any]) -> None:
         """Send control message via ZeroMQ."""
         import msgpack

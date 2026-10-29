@@ -68,6 +68,7 @@ class ElasticPeerSet:
                                         thread_name_prefix="connex-peer")
         self._stop = threading.Event()
         self._push = False
+        self._closed_on_stop: list = []  # endpoints closed by stop()
         self.stats = {"connects": 0, "connect_ms_total": 0.0, "failures": 0, "leaves": 0}
 
     # ----------------------------------------------------------- lifecycle
@@ -90,6 +91,7 @@ class ElasticPeerSet:
             self._ready.clear()
             self._wanted.clear()
             self._order = []
+            self._closed_on_stop = eps
         for ep in eps:
             self._close(ep)
         self._pool.shutdown(wait=False)
@@ -146,7 +148,10 @@ class ElasticPeerSet:
         logger.warning("Peer %s failed; removed and reported", lid)
         self.directory.report_failure(lid)
         if entry is not None:
-            self._pool.submit(self._close, entry[0])
+            try:
+                self._pool.submit(self._close, entry[0])
+            except RuntimeError:  # pool already shut down by stop()
+                self._close(entry[0])
 
     # ------------------------------------------------------------ internals
 
@@ -185,10 +190,17 @@ class ElasticPeerSet:
 
     def _want(self, lid: tuple, addr: str) -> None:
         with self._lock:
+            if self._stop.is_set():
+                return  # late event after stop(): the pool is gone
             if self._wanted.get(lid) == addr:
                 return  # already connected or connecting to this address
             self._wanted[lid] = addr
-        self._pool.submit(self._connect, lid, addr)
+        try:
+            self._pool.submit(self._connect, lid, addr)
+        except RuntimeError:  # stop() raced with this event
+            with self._lock:
+                if self._wanted.get(lid) == addr:
+                    del self._wanted[lid]
 
     def _connect(self, lid: tuple, addr: str) -> None:
         host, port = addr.rsplit(":", 1)
@@ -235,7 +247,10 @@ class ElasticPeerSet:
                 # The transport caches endpoints by address, so a peer that
                 # rejoined at the same address may be using this endpoint again.
                 in_use = any(e is ep for e, _ in self._ready.values())
-            if not in_use and not self._stop.is_set():
+                # stop() closes only the endpoints still routable; one that
+                # was already draining must still be closed here, or it leaks.
+                closed = any(e is ep for e in self._closed_on_stop)
+            if not in_use and not closed:
                 self._close(ep)
         timer = threading.Timer(self.drain_grace_s, run)
         timer.daemon = True

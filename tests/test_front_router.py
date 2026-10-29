@@ -93,7 +93,6 @@ def test_front_router_standalone():
     finally:
         router.stop()
     
-    return True
 
 
 def test_client_registration():
@@ -185,7 +184,6 @@ def test_client_registration():
     finally:
         router.stop()
     
-    return True
 
 
 def test_migration_flow():
@@ -285,7 +283,6 @@ def test_migration_flow():
     finally:
         router.stop()
     
-    return True
 
 
 def test_reconnection():
@@ -346,7 +343,6 @@ def test_reconnection():
     finally:
         router.stop()
     
-    return True
 
 
 def main():
@@ -364,7 +360,8 @@ def main():
     results = []
     for name, test_fn in tests:
         try:
-            success = test_fn()
+            test_fn()
+            success = True
             results.append((name, success, None))
         except Exception as e:
             logger.error("Test '%s' failed: %s", name, e)

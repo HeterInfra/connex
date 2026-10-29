@@ -90,6 +90,31 @@ DTYPE_ELEMENT_SIZE = {
 }
 
 
+def _parse_gdir_metadata(data: Any) -> Optional[dict]:
+    """Parse the GDIR header written by ``_send_ucx_cuda``.
+
+    Format: ``b"GDIR" + struct.pack("!BBI{ndim}I", dtype_idx, ndim, numel, *shape)``.
+    Returns ``{"shape", "dtype", "nbytes"}`` or None if ``data`` is not a
+    well-formed header (length must match exactly and numel must equal the
+    product of the shape, so ordinary payloads are not misparsed).
+    """
+    if not isinstance(data, (bytes, bytearray)) or len(data) < 10 or data[:4] != b"GDIR":
+        return None
+    dtype_idx, ndim = data[4], data[5]
+    if len(data) != 10 + 4 * ndim:
+        return None
+    numel = struct.unpack("!I", data[6:10])[0]
+    shape = struct.unpack(f"!{ndim}I", data[10:10 + ndim * 4])
+    prod = 1
+    for d in shape:
+        prod *= d
+    if prod != numel or dtype_idx >= len(DTYPE_IDX_TO_TORCH):
+        return None
+    dtype = DTYPE_IDX_TO_TORCH[dtype_idx]
+    return {"shape": shape, "dtype": dtype,
+            "nbytes": numel * DTYPE_ELEMENT_SIZE.get(dtype, 4)}
+
+
 _cuda_tls = threading.local()
 
 
@@ -793,10 +818,8 @@ class UCXTransport:
         1. First message: metadata (contains shape, dtype, nbytes, is_cuda flag)
         2. If is_cuda: Second recv() into pre-allocated CUDA tensor
         
-        v1.7.5.5: Optimized metadata parsing - try struct first (faster), then pickle.
+        Metadata is the struct-packed GDIR header only (never pickle).
         """
-        import pickle
-        import struct
         
         logger.info("UCX: Starting recv loop for %s", peer_addr)
         try:
@@ -812,47 +835,13 @@ class UCXTransport:
                         gpu_direct_metadata = None
                         
                         if isinstance(data, (bytes, bytearray)):
-                            # v1.7.5.5: Try fast struct-based metadata first (16 bytes)
-                            # Format: [magic(4)][dtype(1)][ndim(1)][numel(4)][shape dims...]
-                            if len(data) >= 10 and data[:4] == b'GDIR':
-                                try:
-                                    dtype_idx = data[4]
-                                    ndim = data[5]
-                                    numel = struct.unpack('!I', data[6:10])[0]
-                                    shape = struct.unpack(f'!{ndim}I', data[10:10+ndim*4])
-                                    
-                                    # v1.8.18: Use module-level constants
-                                    dtype = DTYPE_IDX_TO_TORCH[dtype_idx] if dtype_idx < len(DTYPE_IDX_TO_TORCH) else torch.float32
-                                    
-                                    is_gpu_direct = True
-                                    gpu_direct_metadata = {
-                                        "shape": shape,
-                                        "dtype": dtype,
-                                        "nbytes": numel * DTYPE_ELEMENT_SIZE.get(dtype, 4),
-                                    }
-                                except Exception:
-                                    pass  # Not struct-based metadata
-                            
-                            # Fallback to pickle-based metadata (legacy protocol)
-                            if not is_gpu_direct:
-                                try:
-                                    metadata = pickle.loads(data)
-                                    if isinstance(metadata, dict) and metadata.get("is_cuda"):
-                                        is_gpu_direct = True
-                                        shape = tuple(metadata["shape"])
-                                        dtype_str = metadata["dtype"]
-                                        nbytes = metadata["nbytes"]
-                                        
-                                        # v1.8.18: Use module-level constant
-                                        dtype = DTYPE_STR_TO_TORCH.get(dtype_str, torch.float32)
-                                        gpu_direct_metadata = {
-                                            "shape": shape,
-                                            "dtype": dtype,
-                                            "nbytes": nbytes,
-                                        }
-                                except Exception:
-                                    pass  # Not GPU Direct metadata
-                        
+                            # Struct-based GPU Direct metadata (see _send_ucx_cuda).
+                            # Never unpickle peer bytes: that would run arbitrary
+                            # code from the network, and no sender emits pickled
+                            # metadata anymore.
+                            gpu_direct_metadata = _parse_gdir_metadata(data)
+                            is_gpu_direct = gpu_direct_metadata is not None
+
                         if is_gpu_direct and gpu_direct_metadata:
                             # GPU Direct: receive CUDA tensor in second phase
                             shape = gpu_direct_metadata["shape"]
@@ -1534,7 +1523,12 @@ class UCXTransport:
         # v1.7.5.5: Use struct-based metadata (much faster than pickle)
         # Format: [magic(4)][dtype(1)][ndim(1)][numel(4)][shape dims...]
         # v1.8.18: Use module-level TORCH_TO_DTYPE_IDX constant
-        dtype_idx = TORCH_TO_DTYPE_IDX.get(tensor.dtype, 0)
+        dtype_idx = TORCH_TO_DTYPE_IDX.get(tensor.dtype)
+        if dtype_idx is None:
+            # No GDIR code for this dtype: defaulting to float32 would make the
+            # receiver allocate a wrong-sized buffer. Use the bytes path.
+            await self._send_ucx(endpoint, self._tensor_to_bytes(tensor), tag)
+            return
         ndim = len(tensor.shape)
         numel = tensor.numel()
         
@@ -1836,18 +1830,14 @@ class UCXTransport:
         Returns:
             The received CUDA tensor
         """
-        import pickle
-        
-        # Step 1: Receive metadata first
+        # Step 1: Receive the struct-packed GDIR metadata sent by _send_ucx_cuda
         meta_bytes = await endpoint.recv_obj()
-        metadata = pickle.loads(meta_bytes)
-        
-        shape = tuple(metadata["shape"])
-        dtype_str = metadata["dtype"]
+        metadata = _parse_gdir_metadata(meta_bytes)
+        if metadata is None:
+            raise ValueError("expected GDIR metadata before GPU Direct payload")
+        shape = metadata["shape"]
+        dtype = metadata["dtype"]
         nbytes = metadata["nbytes"]
-        
-        # v1.8.18: Use module-level DTYPE_STR_TO_TORCH constant
-        dtype = DTYPE_STR_TO_TORCH.get(dtype_str, torch.float32)
         
         # Step 2: Pre-allocate CUDA tensor from cache
         # We need to allocate the exact number of elements

@@ -26,7 +26,7 @@ usually embed the same protocol in their own router.
 
 Run standalone::
 
-    python -m connex.directory_server --bind 0.0.0.0:5555
+    python -m connex.directory_server --bind 0.0.0.0:5555   # no auth: trusted networks only
 """
 
 from __future__ import annotations
@@ -226,7 +226,8 @@ class DirectoryServer:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Connex reference directory server")
-    parser.add_argument("--bind", default="0.0.0.0:5555", help="host:port for requests")
+    parser.add_argument("--bind", default="127.0.0.1:5555",
+                        help="host:port for requests (unauthenticated; use 0.0.0.0 only on a trusted network)")
     parser.add_argument("--event-bind", default=None,
                         help="host:port for the event PUB socket (default: port+1)")
     parser.add_argument("--lease", type=float, default=2.0,

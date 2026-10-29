@@ -381,7 +381,7 @@ class DataPlaneManager:
         with self._lock:
             keys_to_remove = [
                 k for k in self._connections.keys()
-                if k.startswith(lid.to_key())
+                if k.startswith(lid.to_key() + "@")
             ]
             for k in keys_to_remove:
                 # TODO: Close actual connection
