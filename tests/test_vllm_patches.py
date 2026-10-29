@@ -261,21 +261,19 @@ def test_hash_cache_matches_fork_scheme():
 
 
 def test_fast_hash_is_faster_and_distinct():
+    # Best of several runs: a single wall-clock sample flakes on a busy host.
+    import timeit
     toks = list(range(16))
     old = A._CONNEX_PP_FAST_HASH
     try:
         A._CONNEX_PP_FAST_HASH = False
-        t0 = time.perf_counter()
-        for _ in range(3000):
-            slow = A.connex_pp_hash_block(b"x", toks)
-        t_slow = time.perf_counter() - t0
+        slow = A.connex_pp_hash_block(b"x", toks)
+        t_slow = min(timeit.repeat(lambda: A.connex_pp_hash_block(b"x", toks), number=2000, repeat=7))
         A._CONNEX_PP_FAST_HASH = True
-        t0 = time.perf_counter()
-        for _ in range(3000):
-            fast = A.connex_pp_hash_block(b"x", toks)
-        t_fast = time.perf_counter() - t0
+        fast = A.connex_pp_hash_block(b"x", toks)
+        t_fast = min(timeit.repeat(lambda: A.connex_pp_hash_block(b"x", toks), number=2000, repeat=7))
         assert fast != slow and len(fast) == 16
         assert A.connex_pp_hash_block(b"x", toks[:15] + [99]) != fast
-        assert t_fast < t_slow
+        assert t_fast < t_slow, (t_fast, t_slow)
     finally:
         A._CONNEX_PP_FAST_HASH = old

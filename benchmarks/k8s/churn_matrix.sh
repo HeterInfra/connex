@@ -54,7 +54,7 @@ for variant in $VARIANTS; do
     kubectl -n "$NS" delete pod -l router="$RN" >/dev/null; sleep 8
     kubectl -n "$NS" delete pod -l pipeline="$P" >/dev/null; sleep 25
     ./wait_ready.sh "$P" 1200 >/dev/null || { echo "$comm $q: not ready"; continue; }
-    pkill -f "port-forward svc/$RN " || true; sleep 1
+    pkill -u "$(id -u)" -f "port-forward svc/$RN " || true; sleep 1
     res=$(./run_churn.sh "$P" "$MODE" "$T/gamma_qps$q.csv" "$r" 240 "$OUT/$comm" 2>&1 | grep '^{"requests"')
     echo "$comm qps$q $res"
   done

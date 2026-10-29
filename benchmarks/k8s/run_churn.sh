@@ -21,7 +21,7 @@ mkdir -p "$OUT"
 name="${PREFIX}_${MODE}_$(basename "$TRACE" .csv)_$(date +%H%M%S)"
 if [ -z "${CONNEX_ROUTER:-}" ]; then
   RN=${CONNEX_ROUTER_NAME:-connex-front-router}
-  pgrep -f "port-forward svc/$RN " >/dev/null || \
+  pgrep -u "$(id -u)" -f "port-forward svc/$RN " >/dev/null || \
     (kubectl -n "$NS" port-forward "svc/$RN" 15555:15555 >/dev/null 2>&1 &)
   sleep 2
 fi

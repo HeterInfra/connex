@@ -147,7 +147,6 @@ def upstream_env(c, prefix, idx, replica):
 
 
 def stage(c, backend, prefix, idx, node, replica=0, overrides=None):
-    ns = c.namespace
     name = f"{prefix}-s{idx}-r{replica}"
     labels = {"app": "connex-stage", "pipeline": prefix, "stage": str(idx), "replica": str(replica)}
     if c.engine == "upstream":
