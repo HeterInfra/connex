@@ -229,7 +229,12 @@ class LoopbackPlane:
 
 
 def backend_from_env() -> str:
-    b = (os.getenv("CONNEX_PD_BACKEND") or "auto").strip().lower()
+    return resolve_backend(os.getenv("CONNEX_PD_BACKEND"))
+
+
+def resolve_backend(name: Optional[str]) -> str:
+    """Normalize a backend name; empty or ``auto`` picks one automatically."""
+    b = (name or "auto").strip().lower()
     b = {"connexrs": "connex-rs", "connex_rs": "connex-rs", "rs": "connex-rs"}.get(b, b)
     if b == "auto":
         import importlib.util
@@ -245,13 +250,15 @@ def backend_from_env() -> str:
         raise RuntimeError("no KV data plane: install connex-rs (connex-ai[rs]) or Mooncake "
                            "(connex-ai[mooncake]), or set CONNEX_PD_BACKEND=loopback for tests")
     if b not in ("connex-rs", "mooncake", "loopback"):
-        raise ValueError(f"CONNEX_PD_BACKEND must be auto, connex-rs, mooncake or loopback, got {b!r}")
+        raise ValueError(f"PD backend (CONNEX_PD_BACKEND) must be auto, connex-rs, mooncake or loopback, got {b!r}")
     return b
 
 
 def make_plane(model: str, role_idx: int, replica: int, rank: int, ip: str,
                backend: Optional[str] = None, port: int = 0) -> KVDataPlane:
-    backend = backend or backend_from_env()
+    # An explicit "auto" must auto-detect like an unset backend, not fall
+    # through to the in-process LoopbackPlane.
+    backend = resolve_backend(backend) if backend else backend_from_env()
     if backend == "connex-rs":
         return ConnexRsPlane(model, role_idx, replica, rank, ip, port)
     if backend == "mooncake":
