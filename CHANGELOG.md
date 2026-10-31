@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+**Performance**
+- `import connex` no longer imports torch, vLLM or UCX: the package
+  resolves its public names lazily. On one host, `import connex` went from
+  about 4.5 s to 30 ms, and `--help` of `connex-front-router`,
+  `connex-directory` and `connex-pd-router` from about 4.5 s to 0.08 to
+  0.2 s.
+
 **Full review: fixes**
 - Security: `connex.ucx_transport` no longer unpickles received payloads (a
   strict GDIR header parser; dtypes without a GDIR code go the bytes path

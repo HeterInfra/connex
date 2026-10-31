@@ -1376,6 +1376,26 @@ failure at a time, stage 0
 failures (the API instance; use the resume proxy of section 4), PP across
 hosts with more than two stages.
 
+## 14. Import and CLI startup time
+
+`connex/__init__.py` used to import every legacy module eagerly, and two of
+them import torch and vLLM, so every entry point paid for them. The package
+now resolves its public names on first access (PEP 562). Wall time of a fresh
+`python -c "import <mod>"` (or `python -m <mod> --help`) on one
+GPU host with vLLM installed, warm page cache, 3 runs after one warmup:
+
+| Command | Before | After |
+|---|---|---|
+| `import connex` | 4.49–4.66 s | 28–32 ms |
+| `import connex.pp` | 4.28–4.69 s | 56–68 ms |
+| `import connex.serving.proxy` | 4.64–4.80 s | 193–200 ms |
+| `connex-front-router --help` | 4.44–4.48 s | 105–112 ms |
+| `connex-directory --help` | 4.38–4.57 s | 78–81 ms |
+| `connex-pd-router --help` | 4.52–4.56 s | 193–200 ms |
+| `python -m connex.adapters.vllm.pp.stage --help` | 8.6–9.0 s | 8.7–8.9 s (vLLM itself) |
+
+`tests/test_import_light.py` keeps torch and vLLM out of these imports.
+
 ## How to reproduce
 
 Deploy (see `deploy/k8s/README.md`):
