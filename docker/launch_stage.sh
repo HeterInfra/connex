@@ -25,6 +25,9 @@
 #   DATA_PORT      data port of TP rank 0 of a downstream stage [CONTROL_PORT + 1];
 #                  TP rank r listens on DATA_PORT + r (connex.adapters.vllm.pp.ports)
 #   NUM_GPU_BLOCKS --num-gpu-blocks-override, the same on every stage [8192]
+#   KV_CACHE_MEMORY --kv-cache-memory-bytes (e.g. 6G) [unset]: skips vLLM's
+#                  memory and CUDA-graph profiling passes at start, ~3.5 s off
+#                  every (re)start of an 8B stage; must cover NUM_GPU_BLOCKS
 # Common env (defaults in brackets):
 #   BACKEND        (fork) connexte | connex [connexte]
 #   REPLICA        replica index of this stage [0]
@@ -120,6 +123,7 @@ if [ "$PP_ENGINE" = upstream ]; then
   args=(--served-model-name "$MODEL_NAME" --pipeline-parallel-size "$NUM_STAGES"
         --pipeline-stage-rank "$STAGE" --tensor-parallel-size "${TP:-1}"
         --gpu-memory-utilization "${GPU_MEM_UTIL:-0.6}" --num-gpu-blocks-override "${NUM_GPU_BLOCKS:-8192}"
+        ${KV_CACHE_MEMORY:+--kv-cache-memory-bytes "$KV_CACHE_MEMORY"}
         --pp-group-cls connex.adapters.vllm.pp.group.ConnexPPGroup
         --worker-cls connex.adapters.vllm.pp.worker.ConnexPPWorker
         --distributed-executor-backend connex.adapters.vllm.pp.executor.ConnexPPExecutor)

@@ -8,6 +8,14 @@
   about 4.5 s to 30 ms, and `--help` of `connex-front-router`,
   `connex-directory` and `connex-pd-router` from about 4.5 s to 0.08 to
   0.2 s.
+- `docker/launch_stage.sh`: `KV_CACHE_MEMORY` passes
+  `--kv-cache-memory-bytes`, which skips vLLM's profiling passes; restart in
+  place of an 8B stage takes 24 s instead of 28 s.
+- PP stage restart: the READY announce goes to every remembered stage 0 in
+  parallel, newest first (a stale one no longer delays the live one), and
+  stage 0 logs `announced itself` when it was the announce that brought the
+  replica back (the old check read a field the stage never sends).
+- Tests: the PD group lease test no longer flakes on a loaded machine.
 
 **Full review: fixes**
 - Security: `connex.ucx_transport` no longer unpickles received payloads (a

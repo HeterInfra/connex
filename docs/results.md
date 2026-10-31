@@ -1396,6 +1396,35 @@ GPU host with vLLM installed, warm page cache, 3 runs after one warmup:
 
 `tests/test_import_light.py` keeps torch and vLLM out of these imports.
 
+## 15. Stage restart in place
+
+PP2 (Llama-3-8B, one stage-1 replica restarted with `kill -9` and
+`docker/launch_stage.sh` on the same GPU, three A40 GPUs on one host,
+`NUM_GPU_BLOCKS=4096`). Restart time runs from the launch to stage 0
+logging the replica up again, with alternating runs after one warmup:
+
+| Start flags | Restart (3 runs) |
+|---|---|
+| default (memory + CUDA-graph profiling) | 27.6, 27.8, 28.4 s |
+| `KV_CACHE_MEMORY=6G` (`--kv-cache-memory-bytes`) | 24.1, 24.3, 24.3 s |
+
+With a fixed KV size, vLLM skips its profiling forward pass and the extra
+CUDA-graph capture it runs only to estimate graph memory. What remains is
+about 8 s of Python/vLLM import, 4 s of weight loading, 2 s of graph capture
+and engine setup.
+
+The restarted stage announces itself to stage 0 (READY). In 6 of the 7
+restarts stage 0 logged `is up (announced itself 0–1 ms ago)`; in the
+other, its periodic HELLO answer arrived first. Announces now go to every
+remembered stage 0 at once, newest first: before, a stale stage-0 URL from an
+earlier deployment came first and delayed the live one by about 1 s.
+
+Kill test on the same setup, final code (16 greedy requests, 300 tokens,
+kill of the stage-1 replica on the route 4 s in): 4800 tokens, 0 off-argmax.
+Under load (16 clients, 256 tokens), killing the other replica: 64/64
+requests completed, 0 failed, 0.24 s without a token on any stream.
+
+
 ## How to reproduce
 
 Deploy (see `deploy/k8s/README.md`):
