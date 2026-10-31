@@ -85,11 +85,16 @@ class StageServer:
     def announce(self) -> None:
         """Tell the stage-0 instances we have served (before a restart) that
         we are ready; they answer with a HELLO."""
-        def run(heads=list(self.heads)):
-            for url in heads:   # a gone one may take a connect timeout
-                self.ctl.send(url, ("READY",), quiet=True)
+        def one(url):
+            ok = self.ctl.send(url, ("READY",), quiet=True)
+            log.info("connex-pp: announced to %s: %s", url, "sent" if ok else "send failed")
 
-        threading.Thread(target=run, name="cx-stage-announce", daemon=True).start()
+        # One thread per head, newest first: a stage-0 instance that is gone
+        # (an older deployment) can take a connect timeout and must not hold
+        # up the announce to the live one.
+        for url in reversed(self.heads):
+            threading.Thread(target=one, args=(url,), name="cx-stage-announce",
+                             daemon=True).start()
 
     def _on_message(self, peer, msg) -> None:
         kind = msg[0]

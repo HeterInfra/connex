@@ -151,6 +151,7 @@ class Replica:
     alive_since: float = 0.0
     done_seq: int = -1          # last step it reported done (with the pong)
     quarantine_until: float = 0.0   # failed over for a hung step: not chosen before
+    announced: float = 0.0      # when it last announced itself (READY), for the log
 
 
 @dataclass
@@ -333,14 +334,19 @@ class ConnexPPExecutor(MultiprocExecutor):
                 r.data_url = data_url
                 if not r.alive:
                     r.alive_since = time.monotonic()
-                    log.info("connex-pp: replica s%dr%d is up (%s)", r.stage, r.idx,
-                             "announced itself" if len(msg) > 3 and msg[3] else "hello")
+                    how = "hello"
+                    if r.announced:
+                        how = "announced itself %.0f ms ago" % ((time.monotonic() - r.announced)
+                                                                * 1e3)
+                    log.info("connex-pp: replica s%dr%d is up (%s)", r.stage, r.idx, how)
+                r.announced = 0.0
                 r.alive = True
                 r.busy = owner not in (None, self.owner)
                 self.cv.notify_all()
         elif kind == "READY":
             # A (re)started replica announcing itself: confirm with a HELLO
             # (it reports its data URL and owner in the answer).
+            r.announced = time.monotonic()
             self._hello(r)
         elif kind == "PONG":
             if len(msg) > 1:
