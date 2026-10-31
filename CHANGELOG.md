@@ -17,6 +17,28 @@
   replica back (the old check read a field the stage never sends).
 - Tests: the PD group lease test no longer flakes on a loaded machine.
 
+**Cross-host round: fixes**
+- PP over connex-rs: UCX_NET_DEVICES is no longer pinned to the RDMA device
+  and its IPoIB interface when the endpoint's address is on another
+  interface (127.0.0.1, a pod or bridge network). The interface that carries
+  the address is listed too. Before, every connect on such an address
+  joined, failed with "Destination is unreachable" and failed again on
+  each retry (the push-channel tests hung on hosts whose default address is
+  not on IPoIB).
+- PP stage 0 re-resolves the host names of replicas it has lost
+  (`docker/launch_stage.sh` exports the names as `CONNEX_PP_STAGE_NAMES`).
+  A recreated downstream pod comes back under its Service name at a new IP.
+  Before, stage 0 kept sending HELLO to the old address, so the replica
+  never came back.
+- The HELLO that stage 0 sends while waiting for a replacement carries its
+  control URL, as the other HELLOs do.
+- `docker/Dockerfile` builds connex-rs v0.1.5 by default (was v0.1.0, whose
+  `put_chain` has no cancel word, so cross-host push was silently off).
+- `CONNEX_PP_TRACE=1` writes per-step timestamps through EXEC, stage server,
+  workers and OUT; `benchmarks/pp_upstream/trace_steps.py` merges them.
+- Tests: `test_launch_stage.py` no longer needs connex installed in the
+  interpreter (it passes the checkout on PYTHONPATH).
+
 **Full review: fixes**
 - Security: `connex.ucx_transport` no longer unpickles received payloads (a
   strict GDIR header parser; dtypes without a GDIR code go the bytes path

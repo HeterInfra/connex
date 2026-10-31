@@ -49,6 +49,7 @@ from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 from connex.adapters.vllm.pp.link import CONTROL, make_engine
+from connex.adapters.vllm.pp.trace import tr
 from connex.adapters.vllm.pp.worker import ROUTE_ATTR
 
 log = logging.getLogger("vllm.connex_pp")
@@ -56,6 +57,17 @@ log = logging.getLogger("vllm.connex_pp")
 MODEL_ID = os.getenv("CONNEX_PP_MODEL_ID", "cxpp")
 CTL_SHARD = 1000          # LID shard of a stage server's control endpoint
 HEAD_SHARD = 2000         # LID shard of a stage-0 executor
+
+
+def resolve_hostport(hp: str) -> str | None:
+    """"HOST:PORT" with HOST resolved to an IPv4 address; None on failure."""
+    import socket
+
+    h, _, p = hp.rpartition(":")
+    try:
+        return f"{socket.gethostbyname(h.strip('[]'))}:{p}"
+    except (OSError, UnicodeError):
+        return None
 
 
 def control_url(hostport: str, stage: int, replica: int) -> str:
@@ -145,6 +157,7 @@ class Replica:
     idx: int
     ctl_url: str
     data_url: str | None = None
+    name: str | None = None     # HOST:PORT as configured (re-resolved: a pod's IP changes)
     alive: bool = False
     busy: bool = False          # owned by another pipeline
     pong: float = 0.0
@@ -228,6 +241,15 @@ class ConnexPPExecutor(MultiprocExecutor):
             [Replica(k + 1, i, control_url(hp, k + 1, i)) for i, hp in enumerate(lst)]
             for k, lst in enumerate(stages)
         ]
+        # The configured names (launch_stage.sh resolves CONNEX_PP_STAGES to
+        # addresses at start): a recreated downstream pod comes back under the
+        # same Service name at a new address.
+        names = json.loads(os.environ.get("CONNEX_PP_STAGE_NAMES", "null") or "null")
+        if (isinstance(names, list) and len(names) == len(self.replicas)
+                and all(len(n) == len(lst) for n, lst in zip(names, self.replicas))):
+            for n, lst in zip(names, self.replicas):
+                for hp, r in zip(n, lst):
+                    r.name = hp
         self.lock = threading.RLock()
         self.cv = threading.Condition(self.lock)
         self.epoch = 1
@@ -259,7 +281,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                 for lst in self.replicas:
                     for r in lst:
                         if not r.alive:
-                            self._hello(r)
+                            self._hello(r, resolve=True)
         threading.Thread(target=self._watchdog, name="cx-pp-watchdog", daemon=True).start()
         log.info("connex-pp: stage 0 of %d, route %s", self.num_stages,
                  [f"s{r.stage}r{r.idx}" for r in self.route])
@@ -299,10 +321,23 @@ class ConnexPPExecutor(MultiprocExecutor):
                 out[k + 1] = urls
         return out
 
-    def _hello(self, r: Replica) -> None:
+    def _hello(self, r: Replica, resolve: bool = False) -> None:
         # Our control URL goes along: a replica that restarts announces
         # itself to it once ready, instead of waiting for our next HELLO.
+        if resolve:
+            self._resolve(r)
         self.ctl.send(r.ctl_url, ("HELLO", self.owner, self.ctl.url), quiet=True)
+
+    def _resolve(self, r: Replica) -> None:
+        """Re-resolve a replica configured by name (not on the control
+        receive thread: DNS may block)."""
+        if not r.name or r.alive:
+            return
+        url = control_url(resolve_hostport(r.name) or r.ctl_url.split("#", 1)[0], r.stage, r.idx)
+        if url != r.ctl_url:
+            log.info("connex-pp: s%dr%d (%s) moved: %s -> %s", r.stage, r.idx, r.name,
+                     r.ctl_url, url)
+            r.ctl_url = url
 
     # ------------------------------------------------------------- messages
     def _find(self, peer: tuple) -> Replica | None:
@@ -318,6 +353,7 @@ class ConnexPPExecutor(MultiprocExecutor):
         kind = msg[0]
         if kind == "OUT":
             _, seq, epoch, out = msg
+            tr("h_out_rx", seq)
             with self.lock:
                 p = self.pending.get(seq)
                 if p is None or p.epoch != epoch or p.event.is_set():
@@ -416,7 +452,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                     break
                 for x in self.replicas[r.stage - 1]:
                     if not x.alive:
-                        self.ctl.send(x.ctl_url, ("HELLO", self.owner), quiet=True)
+                        self._hello(x, resolve=True)
                 self.cv.wait(0.5)
             urls = [u for u in self._route_urls() if u]
             self.failovers.append({"stage": r.stage, "from": r.idx,
@@ -456,7 +492,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                 for lst in self.replicas:
                     for r in lst:
                         if not r.alive:
-                            self._hello(r)
+                            self._hello(r, resolve=True)
             now = time.monotonic()
             with self.lock:
                 late = [p for p in self.pending.values()
@@ -516,11 +552,18 @@ class ConnexPPExecutor(MultiprocExecutor):
                                  "max_tokens": self.max_tokens, "doomed": doomed,
                                  "spares": spares})
         if not doomed:
+            tr("h_exec_enc", seq)
+            if so.total_num_scheduled_tokens > len(so.num_scheduled_tokens):
+                tr("h_prefill", seq)
             raw = ControlLink.encode(("EXEC", seq, epoch, so, self.owner))
+            tr("h_exec_send", seq)
             for r in route:
                 if r is not None:
                     self.ctl.send(r.ctl_url, None, raw=raw)
-        return super().execute_model(so, non_block)
+            tr("h_exec_sent", seq)
+        out = super().execute_model(so, non_block)
+        tr("h_exec_local", seq)
+        return out
 
     def sample_tokens(self, grammar_output, non_block: bool = False):
         if not getattr(self, "head", False):
@@ -533,11 +576,14 @@ class ConnexPPExecutor(MultiprocExecutor):
             # The step can complete only from here on: the watchdog's step
             # timeout runs from now, not from execute_model.
             p.t_send = time.monotonic()
+            tr("h_sample_enc", seq)
             raw = ControlLink.encode(("SAMPLE", seq, p.epoch, grammar_output, self.owner))
             for r in route:
                 if r is not None:
                     self.ctl.send(r.ctl_url, None, raw=raw)
+            tr("h_sample_sent", seq)
         local = super().sample_tokens(grammar_output, non_block=True)
+        tr("h_sample_local", seq)
         fut = _StepFuture(self, local, p)
         return fut if non_block else fut.result()
 
@@ -597,7 +643,9 @@ class _StepFuture:
         if self._out is not None:
             return self._out
         local_out = self.local.result()
+        tr("h_local_done", self.p.seq)
         self.p.event.wait()
+        tr("h_wake!", self.p.seq)
         with self.ex.lock:
             self.ex.pending.pop(self.p.seq, None)
         if self.p.lost or self.p.output is None:

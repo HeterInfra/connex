@@ -143,7 +143,9 @@ def res(hp):
 print(json.dumps([[res(hp) for hp in st] for st in json.loads(sys.argv[1])]))
 PY
 )
-    export CONNEX_PP_STAGES
+    # The names too: stage 0 re-resolves a replica it lost (a recreated pod
+    # comes back under its Service name at a new address).
+    export CONNEX_PP_STAGES CONNEX_PP_STAGE_NAMES="$PP_STAGES"
     echo "stage 0: downstream replicas $CONNEX_PP_STAGES"
     # shellcheck disable=SC2086
     exec vllm serve "$MODEL_PATH" --port "$API_PORT" "${args[@]}" ${EXTRA_ARGS:-}

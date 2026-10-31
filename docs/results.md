@@ -1370,6 +1370,68 @@ Restarting in place got slower, 32-33 s instead of about 29 s: the stage
 server now compiles the top-k/top-p kernels at start (part of the restart),
 which the earlier version did on the first request instead.
 
+**Re-measured across hosts (2026-10-31).** Same setup and load, with
+connex-rs at the fenced `put_chain` / `IB_ALLOC=mmap,heap` build, stage 0 on
+one host and stage 1 on another (GPU 2, or GPUs 2-3 for TP=2), 8192 KV blocks
+everywhere, one discarded warm-up run and 3 runs per cell (mean ± std):
+
+| two hosts | C=1 TPOT / TTFT ms | C=32 TPOT ms / TTFT ms / tok/s |
+|---|---|---|
+| PP=2, NCCL | 28.29 / 93 | 41.98 ±0.35 / 698 / 679 ±3 |
+| PP=2, Connex in-process | 28.36 / 94 | 42.06 ±0.29 / 664 / 681 ±4 |
+| PP=2, one stage per instance | 28.37 / 95 | 42.49 ±0.44 / 668 / 678 ±2 |
+| PP=2 x TP=2, NCCL | 15.56 / 74 | 23.58 ±0.10 / 524 / 1164 ±1 |
+| PP=2 x TP=2, one stage per instance | 15.61 / 83 | 22.19 ±0.26 / 605 / 1188 ±8 |
+
+TPOT at C=1 is within 0.3 % of NCCL; at C=32 PP2×TP2 is 6 % faster per
+token and 2 % higher in throughput, with a higher mean TTFT. The PP2×TP2
+C=1 TTFT gap moved between runs: 82-83 ms in this campaign, 77-78 ms in a
+later traced run of the same configuration (NCCL 74-75 ms). 0 of 3,200
+greedy tokens off the argmax in every configuration.
+
+Where the C=1 time goes (`CONNEX_PP_TRACE=1`, per-step timestamps through
+EXEC, stage server and OUT, merged by
+`benchmarks/pp_upstream/trace_steps.py`; one host, PP=2, prefill steps,
+medians): stage 0 encodes and sends EXEC in 0.4 ms. The stage server has
+the step at 1.1 ms and its workers at 2.0 ms, while the hidden states arrive
+at 6.4 ms, so the extra control path runs while stage 0 computes. What
+remains serial is the OUT reply: pickle, send, receive and wake take
+0.35 ms. On one host the C=1 TTFT is 95.6 ms vs 94.3 ms for NCCL (runs
+spread 93-96 ms). In the cross-host PP2×TP2 trace, stage 1's workers start a
+prefill step 13 ms after its EXEC arrived: they are still running the
+previous step, because the scheduler runs ahead. This
+trace does not tell whether NCCL pays the same.
+
+Failover across hosts (stage 0, the active replica and the spare on three
+different hosts; each round kills under 32-client load, then during 16 greedy
+requests):
+
+| setup, what is killed | kills (load + greedy) | load requests completed | greedy tokens off the argmax | largest no-token window per load run |
+|---|---|---|---|---|
+| PP=2, active replica | 3 + 3 | 1,056 / 1,056 | 0 / 9,600 | 0.65, 0.43, 0.44 s |
+| PP=2 x TP=2, one TP rank of the active replica | 3 + 3 | 1,803 / 1,803 | 0 / 9,600 | 1.35, 0.69, 0.64 s |
+
+Stage 0 switches the route 1-3 ms after it sees the failure. With a spare
+that has served before, the PP2×TP2 window is now 0.64-0.69 s, down from
+0.89-1.11 s, and meets the 0.7 s target. The first failover onto a spare
+that has never served is slower (0.65 s at TP=1, 1.35 s at TP=2). The extra
+time is in the spare's first real steps and is not explained yet. Push
+channel set-up stays short: the first chain on a fresh channel completes
+0.4-16.6 ms after the channel opens.
+
+**Deploy path.** `deploy/k8s/manifests.py pipeline` (2 stages, 2 replicas
+of stage 1, pod network, headless Services) was applied unchanged except
+that the stock vLLM image runs `docker/launch_stage.sh` from a mounted
+checkout with the vLLM-main-plus-PRs environment, in place of an image built from
+`docker/Dockerfile`. The pipeline served 16/16 greedy requests. Deleting
+the active stage-1 pod during 16 greedy requests of 300 tokens (twice, one
+per replica) completed every request with 0 of 9,600 tokens off the
+argmax. The Deployment recreated each pod at a new IP, and stage 0 found it
+again by re-resolving the Service name (`moved: <old> -> <new>` in its
+log). Before this fix, stage 0 resolved the names once at start and sent
+HELLO to the dead address forever. On the pod network a force-deleted pod
+is detected by the heartbeat (3 s), not a connection reset.
+
 **Not covered.** A replica shared by several pipelines (the fork path
 supports it; here a replica serves one stage 0 at a time), more than one
 failure at a time, stage 0

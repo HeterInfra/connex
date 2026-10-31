@@ -66,14 +66,17 @@ def _upstream(tmp_path, **env):
     b = tmp_path / "ubin"
     b.mkdir(exist_ok=True)
     _exe(b / "nvidia-smi", "exit 0\n")
-    _exe(b / "vllm", 'echo "VLLM $* STAGES=$CONNEX_PP_STAGES REPLICA=$CONNEX_PP_REPLICA"\n')
+    _exe(b / "vllm", 'echo "VLLM $* STAGES=$CONNEX_PP_STAGES REPLICA=$CONNEX_PP_REPLICA"\n'
+                         'echo "NAMES=$CONNEX_PP_STAGE_NAMES"\n')
     # real python for the PP_STAGES resolver; the stage server is faked
     _exe(b / "python3", 'if [ "$1" = -m ] && [ "$2" = connex.adapters.vllm.pp.stage ]; then '
          'echo "STAGE $* DATA=$CONNEX_PP_DATA_PORT RS_IP=$CONNEX_RS_LOCAL_IP"; exit 0; fi\n'
          'case "$*" in *"import connex"*) exit 0;; esac\n'
          f'exec {__import__("sys").executable} "$@"\n')
+    # (this checkout's connex for `python3 -m connex.adapters.vllm.pp.ports`)
+    root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
     e = {"PATH": f"{b}:/usr/bin:/bin", "NUM_STAGES": "3", "GPU_SELECT": "none",
-         "HOST_IP": "10.0.0.5", **{k: str(v) for k, v in env.items()}}
+         "HOST_IP": "10.0.0.5", "PYTHONPATH": root, **{k: str(v) for k, v in env.items()}}
     return subprocess.run(["bash", SCRIPT], env=e, capture_output=True, text=True, timeout=30)
 
 
@@ -87,6 +90,8 @@ def test_upstream_is_default_and_needs_no_router(tmp_path):
     assert "--distributed-executor-backend connex.adapters.vllm.pp.executor.ConnexPPExecutor" in line
     # host names resolved to addresses for connex-rs
     assert 'STAGES=[["127.0.0.1:47120", "10.0.0.7:47122"], ["10.0.0.8:47220"]]' in line
+    # and the names kept, so stage 0 can re-resolve a recreated pod
+    assert 'NAMES=[["localhost:47120","10.0.0.7:47122"],["10.0.0.8:47220"]]' in out.stdout
 
 
 def test_upstream_downstream_stage_ports(tmp_path):

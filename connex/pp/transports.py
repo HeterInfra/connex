@@ -26,6 +26,7 @@ docs/design/engine-contract.md, "Status").
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 from typing import Optional, Protocol
@@ -135,9 +136,32 @@ def _if_ipv4(ifname: str) -> str | None:
         return None
 
 
-def ucx_net_devices_for_ip(ip: str, sysfs: str = "/sys/class/infiniband") -> str | None:
-    """"<rdma dev>:1,<netdev>" for the RDMA device whose network interface
-    has address ``ip`` (or the only RDMA device); None without RDMA."""
+def _iface_of(ip: str) -> str | None:
+    """The network interface that carries ``ip`` ("lo" for loopback)."""
+    import socket
+
+    try:
+        if ipaddress.ip_address(ip).is_loopback:
+            return "lo"
+    except ValueError:
+        return None
+    try:
+        names = [n for _, n in socket.if_nameindex()]
+    except OSError:
+        return None
+    return next((n for n in names if _if_ipv4(n) == ip), None)
+
+
+def ucx_net_devices_for_ip(ip: str, sysfs: str = "/sys/class/infiniband",
+                           iface_of=_iface_of) -> str | None:
+    """UCX_NET_DEVICES for an endpoint listening on ``ip``: "<rdma dev>:1,<netdev>"
+    for the RDMA device whose network interface has address ``ip``; with a
+    single RDMA device and ``ip`` on another interface (loopback, a pod or
+    bridge network), that device plus the interface carrying ``ip``. None
+    without RDMA or when ``ip`` is on no local interface. The interface that
+    carries ``ip`` must be listed: UCX's connection manager only uses listed
+    devices, and without it every connect fails with "Destination is
+    unreachable"."""
     try:
         devs = sorted(os.listdir(sysfs))
     except OSError:
@@ -153,7 +177,9 @@ def ucx_net_devices_for_ip(ip: str, sysfs: str = "/sys/class/infiniband") -> str
             if _if_ipv4(n) == ip:
                 return f"{d}:1,{n}"
     if len(devs) == 1:
-        return f"{devs[0]}:1" + (f",{found[0][1]}" if found else "")
+        own = iface_of(ip)
+        if own:
+            return f"{devs[0]}:1,{own}"
     return None
 
 

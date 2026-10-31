@@ -35,6 +35,8 @@ import sys
 import threading
 import time
 
+from connex.adapters.vllm.pp.trace import tr  # noqa: E402
+
 log = logging.getLogger("vllm.connex_pp")
 
 
@@ -105,6 +107,7 @@ class StageServer:
         elif kind == "PING":
             self.ctl.send(peer, ("PONG", self.done_seq))
         elif kind in ("EXEC", "SAMPLE"):
+            tr("s_rx_" + kind, msg[1])
             self.q.put((peer, msg))
 
     def _on_failed(self, peer, reason) -> None:
@@ -155,15 +158,18 @@ class StageServer:
                 self.owner, self.owner_peer = owner, peer
                 log.info("connex-pp: stage %d replica %d now serves %s", self.stage,
                          self.replica, owner)
+            tr("s_loop_" + kind, seq)
             if kind == "EXEC":
                 so = payload
                 for nr in so.scheduled_new_reqs:
                     self.live_reqs.add(nr.req_id)
                 self.live_reqs.difference_update(so.finished_req_ids)
                 fut = self.ex.execute_model(so, non_block=True)
+                tr("s_exec_submitted", seq)
                 self.out_q.put(("E", seq, epoch, fut, None))
             else:
                 fut = self.ex.sample_tokens(payload, non_block=True)
+                tr("s_sample_submitted", seq)
                 self.out_q.put(("S", seq, epoch, fut, peer))
 
     def _reply_loop(self) -> None:
@@ -174,10 +180,12 @@ class StageServer:
             except Exception:  # noqa: BLE001
                 log.exception("connex-pp: stage %d step %d failed; exiting", self.stage, seq)
                 os._exit(1)
+            tr("s_done_" + kind, seq)
             if kind == "S":
                 self.done_seq = max(self.done_seq, seq)
             if kind == "S" and self.last:
                 self.ctl.send(peer, ("OUT", seq, epoch, out))
+                tr("s_out_sent!", seq)
 
 
 def main(argv: list[str] | None = None) -> None:

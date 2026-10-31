@@ -772,3 +772,33 @@ def test_same_host_sampled_channel_timeout_is_a_failure():
         pop("10.0.0.1:2#cxpp|1|0|0", 1, torch.zeros(4))
     lk.min_epoch = 2                       # epoch aborted: just return
     pop("10.0.0.1:2#cxpp|1|0|0", 1, torch.zeros(4))
+
+
+@needs_vllm
+def test_lost_replica_is_re_resolved_by_name(monkeypatch):
+    """A recreated downstream pod keeps its Service name but gets a new IP:
+    stage 0 must not keep sending HELLO to the old address."""
+    import socket
+
+    from connex.adapters.vllm.pp import executor as exm
+
+    addr = {"stage1": "10.0.0.1"}
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: addr[h])
+    r = exm.Replica(1, 0, exm.control_url("10.0.0.1:47100", 1, 0), name="stage1:47100")
+    ex = SimpleNamespace()
+    resolve = exm.ConnexPPExecutor._resolve.__get__(ex)
+    resolve(r)
+    assert r.ctl_url.startswith("10.0.0.1:47100#")
+    addr["stage1"] = "10.0.0.9"
+    resolve(r)
+    assert r.ctl_url == exm.control_url("10.0.0.9:47100", 1, 0)
+    r.alive = True                       # never re-resolved while alive
+    addr["stage1"] = "10.0.0.5"
+    resolve(r)
+    assert r.ctl_url.startswith("10.0.0.9:")
+    r.alive = False
+    del addr["stage1"]                   # resolution fails: keep the address
+    monkeypatch.setattr(socket, "gethostbyname",
+                        lambda h: (_ for _ in ()).throw(OSError("nx")))
+    resolve(r)
+    assert r.ctl_url.startswith("10.0.0.9:")
