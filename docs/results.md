@@ -1415,7 +1415,7 @@ Stage 0 switches the route 1-3 ms after it sees the failure. With a spare
 that has served before, the PP2×TP2 window is now 0.64-0.69 s, down from
 0.89-1.11 s, and meets the 0.7 s target. The first failover onto a spare
 that has never served is slower (0.65 s at TP=1, 1.35 s at TP=2). The extra
-time is in the spare's first real steps and is not explained yet. Push
+time was not in the spare (explained and fixed below, "Fix round"). Push
 channel set-up stays short: the first chain on a fresh channel completes
 0.4-16.6 ms after the channel opens.
 
@@ -1437,6 +1437,82 @@ supports it; here a replica serves one stage 0 at a time), more than one
 failure at a time, stage 0
 failures (the API instance; use the resume proxy of section 4), PP across
 hosts with more than two stages.
+
+**Fix round (2026-10-31, later the same day).** Same three hosts, same load
+and greedy runs, the stage processes started as before
+(`docker/launch_stage.sh` arguments, per-pipeline control key set).
+
+*Where the failover time went.* `CONNEX_PP_TRACE=1` now also stamps worker
+step calls, chain completions, failure events and aborts, plus a wall-clock
+anchor per file, so the three hosts merge into one timeline. In the slow
+cases the spare was idle: stage 0's hidden-state push to it completed
+400-1000 ms after stage 0 had launched the step. Stage 0's GPU was still
+blocked on the sampled tokens of the killed replica: the receiver queues a
+channel wait and its `done()` back to back, and `done()` removed the wait
+from the pending set, so the abort at the epoch change had nothing to
+release. The stream went on only when the old replica's last process was
+gone (its connection failed). With TP=2 a killed TP rank leaves the other
+rank alive for a while, which is why TP=2 and a first failover (longer
+teardown) were hit hardest. Waits now stay pending until their flag is
+reached. Decomposition of 3 traced TP=2 failovers after the fix:
+the dead worker is noticed 0.17-0.23 s after the kill (most of it is the
+kernel tearing down a CUDA process), stage 0 sees the failure 0.07-0.10 s
+later, and the recompute step takes 0.09-0.22 s. A stage that loses a
+worker now also tells stage 0 before it exits (`DYING`).
+
+| setup, what is killed | kills (load + greedy) | load requests completed | greedy tokens off the argmax | largest no-token window per load run |
+|---|---|---|---|---|
+| PP=2, active replica | 5 + 5 | 1,760 / 1,760 | 0 / 16,000 | 0.38, 0.37, 0.36, 0.72, 0.36 s |
+| PP=2, active replica, traced | 4 + 0 | all | n/a | 0.39, 0.38, 0.37, 0.39 s |
+| PP=2 x TP=2, one TP rank of the active replica | 5 + 5 | 3,040 / 3,040 | 0 / 16,000 | 0.34, 0.40, 0.40, 0.37, 0.34 s |
+
+The first load run of each block is the first failover onto a spare that
+had never served (0.38 and 0.72 s at TP=1, 0.34 and 0.37 s at TP=2). One
+TP=1 run of 9 was 0.72 s; it was not traced, and 4 traced repeats of the
+same case were 0.37-0.39 s. One TP=2 load request streamed 127 chunks with
+a normal end, 2.5 s after the run started (before the kill at 15 s).
+
+*False failure of stage 0.* Stage 0's EngineCore (its connex-rs control
+endpoint) was stopped with SIGSTOP for 6 s, 3 s into 16 greedy requests of
+400 tokens, so stage 1 saw a heartbeat failure of an owner that was alive.
+Before: the stage released the owner, dropped all 16 requests when the same
+owner's next step came, then died with a KeyError in its runner; with no
+spare, 0 of 16 requests completed (client timeout 600 s). After: the stage
+keeps the requests (`owner ... is back, keeping 16 request(s)`), stage 0
+fails over to the same replica on a new epoch, the stage finishes the 16
+requests of the old epoch before the new step, and 16 of 16 complete with
+0 of 6,400 tokens off the argmax (2 runs); a 16-client load run right after
+completes 64 of 64.
+
+*Image.* `docker/Dockerfile` (default upstream path) built on
+`vllm/vllm-openai:v0.31.0` (CUDA 13) at vLLM main b5755c3 plus the three PP
+branches, and deployed unchanged through `deploy/k8s/manifests.py pipeline
+--host-network --ib --pp-auth-secret-create` (2 stages, 2 replicas of stage
+1, all on one node, CUDA IPC off because the pods do not share /dev/shm):
+16/16 greedy requests of 300 tokens, then 16/16 with the active stage-1 pod
+force-deleted 4 s in (route switched 7.1 ms after the failure was seen),
+0 of 9,600 tokens off the argmax.
+
+*Control-frame authentication.* HMAC-SHA256 over each control frame
+(16-byte tag): 2.5-3 us per frame of 300 B, 7 us at 4.3 KB (a 1-request
+prefill step), 28 us at 26 KB (8 new requests), each side. Steady state
+across hosts with it on (one discarded warm-up, 3 runs, 8192 KV blocks):
+
+| two hosts | C=1 TPOT ms / TTFT ms | C=32 TPOT ms / TTFT ms / tok/s |
+|---|---|---|
+| PP=2, NCCL | 28.28 / 94.3 | 41.90 / 661 / 683 ±2 |
+| PP=2, one stage per instance | 28.36 / 95.7 | 41.61 / 651 / 689 ±7 |
+| PP=2 x TP=2, NCCL | 15.53 / 77.6 (74.2, 75.5, 83.0) | 22.02 / 622 / 1184 ±4 |
+| PP=2 x TP=2, one stage per instance | 15.60 / 76.5 | 23.14 / 535 / 1179 ±5 |
+| PP=2 x TP=2, one stage per instance, GIL switch interval 0.5 ms | 15.60 / 76.3 | not run |
+
+0 of 3,200 greedy tokens off the argmax in each. The PP2×TP2 C=1 TTFT gap
+reported above (+3 to +9 ms) did not show this time: 76.5 ms against NCCL
+runs of 74.2-83.0 ms. A shorter GIL switch interval in every stage process
+(0.5 ms instead of 5 ms) changed nothing, so it was not kept. The 13 ms late
+start of stage 1's prefill in the earlier trace is the scheduler running a
+step ahead (async scheduling); whether in-process NCCL PP pays the same was
+not measured, and no change was made for it.
 
 ## 14. Import and CLI startup time
 

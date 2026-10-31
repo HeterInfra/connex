@@ -21,6 +21,8 @@ kubectl -n $NS create secret generic hf-token --from-literal=HF_TOKEN=$HF_TOKEN
 G() { python deploy/k8s/manifests.py --namespace $NS --image $IMAGE \
    --model-hf-id meta-llama/Meta-Llama-3-8B --hf-token-secret hf-token "$@"; }   # bash and zsh
 
+# key that authenticates the stages' control frames (once per pipeline; see SECURITY.md)
+kubectl -n $NS create secret generic demo-pp-auth --from-literal=secret=$(openssl rand -hex 32)
 # 2 stages, two replicas of stage 1 (the second is the failover target)
 G pipeline --prefix demo --num-stages 2 --stage-replicas 2 | kubectl apply -f -
 CONNEX_NAMESPACE=$NS benchmarks/k8s/wait_ready.sh demo

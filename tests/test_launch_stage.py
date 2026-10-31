@@ -76,7 +76,9 @@ def _upstream(tmp_path, **env):
     # (this checkout's connex for `python3 -m connex.adapters.vllm.pp.ports`)
     root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
     e = {"PATH": f"{b}:/usr/bin:/bin", "NUM_STAGES": "3", "GPU_SELECT": "none",
-         "HOST_IP": "10.0.0.5", "PYTHONPATH": root, **{k: str(v) for k, v in env.items()}}
+         "HOST_IP": "10.0.0.5", "PYTHONPATH": root, "CONNEX_PP_SECRET": "k" * 32,
+         **{k: str(v) for k, v in env.items()}}
+    e = {k: v for k, v in e.items() if v != "<unset>"}
     return subprocess.run(["bash", SCRIPT], env=e, capture_output=True, text=True, timeout=30)
 
 
@@ -103,3 +105,21 @@ def test_upstream_downstream_stage_ports(tmp_path):
     # stage 0 without PP_STAGES and the fork without a router fail clearly
     assert "PP_STAGES is required" in _upstream(tmp_path, STAGE=0).stderr
     assert "ROUTER_ADDR is required" in _upstream(tmp_path, STAGE=1, PP_ENGINE="fork").stderr
+
+
+def test_upstream_needs_a_control_key(tmp_path):
+    out = _upstream(tmp_path, STAGE=1, CONNEX_PP_SECRET="<unset>")
+    assert out.returncode != 0 and "CONNEX_PP_SECRET" in out.stderr
+    assert _upstream(tmp_path, STAGE=1, CONNEX_PP_SECRET="<unset>",
+                     CONNEX_PP_AUTH="off").returncode == 0
+    # a path shared by the stages: the first one generates the key, the next reuses it
+    path = tmp_path / "shared" / "key"
+    path.parent.mkdir()
+    for st in (1, 2):
+        out = _upstream(tmp_path, STAGE=st, CONNEX_PP_SECRET="<unset>",
+                        CONNEX_PP_SECRET_PATH=str(path))
+        assert out.returncode == 0, out.stderr
+        if st == 1:
+            key = path.read_text()
+            assert len(key.strip()) == 64 and oct(path.stat().st_mode)[-3:] == "600"
+    assert path.read_text() == key

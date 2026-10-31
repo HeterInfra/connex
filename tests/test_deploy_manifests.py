@@ -46,8 +46,13 @@ def test_etcd_ib_pvc_and_config(tmp_path, monkeypatch):
 
 
 def test_upstream_pipeline_defaults():
-    d = M.generate(["pipeline", "--num-stages", "3", "--stage-replicas", "2", "--model-host-path", "/m"])
+    d = M.generate(["pipeline", "--num-stages", "3", "--stage-replicas", "2", "--model-host-path", "/m",
+                    "--pp-auth-secret-create"])
     names = [(i["kind"], i["metadata"]["name"]) for i in d["items"]]
+    assert names[0] == ("Secret", "cte-pp-auth")
+    secret = d["items"].pop(0)["stringData"]["secret"]
+    assert len(secret) == 64 and int(secret, 16) >= 0
+    names = names[1:]
     assert names == [("Deployment", "cte-s0-r0"), ("Service", "cte-s0-r0"),
                      ("Deployment", "cte-s1-r0"), ("Service", "cte-s1-r0"),
                      ("Deployment", "cte-s1-r1"), ("Service", "cte-s1-r1"),
@@ -63,6 +68,32 @@ def test_upstream_pipeline_defaults():
     svc = d["items"][5]
     assert svc["spec"]["clusterIP"] == "None"
     assert [p["port"] for p in svc["spec"]["ports"]] == [48016, 48017]
+    # every stage reads the control-frame key from the Secret
+    for dep in [i for i in d["items"] if i["kind"] == "Deployment"]:
+        env = dep["spec"]["template"]["spec"]["containers"][0]["env"]
+        assert {"name": "CONNEX_PP_SECRET", "valueFrom": {"secretKeyRef": {
+            "name": "cte-pp-auth", "key": "secret"}}} in env
+
+
+def test_upstream_existing_auth_secret_is_referenced_not_created():
+    """Regenerating the manifests must not rotate the key (running stages
+    and restarted ones would disagree): the Secret is emitted only on request."""
+    d = M.generate(["pipeline", "--model-host-path", "/m"])
+    assert "Secret" not in [i["kind"] for i in d["items"]]
+    d = M.generate(["pipeline", "--pp-auth-secret", "mine", "--model-host-path", "/m"])
+    assert "Secret" not in [i["kind"] for i in d["items"]]
+    env = [i for i in d["items"] if i["kind"] == "Deployment"][0]["spec"]["template"]["spec"][
+        "containers"][0]["env"]
+    assert {"name": "CONNEX_PP_SECRET", "valueFrom": {"secretKeyRef": {
+        "name": "mine", "key": "secret"}}} in env
+    (st,) = [i for i in M.generate(["stage", "--stage", "1", "--model-host-path", "/m"])["items"]
+             if i["kind"] == "Deployment"]
+    refs = [e["valueFrom"]["secretKeyRef"]["name"]
+            for e in st["spec"]["template"]["spec"]["containers"][0]["env"]
+            if e["name"] == "CONNEX_PP_SECRET"]
+    assert refs == ["cte-pp-auth"]
+    fork = M.generate(["pipeline", "--engine", "fork", "--model-host-path", "/m"])["items"]
+    assert "Secret" not in [i["kind"] for i in fork]
 
 
 def test_errors():
@@ -83,7 +114,7 @@ def test_router():
 
 def test_portable_defaults_hf_model():
     d = M.generate(["pipeline", "--model-hf-id", "org/model", "--hf-token-secret", "hf"])
-    dep = d["items"][0]
+    dep = [i for i in d["items"] if i["kind"] == "Deployment"][0]
     pod = dep["spec"]["template"]["spec"]
     assert "nodeSelector" not in pod and "hostNetwork" not in pod
     c = pod["containers"][0]

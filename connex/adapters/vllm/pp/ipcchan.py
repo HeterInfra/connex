@@ -225,6 +225,10 @@ class RxChannel:
         stream = torch.cuda.current_stream(self.device)
         self.streams[stream.cuda_stream] = stream
         _wait(stream, self.flags.ready_addr(s), i + 1)
+        # Pending until its flag is reached, not until done() is queued (the
+        # stream may still be blocked on it): release_below must find it.
+        for j in [j for j in list(self.pending) if reached(self.flags.arr[j % self.n], j + 1)]:
+            self.pending.pop(j, None)
         self.pending[i] = epoch
         self.hi = max(self.hi, i + 1)
         return self.ring[s * self.slot_bytes:(s + 1) * self.slot_bytes]
@@ -234,8 +238,6 @@ class RxChannel:
         if self.retired:
             return
         _write(torch.cuda.current_stream(self.device), self.flags.free_addr(i % self.n), i + 1)
-        for j in [j for j in self.pending if j <= i]:
-            del self.pending[j]
 
     def release_below(self, epoch: int) -> int:
         """Let the waits for messages of epochs before ``epoch`` go (their

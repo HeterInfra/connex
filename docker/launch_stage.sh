@@ -21,6 +21,14 @@
 #                  CONNEX_PP_STAGES.
 #   ROUTER_ADDR    (fork) Connex front-router API address HOST:PORT
 # Upstream env (defaults in brackets):
+#   CONNEX_PP_SECRET / CONNEX_PP_SECRET_FILE  key (>= 16 bytes) that
+#                  authenticates the control frames between the stages; the
+#                  same on every stage of a pipeline. deploy/k8s/manifests.py
+#                  puts it in a Secret. Unset: CONNEX_PP_SECRET_FILE is
+#                  generated at CONNEX_PP_SECRET_PATH if that is given (a
+#                  volume shared by the stages), else the stage refuses to
+#                  start; CONNEX_PP_AUTH=off disables the check (trusted
+#                  networks only)
 #   CONTROL_PORT   control port of a downstream stage [47000 + 1000*STAGE + 16*REPLICA]
 #   DATA_PORT      data port of TP rank 0 of a downstream stage [CONTROL_PORT + 1];
 #                  TP rank r listens on DATA_PORT + r (connex.adapters.vllm.pp.ports)
@@ -120,6 +128,20 @@ python3 -c "import connex; print('connex', connex.__file__)" || true
 if [ "$PP_ENGINE" = upstream ]; then
   export VLLM_HOST_IP=$HOST_IP CONNEX_RS_LOCAL_IP=${CONNEX_RS_LOCAL_IP:-$HOST_IP}
   export CONNEX_PP_REPLICA=$REPLICA
+  if [ -z "${CONNEX_PP_SECRET:-}" ] && [ -z "${CONNEX_PP_SECRET_FILE:-}" ] && [ "${CONNEX_PP_AUTH:-on}" != off ]; then
+    if [ -n "${CONNEX_PP_SECRET_PATH:-}" ]; then
+      # First stage to start makes it; the others read the same file.
+      if [ ! -s "$CONNEX_PP_SECRET_PATH" ]; then
+        (umask 077; python3 -c 'import secrets; print(secrets.token_hex(32))' > "$CONNEX_PP_SECRET_PATH.$$" &&
+          mv -n "$CONNEX_PP_SECRET_PATH.$$" "$CONNEX_PP_SECRET_PATH"; rm -f "$CONNEX_PP_SECRET_PATH.$$")
+      fi
+      [ -s "$CONNEX_PP_SECRET_PATH" ] || { echo "cannot create the control key at $CONNEX_PP_SECRET_PATH" >&2; exit 1; }
+      export CONNEX_PP_SECRET_FILE=$CONNEX_PP_SECRET_PATH
+    else
+      echo "set CONNEX_PP_SECRET (or CONNEX_PP_SECRET_FILE / CONNEX_PP_SECRET_PATH) to the pipeline's shared key, or CONNEX_PP_AUTH=off" >&2
+      exit 1
+    fi
+  fi
   args=(--served-model-name "$MODEL_NAME" --pipeline-parallel-size "$NUM_STAGES"
         --pipeline-stage-rank "$STAGE" --tensor-parallel-size "${TP:-1}"
         --gpu-memory-utilization "${GPU_MEM_UTIL:-0.6}" --num-gpu-blocks-override "${NUM_GPU_BLOCKS:-8192}"

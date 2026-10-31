@@ -26,6 +26,9 @@ def tr(tag: str, seq: int) -> None:
         if _f is None:
             d = os.getenv("CONNEX_PP_TRACE_DIR", "/dev/shm")
             _f = open(os.path.join(d, f"cxtrace-{os.getpid()}.txt"), "a", buffering=1 << 16)
+            # wall clock at this monotonic time: aligns hosts (to NTP accuracy)
+            _f.write(f"clock {time.time_ns()} {time.monotonic_ns()} -\n")
         _f.write(f"{tag} {seq} {t} {threading.current_thread().name}\n")
         if tag.endswith("!"):
             _f.flush()
+
