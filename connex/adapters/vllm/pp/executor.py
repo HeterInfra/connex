@@ -30,7 +30,10 @@ Configuration (stage 0):
   CONNEX_PP_REPLICA      this pipeline's replica index (preferred route)
   CONNEX_PP_STEP_TIMEOUT_S   backstop for a step without reply (60): the
                          stage that does not answer a ping, else the first
-                         one behind on the step, is failed over
+                         one behind on the step, is failed over. Once 32
+                         steps came back, the timeout is
+                         max(CONNEX_PP_STEP_TIMEOUT_MIN_S (10), 20 x the
+                         slowest of the last 512 steps), at most this value
   CONNEX_PP_REPLACE_TIMEOUT_S how long to wait for a live replica (120)
 """
 
@@ -249,6 +252,8 @@ class ConnexPPExecutor(MultiprocExecutor):
         self.replica_id = int(os.getenv("CONNEX_PP_REPLICA", "0"))
         self.owner = f"{self.replica_id}:{os.getpid()}"
         self.step_timeout = float(os.getenv("CONNEX_PP_STEP_TIMEOUT_S", "60"))
+        self.step_timeout_min = float(os.getenv("CONNEX_PP_STEP_TIMEOUT_MIN_S", "10"))
+        self.step_times: deque[float] = deque(maxlen=512)
         self.replace_timeout = float(os.getenv("CONNEX_PP_REPLACE_TIMEOUT_S", "120"))
         self.max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.replicas: list[list[Replica]] = [
@@ -388,6 +393,8 @@ class ConnexPPExecutor(MultiprocExecutor):
                     return
                 p.output = out
                 p.event.set()
+                if p.t_send:
+                    self.step_times.append(time.monotonic() - p.t_send)
             return
         r = self._find(peer)
         if r is None:
@@ -545,6 +552,15 @@ class ConnexPPExecutor(MultiprocExecutor):
         for u in [e for u in urls for e in u.split(";")]:
             threading.Thread(target=one, args=(u,), name="cx-pp-abort", daemon=True).start()
 
+    def current_step_timeout(self) -> float:
+        """A hung (not crashed) stage is found by its late step. The fixed
+        backstop (60 s) is longer than client timeouts, so once enough steps
+        came back the limit follows the measured step time."""
+        st = getattr(self, "step_times", None)
+        if not st or len(st) < 32:
+            return self.step_timeout
+        return min(self.step_timeout, max(self.step_timeout_min, 20.0 * max(st)))
+
     def _rehello_down(self, now: float) -> None:
         """(Re)discover replicas that are down: a restarted one becomes a
         spare. It also announces itself (see stage.py), so the HELLO here
@@ -562,8 +578,9 @@ class ConnexPPExecutor(MultiprocExecutor):
             self._rehello_down(time.monotonic())
             now = time.monotonic()
             with self.lock:
+                limit = self.current_step_timeout()
                 late = [p for p in self.pending.values()
-                        if not p.event.is_set() and now - p.t_send > self.step_timeout]
+                        if not p.event.is_set() and now - p.t_send > limit]
                 route = list(self.route)
             if not late:
                 continue

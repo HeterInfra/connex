@@ -96,3 +96,16 @@ def test_rehello_backs_off_and_resets():
     h._on_message((1, 1, ex.CTL_SHARD, 0), ("HELLO_OK", "d", None))
     assert r.alive and r.hello_every == 2.0
 
+
+def test_step_timeout_follows_measured_steps():
+    """Issue #15: a hung stage is found in seconds, not after 60 s."""
+    h = _head()
+    h.step_timeout, h.step_timeout_min = 60.0, 10.0
+    h.step_times = __import__("collections").deque(maxlen=512)
+    assert h.current_step_timeout() == 60.0
+    h.step_times.extend([0.03] * 40)
+    assert h.current_step_timeout() == 10.0
+    h.step_times.append(1.0)
+    assert h.current_step_timeout() == 20.0
+    h.step_times.append(5.0)
+    assert h.current_step_timeout() == 60.0
