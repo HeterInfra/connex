@@ -280,11 +280,21 @@ class ConnexPPExecutor(MultiprocExecutor):
             for r in lst:
                 self._hello(r)
         deadline = time.monotonic() + float(os.getenv("CONNEX_PP_CONNECT_TIMEOUT_S", "600"))
-        # Give every replica a moment to answer, so the preferred one is used.
+        # Give every replica a moment to answer, so the preferred one is used:
+        # at most CONNEX_PP_SETTLE_S (10), and only CONNEX_PP_SETTLE_GRACE_S
+        # (1) more once every stage has a live replica (a replica that is
+        # down would otherwise always cost the full 10 s).
         settle = time.monotonic() + float(os.getenv("CONNEX_PP_SETTLE_S", "10"))
+        grace = float(os.getenv("CONNEX_PP_SETTLE_GRACE_S", "1"))
         with self.cv:
+            covered_at = None
             while (time.monotonic() < settle
                    and not all(r.alive for lst in self.replicas for r in lst)):
+                if covered_at is None and all(any(r.alive for r in lst)
+                                              for lst in self.replicas):
+                    covered_at = time.monotonic()
+                if covered_at is not None and time.monotonic() - covered_at >= grace:
+                    break
                 self.cv.wait(0.2)
             while not self._choose_route():
                 if time.monotonic() > deadline:
