@@ -929,6 +929,7 @@ class _MsgEngine:
         return None
 
 
+@needs_vllm
 def test_unauthenticated_control_frame_is_never_unpickled():
     """A frame without a valid tag is dropped before pickle.loads: a pickle
     that would run code (here: a global lookup) never gets that far."""

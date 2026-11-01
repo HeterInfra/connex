@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+**connex-rs 0.1.6**
+- `connex-ai[rs]` requires `connex-rs>=0.1.6,<0.2` (fast connect, fenced
+  `put_chain`, idle CPU, listen-address checks); the submodule and
+  `docker/Dockerfile` default (`CONNEX_RS_REF`) are at v0.1.6.
+
 **PP fix round (failover gap, false failures, control-port auth)**
 - PP failover: a receiver's channel waits (push channels across hosts,
   CUDA IPC channels on one host) stayed registered only until the matching
