@@ -48,7 +48,7 @@ def stage1(directory: str, port: int, ready, result) -> None:
 
 
 def main() -> None:
-    server = DirectoryServer(f"127.0.0.1:{free_port()}")
+    server = DirectoryServer(f"127.0.0.1:{free_port()}", f"127.0.0.1:{free_port()}")
     server.start()
 
     ctx = mp.get_context("spawn")
