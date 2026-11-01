@@ -177,6 +177,8 @@ class Replica:
     done_seq: int = -1          # last step it reported done (with the pong)
     quarantine_until: float = 0.0   # failed over for a hung step: not chosen before
     announced: float = 0.0      # when it last announced itself (READY), for the log
+    hello_every: float = 2.0    # watchdog re-HELLO interval while down (backs off)
+    next_hello: float = 0.0
 
 
 @dataclass
@@ -405,6 +407,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                                                                 * 1e3)
                     log.info("connex-pp: replica s%dr%d is up (%s)", r.stage, r.idx, how)
                 r.announced = 0.0
+                r.hello_every, r.next_hello = 2.0, 0.0
                 r.alive = True
                 r.busy = owner not in (None, self.owner)
                 self.cv.notify_all()
@@ -457,9 +460,17 @@ class ConnexPPExecutor(MultiprocExecutor):
             log.info("connex-pp: ignoring failure event for s%dr%d (%s): it answers",
                      r.stage, r.idx, reason)
             return
-        log.warning("connex-pp: replica s%dr%d failed (%s)", r.stage, r.idx, reason)
         with self.lock:
-            r.alive = False
+            was_alive, r.alive = r.alive, False
+            if was_alive:
+                r.hello_every, r.next_hello = 2.0, 0.0
+            on_route = self.route[r.stage - 1] is r
+        if not was_alive and not on_route:
+            # A failed (re)connect to a replica that is already down (the
+            # watchdog's HELLO): no state change, nothing to fail over.
+            log.debug("connex-pp: s%dr%d still down (%s)", r.stage, r.idx, reason)
+            return
+        log.warning("connex-pp: replica s%dr%d failed (%s)", r.stage, r.idx, reason)
         # Not on this (the failure event) thread: without a spare the
         # failover waits up to replace_timeout for a replacement, and the
         # failure events of other stages must not queue behind it.
@@ -534,18 +545,21 @@ class ConnexPPExecutor(MultiprocExecutor):
         for u in [e for u in urls for e in u.split(";")]:
             threading.Thread(target=one, args=(u,), name="cx-pp-abort", daemon=True).start()
 
+    def _rehello_down(self, now: float) -> None:
+        """(Re)discover replicas that are down: a restarted one becomes a
+        spare. It also announces itself (see stage.py), so the HELLO here
+        backs off (2 s doubling to 30 s) while it stays down."""
+        for lst in self.replicas:
+            for r in lst:
+                if not r.alive and now >= r.next_hello:
+                    r.next_hello = now + r.hello_every
+                    r.hello_every = min(r.hello_every * 2, 30.0)
+                    self._hello(r, resolve=True)
+
     def _watchdog(self) -> None:
-        tick = 0
         while not self.ctl.closed:
             time.sleep(1.0)
-            tick += 1
-            if tick % 2 == 0:
-                # (Re)discover replicas that are down: a restarted one becomes
-                # a spare (it also announces itself, see stage.py).
-                for lst in self.replicas:
-                    for r in lst:
-                        if not r.alive:
-                            self._hello(r, resolve=True)
+            self._rehello_down(time.monotonic())
             now = time.monotonic()
             with self.lock:
                 late = [p for p in self.pending.values()

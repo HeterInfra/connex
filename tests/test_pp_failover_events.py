@@ -58,3 +58,41 @@ def test_failover_without_spare_does_not_block_event_thread():
     while time.monotonic() < deadline and h.route[1] is not None:
         time.sleep(0.05)
     assert h.route == [None, None]
+
+
+def test_failed_connect_to_down_replica_is_quiet(caplog):
+    """Issue #14: a failed re-HELLO to a replica that is already down is no
+    state change: no warning, no failover."""
+    h = _head()
+    r = h.replicas[0][0]
+    r.alive = False
+    h.route[0] = None
+    called = []
+    h._failover = lambda *a: called.append(a)
+    with caplog.at_level("INFO", logger=ex.log.name):
+        h._on_failed((1,), "connect refused", ts=time.monotonic())
+    time.sleep(0.05)
+    assert not called and not [x for x in caplog.records if x.levelname == "WARNING"]
+
+
+def test_rehello_backs_off_and_resets():
+    h = _head()
+    r = h.replicas[0][0]
+    r.alive = False
+    sent = []
+    h._hello = lambda x, resolve=False: sent.append(x.idx)
+    t = 1000.0
+    times = []
+    for k in range(120):        # two minutes, one tick per second
+        n = len(sent)
+        h._rehello_down(t + k)
+        if len(sent) > n:
+            times.append(k)
+    assert times[:5] == [0, 2, 6, 14, 30]
+    assert len(times) <= 7      # was 60 (every 2 s)
+    # up again: the next outage starts at 2 s again
+    h._on_message = ex.ConnexPPExecutor._on_message.__get__(h)
+    h.owner = "o"
+    h._on_message((1, 1, ex.CTL_SHARD, 0), ("HELLO_OK", "d", None))
+    assert r.alive and r.hello_every == 2.0
+
