@@ -16,7 +16,16 @@ step's ModelRunnerOutput back to stage 0. All stages must use the same
 
 A replica serves one pipeline (stage-0 instance) at a time. When its owner
 goes away, the first other pipeline that sends it a step takes it over
-(after it dropped the old owner's requests).
+(after it dropped the old owner's requests). A failure event about the
+owner only releases it: if the same owner sends again (the event was a
+false positive, e.g. a heartbeat missed under load), it keeps its requests.
+
+Requests live in the stage's model runner across steps. Stage 0 bumps the
+epoch on every failover and then recomputes every running request (lost KV),
+so when a step of a newer epoch arrives, every request this stage still holds
+is stale: a replica that was off the route meanwhile (failed over while
+alive, now chosen again) never saw those requests finish. They are dropped
+before the step runs.
 
 Stage 0 sends its control URL with its HELLO; the server keeps the URLs in
 a small state file (``CONNEX_PP_STATE_DIR``, default /dev/shm, per control
@@ -35,6 +44,8 @@ import sys
 import threading
 import time
 
+from connex.adapters.vllm.pp.trace import tr  # noqa: E402
+
 log = logging.getLogger("vllm.connex_pp")
 
 
@@ -51,7 +62,10 @@ class StageServer:
         self.data_url = self.ex.local_data_url
         self.owner: str | None = None
         self.owner_peer = None
+        self.prev_owner: str | None = None   # released by a failure event, may come back
+        self.epoch = 0          # newest epoch of a step this stage executed
         self.live_reqs: set[str] = set()
+        self.stale: set[str] = set()   # to finish with the next step
         self.q: queue.Queue = queue.Queue()
         self.out_q: queue.Queue = queue.Queue()
         self.done_seq = -1      # last step whose results came back (reported with PONG)
@@ -85,11 +99,16 @@ class StageServer:
     def announce(self) -> None:
         """Tell the stage-0 instances we have served (before a restart) that
         we are ready; they answer with a HELLO."""
-        def run(heads=list(self.heads)):
-            for url in heads:   # a gone one may take a connect timeout
-                self.ctl.send(url, ("READY",), quiet=True)
+        def one(url):
+            ok = self.ctl.send(url, ("READY",), quiet=True)
+            log.info("connex-pp: announced to %s: %s", url, "sent" if ok else "send failed")
 
-        threading.Thread(target=run, name="cx-stage-announce", daemon=True).start()
+        # One thread per head, newest first: a stage-0 instance that is gone
+        # (an older deployment) can take a connect timeout and must not hold
+        # up the announce to the live one.
+        for url in reversed(self.heads):
+            threading.Thread(target=one, args=(url,), name="cx-stage-announce",
+                             daemon=True).start()
 
     def _on_message(self, peer, msg) -> None:
         kind = msg[0]
@@ -100,6 +119,7 @@ class StageServer:
         elif kind == "PING":
             self.ctl.send(peer, ("PONG", self.done_seq))
         elif kind in ("EXEC", "SAMPLE"):
+            tr("s_rx_" + kind, msg[1])
             self.q.put((peer, msg))
 
     def _on_failed(self, peer, reason) -> None:
@@ -109,15 +129,13 @@ class StageServer:
             self.q.put((peer, ("OWNER_GONE",)))
 
     def _drop_requests(self) -> None:
-        """Forget the requests of a previous owner (their KV belongs to it)."""
-        if not self.live_reqs:
-            return
-        from vllm.v1.core.sched.output import SchedulerOutput
-
-        so = SchedulerOutput.make_empty()
-        so.finished_req_ids = set(self.live_reqs)
-        self.out_q.put(("E", 0, 0, self.ex.execute_model(so, non_block=True), None))
-        self.live_reqs.clear()
+        """Forget the requests held (a previous owner's, whose KV belongs to
+        it, or an older epoch's, which stage 0 recomputes): they are finished
+        in the runner by the next step (its finished_req_ids; the runner
+        finishes before it adds, so a request resumed in that step is
+        re-added cleanly)."""
+        self.stale |= self.live_reqs
+        self.live_reqs = set()
 
     def _watch_workers(self) -> None:
         """Exit as soon as one of this stage's worker processes (a TP rank)
@@ -128,7 +146,18 @@ class StageServer:
         while procs:
             for p in procs:
                 if not p.is_alive():
+                    tr("s_worker_died!", self.done_seq)
                     log.error("connex-pp: stage %d worker %s died; exiting", self.stage, p.pid)
+                    # Tell the owner first: our endpoints close only once
+                    # this process is torn down (~0.1 s later).
+                    if self.owner_peer is not None:
+                        # bounded: the send lock may be held by a reply to a
+                        # hung peer
+                        t = threading.Thread(target=self.ctl.send, args=(
+                            self.owner_peer, ("DYING", f"worker {p.pid} died")),
+                            kwargs={"quiet": True}, daemon=True)
+                        t.start()
+                        t.join(0.1)
                     os._exit(1)
             time.sleep(0.05)
 
@@ -136,30 +165,64 @@ class StageServer:
         threading.Thread(target=self._watch_workers, name="cx-stage-watch", daemon=True).start()
         threading.Thread(target=self._reply_loop, name="cx-stage-reply", daemon=True).start()
         while True:
-            peer, msg = self.q.get()
-            kind = msg[0]
-            if kind == "OWNER_GONE":
-                self.owner, self.owner_peer = None, None
-                continue
-            _, seq, epoch, payload, owner = msg
-            if self.owner != owner:
-                if self.owner is not None:
-                    self.ctl.send(peer, ("BUSY", seq))
-                    continue
-                self._drop_requests()
-                self.owner, self.owner_peer = owner, peer
-                log.info("connex-pp: stage %d replica %d now serves %s", self.stage,
-                         self.replica, owner)
-            if kind == "EXEC":
-                so = payload
-                for nr in so.scheduled_new_reqs:
-                    self.live_reqs.add(nr.req_id)
-                self.live_reqs.difference_update(so.finished_req_ids)
-                fut = self.ex.execute_model(so, non_block=True)
-                self.out_q.put(("E", seq, epoch, fut, None))
-            else:
-                fut = self.ex.sample_tokens(payload, non_block=True)
-                self.out_q.put(("S", seq, epoch, fut, peer))
+            self._step(*self.q.get())
+
+    def _step(self, peer, msg) -> None:
+        kind = msg[0]
+        if kind == "OWNER_GONE":
+            if self.owner is not None:
+                self.prev_owner = self.owner
+            self.owner, self.owner_peer = None, None
+            return
+        _, seq, epoch, payload, owner = msg
+        if self.owner != owner:
+            if self.owner is not None:
+                self.ctl.send(peer, ("BUSY", seq))
+                return
+            self._take_over(owner, peer)
+        tr("s_loop_" + kind, seq)
+        if kind == "EXEC":
+            so = payload
+            if epoch > self.epoch:
+                self._new_epoch(epoch)
+            if self.stale:
+                so.finished_req_ids = set(so.finished_req_ids) | self.stale
+                self.stale = set()
+            # The runner finishes before it adds: same order here.
+            self.live_reqs.difference_update(so.finished_req_ids)
+            for nr in so.scheduled_new_reqs:
+                self.live_reqs.add(nr.req_id)
+            fut = self.ex.execute_model(so, non_block=True)
+            tr("s_exec_submitted", seq)
+            self.out_q.put(("E", seq, epoch, fut, None))
+        else:
+            fut = self.ex.sample_tokens(payload, non_block=True)
+            tr("s_sample_submitted", seq)
+            self.out_q.put(("S", seq, epoch, fut, peer))
+
+    def _take_over(self, owner: str, peer) -> None:
+        if owner == self.prev_owner:
+            # The failure event about it was false: it still drives the
+            # requests we hold (an epoch change drops them if it failed us over).
+            log.info("connex-pp: stage %d replica %d: owner %s is back, keeping %d request(s)",
+                     self.stage, self.replica, owner, len(self.live_reqs))
+        else:
+            self._drop_requests()
+            # A new pipeline numbers its steps and epochs from the start.
+            self.epoch = 0
+            self.done_seq = -1
+            log.info("connex-pp: stage %d replica %d now serves %s", self.stage,
+                     self.replica, owner)
+        self.prev_owner = None
+        self.owner, self.owner_peer = owner, peer
+
+    def _new_epoch(self, epoch: int) -> None:
+        if self.epoch and self.live_reqs:
+            log.info("connex-pp: stage %d replica %d: epoch %d -> %d, dropping %d stale "
+                     "request(s)", self.stage, self.replica, self.epoch, epoch,
+                     len(self.live_reqs))
+            self._drop_requests()
+        self.epoch = epoch
 
     def _reply_loop(self) -> None:
         while True:
@@ -169,10 +232,12 @@ class StageServer:
             except Exception:  # noqa: BLE001
                 log.exception("connex-pp: stage %d step %d failed; exiting", self.stage, seq)
                 os._exit(1)
+            tr("s_done_" + kind, seq)
             if kind == "S":
                 self.done_seq = max(self.done_seq, seq)
             if kind == "S" and self.last:
                 self.ctl.send(peer, ("OUT", seq, epoch, out))
+                tr("s_out_sent!", seq)
 
 
 def main(argv: list[str] | None = None) -> None:

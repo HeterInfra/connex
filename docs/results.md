@@ -1370,11 +1370,198 @@ Restarting in place got slower, 32-33 s instead of about 29 s: the stage
 server now compiles the top-k/top-p kernels at start (part of the restart),
 which the earlier version did on the first request instead.
 
+**Re-measured across hosts (2026-10-31).** Same setup and load, with
+connex-rs at the fenced `put_chain` / `IB_ALLOC=mmap,heap` build, stage 0 on
+one host and stage 1 on another (GPU 2, or GPUs 2-3 for TP=2), 8192 KV blocks
+everywhere, one discarded warm-up run and 3 runs per cell (mean ± std):
+
+| two hosts | C=1 TPOT / TTFT ms | C=32 TPOT ms / TTFT ms / tok/s |
+|---|---|---|
+| PP=2, NCCL | 28.29 / 93 | 41.98 ±0.35 / 698 / 679 ±3 |
+| PP=2, Connex in-process | 28.36 / 94 | 42.06 ±0.29 / 664 / 681 ±4 |
+| PP=2, one stage per instance | 28.37 / 95 | 42.49 ±0.44 / 668 / 678 ±2 |
+| PP=2 x TP=2, NCCL | 15.56 / 74 | 23.58 ±0.10 / 524 / 1164 ±1 |
+| PP=2 x TP=2, one stage per instance | 15.61 / 83 | 22.19 ±0.26 / 605 / 1188 ±8 |
+
+TPOT at C=1 is within 0.3 % of NCCL; at C=32 PP2×TP2 is 6 % faster per
+token and 2 % higher in throughput, with a higher mean TTFT. The PP2×TP2
+C=1 TTFT gap moved between runs: 82-83 ms in this campaign, 77-78 ms in a
+later traced run of the same configuration (NCCL 74-75 ms). 0 of 3,200
+greedy tokens off the argmax in every configuration.
+
+Where the C=1 time goes (`CONNEX_PP_TRACE=1`, per-step timestamps through
+EXEC, stage server and OUT, merged by
+`benchmarks/pp_upstream/trace_steps.py`; one host, PP=2, prefill steps,
+medians): stage 0 encodes and sends EXEC in 0.4 ms. The stage server has
+the step at 1.1 ms and its workers at 2.0 ms, while the hidden states arrive
+at 6.4 ms, so the extra control path runs while stage 0 computes. What
+remains serial is the OUT reply: pickle, send, receive and wake take
+0.35 ms. On one host the C=1 TTFT is 95.6 ms vs 94.3 ms for NCCL (runs
+spread 93-96 ms). In the cross-host PP2×TP2 trace, stage 1's workers start a
+prefill step 13 ms after its EXEC arrived: they are still running the
+previous step, because the scheduler runs ahead. This
+trace does not tell whether NCCL pays the same.
+
+Failover across hosts (stage 0, the active replica and the spare on three
+different hosts; each round kills under 32-client load, then during 16 greedy
+requests):
+
+| setup, what is killed | kills (load + greedy) | load requests completed | greedy tokens off the argmax | largest no-token window per load run |
+|---|---|---|---|---|
+| PP=2, active replica | 3 + 3 | 1,056 / 1,056 | 0 / 9,600 | 0.65, 0.43, 0.44 s |
+| PP=2 x TP=2, one TP rank of the active replica | 3 + 3 | 1,803 / 1,803 | 0 / 9,600 | 1.35, 0.69, 0.64 s |
+
+Stage 0 switches the route 1-3 ms after it sees the failure. With a spare
+that has served before, the PP2×TP2 window is now 0.64-0.69 s, down from
+0.89-1.11 s, and meets the 0.7 s target. The first failover onto a spare
+that has never served is slower (0.65 s at TP=1, 1.35 s at TP=2). The extra
+time was not in the spare (explained and fixed below, "Fix round"). Push
+channel set-up stays short: the first chain on a fresh channel completes
+0.4-16.6 ms after the channel opens.
+
+**Deploy path.** `deploy/k8s/manifests.py pipeline` (2 stages, 2 replicas
+of stage 1, pod network, headless Services) was applied unchanged except
+that the stock vLLM image runs `docker/launch_stage.sh` from a mounted
+checkout with the vLLM-main-plus-PRs environment, in place of an image built from
+`docker/Dockerfile`. The pipeline served 16/16 greedy requests. Deleting
+the active stage-1 pod during 16 greedy requests of 300 tokens (twice, one
+per replica) completed every request with 0 of 9,600 tokens off the
+argmax. The Deployment recreated each pod at a new IP, and stage 0 found it
+again by re-resolving the Service name (`moved: <old> -> <new>` in its
+log). Before this fix, stage 0 resolved the names once at start and sent
+HELLO to the dead address forever. On the pod network a force-deleted pod
+is detected by the heartbeat (3 s), not a connection reset.
+
 **Not covered.** A replica shared by several pipelines (the fork path
 supports it; here a replica serves one stage 0 at a time), more than one
 failure at a time, stage 0
 failures (the API instance; use the resume proxy of section 4), PP across
 hosts with more than two stages.
+
+**Fix round (2026-10-31, later the same day).** Same three hosts, same load
+and greedy runs, the stage processes started as before
+(`docker/launch_stage.sh` arguments, per-pipeline control key set).
+
+*Where the failover time went.* `CONNEX_PP_TRACE=1` now also stamps worker
+step calls, chain completions, failure events and aborts, plus a wall-clock
+anchor per file, so the three hosts merge into one timeline. In the slow
+cases the spare was idle: stage 0's hidden-state push to it completed
+400-1000 ms after stage 0 had launched the step. Stage 0's GPU was still
+blocked on the sampled tokens of the killed replica: the receiver queues a
+channel wait and its `done()` back to back, and `done()` removed the wait
+from the pending set, so the abort at the epoch change had nothing to
+release. The stream went on only when the old replica's last process was
+gone (its connection failed). With TP=2 a killed TP rank leaves the other
+rank alive for a while, which is why TP=2 and a first failover (longer
+teardown) were hit hardest. Waits now stay pending until their flag is
+reached. Decomposition of 3 traced TP=2 failovers after the fix:
+the dead worker is noticed 0.17-0.23 s after the kill (most of it is the
+kernel tearing down a CUDA process), stage 0 sees the failure 0.07-0.10 s
+later, and the recompute step takes 0.09-0.22 s. A stage that loses a
+worker now also tells stage 0 before it exits (`DYING`).
+
+| setup, what is killed | kills (load + greedy) | load requests completed | greedy tokens off the argmax | largest no-token window per load run |
+|---|---|---|---|---|
+| PP=2, active replica | 5 + 5 | 1,760 / 1,760 | 0 / 16,000 | 0.38, 0.37, 0.36, 0.72, 0.36 s |
+| PP=2, active replica, traced | 4 + 0 | all | n/a | 0.39, 0.38, 0.37, 0.39 s |
+| PP=2 x TP=2, one TP rank of the active replica | 5 + 5 | 3,040 / 3,040 | 0 / 16,000 | 0.34, 0.40, 0.40, 0.37, 0.34 s |
+
+The first load run of each block is the first failover onto a spare that
+had never served (0.38 and 0.72 s at TP=1, 0.34 and 0.37 s at TP=2). One
+TP=1 run of 9 was 0.72 s; it was not traced, and 4 traced repeats of the
+same case were 0.37-0.39 s. One TP=2 load request streamed 127 chunks with
+a normal end, 2.5 s after the run started (before the kill at 15 s).
+
+*False failure of stage 0.* Stage 0's EngineCore (its connex-rs control
+endpoint) was stopped with SIGSTOP for 6 s, 3 s into 16 greedy requests of
+400 tokens, so stage 1 saw a heartbeat failure of an owner that was alive.
+Before: the stage released the owner, dropped all 16 requests when the same
+owner's next step came, then died with a KeyError in its runner; with no
+spare, 0 of 16 requests completed (client timeout 600 s). After: the stage
+keeps the requests (`owner ... is back, keeping 16 request(s)`), stage 0
+fails over to the same replica on a new epoch, the stage finishes the 16
+requests of the old epoch before the new step, and 16 of 16 complete with
+0 of 6,400 tokens off the argmax (2 runs); a 16-client load run right after
+completes 64 of 64.
+
+*Image.* `docker/Dockerfile` (default upstream path) built on
+`vllm/vllm-openai:v0.31.0` (CUDA 13) at vLLM main b5755c3 plus the three PP
+branches, and deployed unchanged through `deploy/k8s/manifests.py pipeline
+--host-network --ib --pp-auth-secret-create` (2 stages, 2 replicas of stage
+1, all on one node, CUDA IPC off because the pods do not share /dev/shm):
+16/16 greedy requests of 300 tokens, then 16/16 with the active stage-1 pod
+force-deleted 4 s in (route switched 7.1 ms after the failure was seen),
+0 of 9,600 tokens off the argmax.
+
+*Control-frame authentication.* HMAC-SHA256 over each control frame
+(16-byte tag): 2.5-3 us per frame of 300 B, 7 us at 4.3 KB (a 1-request
+prefill step), 28 us at 26 KB (8 new requests), each side. Steady state
+across hosts with it on (one discarded warm-up, 3 runs, 8192 KV blocks):
+
+| two hosts | C=1 TPOT ms / TTFT ms | C=32 TPOT ms / TTFT ms / tok/s |
+|---|---|---|
+| PP=2, NCCL | 28.28 / 94.3 | 41.90 / 661 / 683 ±2 |
+| PP=2, one stage per instance | 28.36 / 95.7 | 41.61 / 651 / 689 ±7 |
+| PP=2 x TP=2, NCCL | 15.53 / 77.6 (74.2, 75.5, 83.0) | 22.02 / 622 / 1184 ±4 |
+| PP=2 x TP=2, one stage per instance | 15.60 / 76.5 | 23.14 / 535 / 1179 ±5 |
+| PP=2 x TP=2, one stage per instance, GIL switch interval 0.5 ms | 15.60 / 76.3 | not run |
+
+0 of 3,200 greedy tokens off the argmax in each. The PP2×TP2 C=1 TTFT gap
+reported above (+3 to +9 ms) did not show this time: 76.5 ms against NCCL
+runs of 74.2-83.0 ms. A shorter GIL switch interval in every stage process
+(0.5 ms instead of 5 ms) changed nothing, so it was not kept. The 13 ms late
+start of stage 1's prefill in the earlier trace is the scheduler running a
+step ahead (async scheduling); whether in-process NCCL PP pays the same was
+not measured, and no change was made for it.
+
+## 14. Import and CLI startup time
+
+`connex/__init__.py` used to import every legacy module eagerly, and two of
+them import torch and vLLM, so every entry point paid for them. The package
+now resolves its public names on first access (PEP 562). Wall time of a fresh
+`python -c "import <mod>"` (or `python -m <mod> --help`) on one
+GPU host with vLLM installed, warm page cache, 3 runs after one warmup:
+
+| Command | Before | After |
+|---|---|---|
+| `import connex` | 4.49–4.66 s | 28–32 ms |
+| `import connex.pp` | 4.28–4.69 s | 56–68 ms |
+| `import connex.serving.proxy` | 4.64–4.80 s | 193–200 ms |
+| `connex-front-router --help` | 4.44–4.48 s | 105–112 ms |
+| `connex-directory --help` | 4.38–4.57 s | 78–81 ms |
+| `connex-pd-router --help` | 4.52–4.56 s | 193–200 ms |
+| `python -m connex.adapters.vllm.pp.stage --help` | 8.6–9.0 s | 8.7–8.9 s (vLLM itself) |
+
+`tests/test_import_light.py` keeps torch and vLLM out of these imports.
+
+## 15. Stage restart in place
+
+PP2 (Llama-3-8B, one stage-1 replica restarted with `kill -9` and
+`docker/launch_stage.sh` on the same GPU, three A40 GPUs on one host,
+`NUM_GPU_BLOCKS=4096`). Restart time runs from the launch to stage 0
+logging the replica up again, with alternating runs after one warmup:
+
+| Start flags | Restart (3 runs) |
+|---|---|
+| default (memory + CUDA-graph profiling) | 27.6, 27.8, 28.4 s |
+| `KV_CACHE_MEMORY=6G` (`--kv-cache-memory-bytes`) | 24.1, 24.3, 24.3 s |
+
+With a fixed KV size, vLLM skips its profiling forward pass and the extra
+CUDA-graph capture it runs only to estimate graph memory. What remains is
+about 8 s of Python/vLLM import, 4 s of weight loading, 2 s of graph capture
+and engine setup.
+
+The restarted stage announces itself to stage 0 (READY). In 6 of the 7
+restarts stage 0 logged `is up (announced itself 0–1 ms ago)`; in the
+other, its periodic HELLO answer arrived first. Announces now go to every
+remembered stage 0 at once, newest first: before, a stale stage-0 URL from an
+earlier deployment came first and delayed the live one by about 1 s.
+
+Kill test on the same setup, final code (16 greedy requests, 300 tokens,
+kill of the stage-1 replica on the route 4 s in): 4800 tokens, 0 off-argmax.
+Under load (16 clients, 256 tokens), killing the other replica: 64/64
+requests completed, 0 failed, 0.24 s without a token on any stream.
+
 
 ## How to reproduce
 

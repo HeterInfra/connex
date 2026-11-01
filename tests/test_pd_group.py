@@ -54,7 +54,9 @@ def test_tracker_reports_each_dead_rank_once_per_incarnation():
 
 @pytest.fixture
 def fr(monkeypatch):
-    monkeypatch.setenv("CONNEX_HEARTBEAT_TIMEOUT_S", "0.6")
+    # Long enough that a loaded CI box still sees a never-heartbeating rank
+    # registered before its lease runs out.
+    monkeypatch.setenv("CONNEX_HEARTBEAT_TIMEOUT_S", "1.5")
     monkeypatch.setenv("CONNEX_HEALTH_CHECK_INTERVAL_S", "0.1")
     p = next(_ports)
     router = FrontRouter(FrontRouterConfig(api_address=f"tcp://127.0.0.1:{p}",
@@ -143,7 +145,7 @@ def test_missed_lease_of_one_rank_fails_the_group(fr):
     try:
         raw_register(fr, PDRole.DECODE, 1, 1, 2)            # never heartbeats
         assert decode_urls(fr) == ["http://d0:80", "http://d1:80"]
-        assert wait_for(lambda: decode_urls(fr) == ["http://d0:80"], timeout=3)
+        assert wait_for(lambda: decode_urls(fr) == ["http://d0:80"], timeout=5)
         assert fr._stats.get("group_failures", 0) >= 1
     finally:
         for m in ms:

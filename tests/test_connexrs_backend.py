@@ -297,3 +297,17 @@ def test_transport_confirmed_remote_death_resends_k1_step_sooner(monkeypatch):
         assert ep._send_is_stale(rec) is stale_at_0_15, (source, k)
         fresh = (ep._chain_epoch, ep._remote_epoch, time.monotonic())
         assert not ep._send_is_stale(fresh)
+
+
+def test_net_devices_include_the_interface_of_the_ip(tmp_path):
+    """Pinning only the RDMA device and its IPoIB interface for an address
+    on another interface (127.0.0.1, a pod network) made every connect fail
+    with "Destination is unreachable": that interface must be listed too."""
+    from connex.pp.transports import ucx_net_devices_for_ip
+
+    (tmp_path / "mlx5_0" / "device" / "net" / "ibs102").mkdir(parents=True)
+    own = {"127.0.0.1": "lo", "10.0.0.3": "eth1"}.get
+    f = lambda ip: ucx_net_devices_for_ip(ip, sysfs=str(tmp_path), iface_of=own)  # noqa: E731
+    assert f("127.0.0.1") == "mlx5_0:1,lo"
+    assert f("10.0.0.3") == "mlx5_0:1,eth1"
+    assert f("10.0.0.9") is None          # on no local interface: do not pin

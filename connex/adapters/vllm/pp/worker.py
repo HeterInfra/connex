@@ -22,9 +22,14 @@ import os
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.v1.worker.gpu_worker import Worker
 
+from connex.adapters.vllm.pp.trace import ON as TRACE_ON, tr
+
 log = logging.getLogger("vllm.connex_pp")
 
 ROUTE_ATTR = "connex_pp_route"
+# With CONNEX_PP_TRACE=1: also synchronize after each step's calls to trace
+# when its GPU work ends (slows the steps; diagnosis only).
+_TRACE_SYNC = os.getenv("CONNEX_PP_TRACE_SYNC", "0") == "1"
 
 
 class ConnexPPWorker(Worker):
@@ -34,7 +39,31 @@ class ConnexPPWorker(Worker):
         if begin is not None:
             begin(getattr(scheduler_output, ROUTE_ATTR, None))
             group.before_step()
-        return super().execute_model(scheduler_output)
+        if not TRACE_ON:
+            return super().execute_model(scheduler_output)
+        seq = (getattr(scheduler_output, ROUTE_ATTR, None) or {}).get("seq", -1)
+        out = super().execute_model(scheduler_output)
+        tr("w_exec_ret", seq)
+        if _TRACE_SYNC:
+            import torch
+
+            torch.cuda.synchronize()
+            tr("w_exec_gpu", seq)
+        return out
+
+    def sample_tokens(self, *args, **kwargs):
+        if not TRACE_ON:
+            return super().sample_tokens(*args, **kwargs)
+        seq = getattr(get_pp_group(), "_step_key", (0, -1))[1]
+        tr("w_sample_call", seq)
+        out = super().sample_tokens(*args, **kwargs)
+        tr("w_sample_ret", seq)
+        if _TRACE_SYNC:
+            import torch
+
+            torch.cuda.synchronize()
+            tr("w_sample_gpu", seq)
+        return out
 
     def compile_or_warm_up_model(self, *args, **kwargs):
         group = get_pp_group()

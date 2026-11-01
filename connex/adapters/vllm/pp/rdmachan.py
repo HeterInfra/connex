@@ -120,6 +120,11 @@ class PushRx:
         self.streams[stream.cuda_stream] = stream
         _wait(stream, self.dptr + 4 * s, v + 1)
         with self.lock:
+            # A wait stays pending until its flag is reached (not when done()
+            # is queued: the stream may still be blocked on it), so that
+            # release_below can let it go. Prune the ones that passed.
+            for j in [j for j in self.pending if reached(self.arr[j % self.n], j + 1)]:
+                del self.pending[j]
             self.pending[v] = epoch
             self.hi = max(self.hi, v + 1)
         return self.ring[s * self.slot_bytes:(s + 1) * self.slot_bytes]
@@ -130,9 +135,6 @@ class PushRx:
             return
         _write(torch.cuda.current_stream(self.device), self.dptr + 4 * (self.n + v % self.n),
                v + 1)
-        with self.lock:
-            for j in [j for j in self.pending if j <= v]:
-                del self.pending[j]
 
     def skip_to(self, v: int) -> None:
         """Before waiting for ``v``: mark the slots of the messages since the

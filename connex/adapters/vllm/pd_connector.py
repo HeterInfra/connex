@@ -106,6 +106,10 @@ class _Pull:
     local_blocks: list[int]
     first_block: int
     remote_tp: int = 0   # 0: unknown (older producer), read rank r from rank r
+    # False for an acquire-only pull (the remote prefix is already cached
+    # locally): the scheduler did not wait for a load, so its completion must
+    # not be reported in finished_recving.
+    report: bool = True
 
 
 @dataclass
@@ -243,7 +247,8 @@ class ConnexConnector(KVConnectorBase_V1):
             local = list(blocks.get_block_ids()[0][first:last])
         # an empty pull still acquires: the router learns nothing is lost, and
         # the hold is renewed until this request releases it
-        self._meta.pulls.append(_Pull(request.request_id, ctrl, tid, local, first, rtp))
+        self._meta.pulls.append(_Pull(request.request_id, ctrl, tid, local, first, rtp,
+                                      report=num_external_tokens > 0))
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> KVConnectorMetadata:
         meta, self._meta = self._meta, ConnexConnectorMetadata()
@@ -302,6 +307,7 @@ class ConnexConnector(KVConnectorBase_V1):
         self.consumer: Optional[KVConsumer] = None
         self._errors: set[int] = set()
         self._recving: set[str] = set()
+        self._acquire_only: set[str] = set()
 
     def register_kv_caches(self, kv_caches: dict[str, "torch.Tensor"]) -> None:
         num_blocks = self._kv_cache_config.num_blocks
@@ -381,7 +387,10 @@ class ConnexConnector(KVConnectorBase_V1):
                 self.producer.hold(rid, tid, blocks)
         if self.consumer is not None:
             for pl in meta.pulls:
-                self._recving.add(pl.req_id)
+                if pl.report:
+                    self._recving.add(pl.req_id)
+                else:
+                    self._acquire_only.add(pl.req_id)
                 try:
                     srcs = self._sources(pl.ctrl, pl.remote_tp)
                 except ValueError as e:
@@ -424,6 +433,13 @@ class ConnexConnector(KVConnectorBase_V1):
         recving: set[str] = set()
         if self.consumer is not None:
             for r in self.consumer.take_done():
+                if r.req_id in self._acquire_only:
+                    # the request is already running on its local prefix
+                    self._acquire_only.discard(r.req_id)
+                    if not r.ok:
+                        log.warning("request %s: acquiring the prefill hold failed: %s",
+                                    r.req_id, r.why)
+                    continue
                 recving.add(r.req_id)
                 self._recving.discard(r.req_id)
                 if not r.ok:

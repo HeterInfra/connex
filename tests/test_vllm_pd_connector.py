@@ -99,3 +99,37 @@ def test_release_after_pull_mode_sends_no_release():
     c.update_state_after_alloc(r, Blocks([1]), 4)
     c.request_finished(r, ([1],))
     assert c.build_connector_meta(None).releases == []
+
+
+def test_cached_remote_prefix_pull_is_acquire_only_and_not_reported():
+    """A resumed request whose remote prefix is already cached locally loads
+    nothing (no async load), but still acquires the hold. The worker must not
+    report that pull in finished_recving: the request is RUNNING, and vLLM's
+    scheduler asserts that a finished receive belongs to a waiting or a
+    finished request."""
+    from connex.pd.transfer import PullResult
+
+    c = ConnexConnector(config("kv_consumer"), KVConnectorRole.SCHEDULER, None)
+    p = {"do_remote_prefill": True, "transfer_id": "T", "remote_ctrl": "h:1",
+         "remote_num_tokens": 8}
+    r = request("d4", 12, dict(p))                       # 8 prompt + 4 generated
+    assert c.get_num_new_matched_tokens(r, 8) == (0, False)  # all cached locally
+    c.update_state_after_alloc(r, Blocks([5, 6, 7]), 0)
+    (pl,) = c.build_connector_meta(None).pulls
+    assert pl.local_blocks == [] and pl.report is False
+
+    # worker side: the acquire-only pull completes without a recving report
+    w = object.__new__(ConnexConnector)
+    done = [PullResult("d4", True), PullResult("d5", True)]
+    w.producer = None
+    w.consumer = SimpleNamespace(pull=lambda *a, **k: None,
+                                 take_done=lambda: [done.pop(0) for _ in range(len(done))])
+    w._recving, w._acquire_only, w._errors = set(), set(), set()
+    w._sources = lambda ctrl, rtp: None
+    w._rank_addr = lambda ctrl: ctrl
+    meta = c.build_connector_meta(None)
+    meta.pulls = [pl, type(pl)("d5", "h:1", "U", [9], 0)]
+    w._get_connector_metadata = lambda: meta
+    w.start_load_kv(None)
+    assert w.get_finished(set()) == (None, {"d5"})
+    assert w._acquire_only == set() and w._recving == set()

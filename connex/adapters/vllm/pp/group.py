@@ -46,6 +46,7 @@ import torch
 from vllm.distributed.parallel_state import GroupCoordinator, get_tp_group
 
 from connex.adapters.vllm.pp.link import StageLink
+from connex.adapters.vllm.pp.trace import tr
 
 log = logging.getLogger("vllm.connex_pp")
 
@@ -190,6 +191,7 @@ class ConnexPPGroup(GroupCoordinator):
         if self.link is not None and epoch > self.link.min_epoch:
             self.link.abort(epoch)
         self._step_key = (epoch, seq)
+        tr("w_begin", seq)
         self._route = route
         self._bcast_idx = 0
         self._max_tokens = meta.get("max_tokens", 1)
@@ -322,6 +324,7 @@ class ConnexPPGroup(GroupCoordinator):
         t0 = time.perf_counter()
         self.link.send_tensors(self._rank_url(url, per_rank), key, tensors, meta or None)
         self.timing["send_s"] += time.perf_counter() - t0
+        tr("w_sent", key[1])
         return []
 
     def send_tensor_dict(self, tensor_dict, dst=None, all_gather_group=None,
@@ -346,7 +349,9 @@ class ConnexPPGroup(GroupCoordinator):
             # _defer_sampled for why a Python-released stream wait is unsafe).
             # Pushed and same-host messages are released by the sender.
             blocking = self.blocking or not (self._same_host(src) or XHOST_STREAM_WAIT)
+            tr("w_recv", key[1])
             got = self.link.recv_tensors(key, blocking=blocking)
+            tr("w_recv_ret", key[1])
             self.timing["recv_wait_s"] += time.perf_counter() - t0
             self.timing["steps"] += 1
             if got is None:
@@ -421,6 +426,7 @@ class ConnexPPGroup(GroupCoordinator):
 
     def _send_sampled(self, tensor: torch.Tensor) -> None:
         key = self._bkey()
+        tr("w_send_sampled", self._step_key[1] if self.external else key[1])
         if not self.is_endpoint:
             return
         stream = torch.cuda.current_stream(self.device)
@@ -478,6 +484,7 @@ class ConnexPPGroup(GroupCoordinator):
 
     def _recv_sampled(self, tensor: torch.Tensor) -> None:
         key = self._bkey()
+        tr("w_recv_sampled", self._step_key[1] if self.external else key[1])
         src = self._rank_url(self._route[self.world_size - 1]) if self._route else None
         if self._same_host(src):
             if self.is_endpoint:

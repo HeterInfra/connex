@@ -75,6 +75,15 @@ DEFAULTS = {
     "image_pull_secret": "",
     "proxy_port": 5199,
     "proxy_endpoints": "",         # comma-separated stage-0 URLs for `proxy`
+    # Upstream: name of the Secret (key "secret") holding the key that
+    # authenticates the stages' control frames (CONNEX_PP_SECRET); empty:
+    # PREFIX-pp-auth. Create it once, e.g. `kubectl create secret generic
+    # PREFIX-pp-auth --from-literal=secret=$(openssl rand -hex 32)`, or pass
+    # --pp-auth-secret-create to emit one with a random key. Not emitted by
+    # default: re-applying a regenerated key would leave running stages and
+    # restarted ones with different keys.
+    "pp_auth_secret": "",
+    "pp_auth_secret_create": False,
     # Object name of the router Deployment/Service. Give each pipeline that
     # shares a namespace its own (e.g. PREFIX-front-router) so applying one
     # pipeline's router never replaces another's.
@@ -146,6 +155,21 @@ def upstream_env(c, prefix, idx, replica):
     return env
 
 
+def pp_auth_secret_name(c, prefix):
+    return c.pp_auth_secret or f"{prefix}-pp-auth"
+
+
+def pp_auth_secret(c, prefix):
+    """A Secret with a random 256-bit key (`pipeline --pp-auth-secret-create`,
+    for the first deployment of a pipeline)."""
+    import secrets
+
+    return {"apiVersion": "v1", "kind": "Secret", "type": "Opaque",
+            "metadata": {"name": pp_auth_secret_name(c, prefix), "namespace": c.namespace,
+                         "labels": {"app": "connex-stage", "pipeline": prefix}},
+            "stringData": {"secret": secrets.token_hex(32)}}
+
+
 def stage(c, backend, prefix, idx, node, replica=0, overrides=None):
     name = f"{prefix}-s{idx}-r{replica}"
     labels = {"app": "connex-stage", "pipeline": prefix, "stage": str(idx), "replica": str(replica)}
@@ -201,7 +225,10 @@ def stage_objects(c, prefix, idx, replica, name, labels, env, node):
         "env": env_list(env) + [{"name": "HOST_IP", "valueFrom": {"fieldRef": {
             "fieldPath": "status.hostIP" if c.host_network else "status.podIP"}}}] + (
             [{"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": {
-                "name": c.hf_token_secret, "key": "HF_TOKEN"}}}] if c.hf_token_secret else []),
+                "name": c.hf_token_secret, "key": "HF_TOKEN"}}}] if c.hf_token_secret else []) + (
+            [{"name": "CONNEX_PP_SECRET", "valueFrom": {"secretKeyRef": {
+                "name": pp_auth_secret_name(c, prefix), "key": "secret"}}}]
+            if c.engine == "upstream" else []),
         "resources": {"limits": {c.gpu_resource: 1}},
         "volumeMounts": [{"name": "shm", "mountPath": "/dev/shm"}],
     }
@@ -392,6 +419,8 @@ def generate(argv=None):
         reps = c.stage_replicas if c.engine == "upstream" else 1
         items = [o for i in range(c.num_stages) for r in range(1 if i == 0 else reps)
                  for o in stage(c, c.backend, c.prefix, i, nodes[i] if nodes else "", r, ov)]
+        if c.engine == "upstream" and c.pp_auth_secret_create:
+            items.insert(0, pp_auth_secret(c, c.prefix))
     else:
         items = stage(c, c.backend, c.prefix, c.stage, c.node, c.replica, ov)
     return {"apiVersion": "v1", "kind": "List", "items": items}

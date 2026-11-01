@@ -49,6 +49,8 @@ from typing import Any, Callable
 
 import torch
 
+from connex.adapters.vllm.pp.trace import tr
+
 log = logging.getLogger("vllm.connex_pp")
 
 ZCOPY_THRESH = 4096
@@ -453,6 +455,7 @@ class StageLink:
                     err = e
                 if r.off is not None:
                     self.send_ring.free(r.off)
+                tr("w_chain_" + r.kind, r.key[1])
                 if err is None:
                     if r.tx.first_done is None:
                         r.tx.first_done = time.monotonic()
@@ -1004,6 +1007,8 @@ class StageLink:
             if epoch <= self.min_epoch:
                 return
             self.min_epoch = epoch
+        tr("w_abort", epoch)
+        with self.inbox.cv:
             for key in [k for k in self.inbox.items if k[0] < epoch]:
                 self._release(self.inbox.items.pop(key))
             for key in [k for k in self.push_fallback if k[0] < epoch]:
@@ -1062,6 +1067,7 @@ class StageLink:
             if ev.get("type") != "failed":
                 continue
             peer = tuple(ev.get("peer") or ())
+            tr("w_peer_failed", self.min_epoch)
             with self.inbox.cv:
                 self.up_peers.discard(peer)
             self.close_chans(lambda k, peer=peer: k[0] == peer)

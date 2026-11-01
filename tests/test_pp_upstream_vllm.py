@@ -772,3 +772,248 @@ def test_same_host_sampled_channel_timeout_is_a_failure():
         pop("10.0.0.1:2#cxpp|1|0|0", 1, torch.zeros(4))
     lk.min_epoch = 2                       # epoch aborted: just return
     pop("10.0.0.1:2#cxpp|1|0|0", 1, torch.zeros(4))
+
+
+@needs_vllm
+def test_lost_replica_is_re_resolved_by_name(monkeypatch):
+    """A recreated downstream pod keeps its Service name but gets a new IP:
+    stage 0 must not keep sending HELLO to the old address."""
+    import socket
+
+    from connex.adapters.vllm.pp import executor as exm
+
+    addr = {"stage1": "10.0.0.1"}
+    monkeypatch.setattr(socket, "gethostbyname", lambda h: addr[h])
+    r = exm.Replica(1, 0, exm.control_url("10.0.0.1:47100", 1, 0), name="stage1:47100")
+    ex = SimpleNamespace()
+    resolve = exm.ConnexPPExecutor._resolve.__get__(ex)
+    resolve(r)
+    assert r.ctl_url.startswith("10.0.0.1:47100#")
+    addr["stage1"] = "10.0.0.9"
+    resolve(r)
+    assert r.ctl_url == exm.control_url("10.0.0.9:47100", 1, 0)
+    r.alive = True                       # never re-resolved while alive
+    addr["stage1"] = "10.0.0.5"
+    resolve(r)
+    assert r.ctl_url.startswith("10.0.0.9:")
+    r.alive = False
+    del addr["stage1"]                   # resolution fails: keep the address
+    monkeypatch.setattr(socket, "gethostbyname",
+                        lambda h: (_ for _ in ()).throw(OSError("nx")))
+    resolve(r)
+    assert r.ctl_url.startswith("10.0.0.9:")
+
+
+# --------------------------------------------------------------------------
+# Stage server request state across owners and epochs, control-frame auth.
+# --------------------------------------------------------------------------
+
+def _stage_server():
+    """A StageServer without vLLM, connex-rs or threads; records the steps
+    it hands to its executor."""
+    from connex.adapters.vllm.pp.stage import StageServer
+
+    srv = object.__new__(StageServer)
+    srv.stage, srv.replica, srv.last = 1, 0, True
+    srv.owner = srv.owner_peer = srv.prev_owner = None
+    srv.epoch, srv.done_seq = 0, -1
+    srv.live_reqs, srv.stale = set(), set()
+    srv.out_q = queue.Queue()
+    srv.sent = []
+    srv.ctl = SimpleNamespace(send=lambda peer, msg: srv.sent.append((peer, msg)))
+    srv.executed = []
+
+    def execute_model(so, non_block=False):
+        srv.executed.append((set(so.finished_req_ids), [r.req_id for r in so.scheduled_new_reqs]))
+        return None
+
+    srv.ex = SimpleNamespace(execute_model=execute_model,
+                             sample_tokens=lambda g, non_block=False: None)
+    return srv
+
+
+def _exec(seq, epoch, new=(), finished=(), owner="h0"):
+    so = SimpleNamespace(scheduled_new_reqs=[SimpleNamespace(req_id=r) for r in new],
+                         finished_req_ids=set(finished))
+    return ("EXEC", seq, epoch, so, owner)
+
+
+def test_false_owner_failure_keeps_the_requests():
+    """A heartbeat false positive about stage 0 released the owner, and the
+    same owner's next step then dropped every request the stage held (the
+    runner lost their state; the stage died on the next step)."""
+    srv = _stage_server()
+    srv._step("p0", _exec(1, 1, new=["a", "b"]))
+    srv._step("p0", ("OWNER_GONE",))
+    assert srv.owner is None
+    srv._step("p0", _exec(2, 1))
+    assert srv.executed[-1] == (set(), [])          # nothing finished
+    assert srv.live_reqs == {"a", "b"} and srv.owner == "h0"
+    # A different pipeline taking the released replica drops them.
+    srv._step("p1", ("OWNER_GONE",))
+    srv._step("p1", _exec(1, 1, new=["x"], owner="h1"))
+    assert srv.executed[-1] == ({"a", "b"}, ["x"])
+    assert srv.live_reqs == {"x"}
+
+
+def test_busy_replica_refuses_another_owner():
+    srv = _stage_server()
+    srv._step("p0", _exec(1, 1, new=["a"]))
+    srv._step("p1", _exec(5, 1, owner="h1"))
+    assert srv.sent == [("p1", ("BUSY", 5))] and len(srv.executed) == 1
+
+
+def test_new_epoch_finishes_requests_of_older_epochs():
+    """A replica failed over while alive and later chosen again never saw
+    its old requests finish: a step of a newer epoch finishes them first
+    (a request resumed in that same step is re-added by the runner)."""
+    srv = _stage_server()
+    srv._step("p0", _exec(1, 1, new=["a", "b"]))
+    srv._step("p0", ("SAMPLE", 1, 1, None, "h0"))
+    srv._step("p0", _exec(9, 3, new=["b", "c"]))
+    assert srv.executed[-1] == ({"a", "b"}, ["b", "c"])
+    assert srv.live_reqs == {"b", "c"} and srv.epoch == 3
+    srv._step("p0", _exec(10, 3, finished=["c"]))
+    assert srv.executed[-1] == ({"c"}, []) and srv.live_reqs == {"b"}
+
+
+def test_new_owner_resets_progress_and_epoch():
+    srv = _stage_server()
+    srv._step("p0", _exec(40, 7, new=["a"]))
+    srv.done_seq = 40
+    srv._step("p0", ("OWNER_GONE",))
+    srv._step("p1", _exec(1, 1, owner="h1"))
+    assert srv.done_seq == -1 and srv.epoch == 1
+
+
+def test_control_frames_need_the_shared_secret():
+    from connex.adapters.vllm.pp.auth import AuthError, FrameAuth, load_secret
+
+    with pytest.raises(AuthError, match="CONNEX_PP_SECRET"):
+        load_secret({})
+    with pytest.raises(AuthError, match="at least"):
+        load_secret({"CONNEX_PP_SECRET": "short"})
+    assert load_secret({"CONNEX_PP_AUTH": "off"}) is None
+    a = FrameAuth(load_secret({"CONNEX_PP_SECRET": "s" * 32}))
+    b = FrameAuth(b"t" * 32)
+    payload = pickle.dumps(("EXEC", 1))
+    frame = a.seal(payload)
+    assert bytes(a.open(frame)) == payload
+    assert b.open(frame) is None                       # other secret
+    assert a.open(payload) is None                     # no tag
+    bad = bytearray(frame)
+    bad[-1] ^= 1
+    assert a.open(bytes(bad)) is None                  # tampered payload
+    assert a.rejected == 2 and b.rejected == 1
+
+
+def test_control_secret_from_a_file(tmp_path):
+    from connex.adapters.vllm.pp.auth import AuthError, load_secret
+
+    f = tmp_path / "secret"
+    f.write_text("0123456789abcdef0123\n")
+    assert load_secret({"CONNEX_PP_SECRET_FILE": str(f)}) == b"0123456789abcdef0123"
+    with pytest.raises(AuthError, match="CONNEX_PP_SECRET_FILE"):
+        load_secret({"CONNEX_PP_SECRET_FILE": str(tmp_path / "missing")})
+
+
+class _MsgEngine:
+    def __init__(self, msgs):
+        self.msgs = list(msgs)
+        self.local_url = "10.0.0.1:1#cxpp|0|2000|0"
+
+    def recv_msg(self, timeout_ms=0):
+        if self.msgs:
+            return self.msgs.pop(0)
+        time.sleep(0.01)
+        return None
+
+
+def test_unauthenticated_control_frame_is_never_unpickled():
+    """A frame without a valid tag is dropped before pickle.loads: a pickle
+    that would run code (here: a global lookup) never gets that far."""
+    from connex.adapters.vllm.pp import executor as exm
+    from connex.adapters.vllm.pp.auth import FrameAuth
+    from connex.adapters.vllm.pp.link import CONTROL
+
+    class Boom:
+        def __reduce__(self):
+            return (exm.log.critical, ("unpickled an unauthenticated frame",))
+
+    auth = FrameAuth(b"k" * 32)
+    evil = pickle.dumps((CONTROL, Boom()))
+    good = auth.seal(pickle.dumps((CONTROL, ("PING",))))
+    got = []
+    ctl = object.__new__(exm.ControlLink)
+    ctl.auth, ctl.closed = auth, False
+    ctl.on_message = lambda peer, msg: got.append(msg)
+    ctl.engine = _MsgEngine([(("m", 1, 1000, 0), evil), (("m", 1, 1000, 0), good)])
+    loaded = []
+    orig = pickle.loads
+    exm.pickle.loads = lambda data: loaded.append(1) or orig(data)
+    try:
+        t = threading.Thread(target=ctl._rx, daemon=True)
+        t.start()
+        t0 = time.monotonic()
+        while not got and time.monotonic() - t0 < 2:
+            time.sleep(0.01)
+    finally:
+        ctl.closed = True
+        exm.pickle.loads = orig
+    assert got == [("PING",)] and loaded == [1] and auth.rejected == 1
+
+
+def test_release_below_finds_a_wait_whose_done_was_already_queued(monkeypatch):
+    """The receiver queues wait(v) and done(v) back to back on the stream,
+    so done() used to drop v from the pending waits at once, while the
+    stream was still blocked on it. An abort then released nothing: a first
+    stage stayed blocked on the sampled tokens of a replaced (hung, not yet
+    dead) last stage until its failure event, ~0.3-0.8 s into a failover."""
+    import numpy as np
+
+    from connex.adapters.vllm.pp import ipcchan, rdmachan
+
+    monkeypatch.setattr(rdmachan, "_wait", lambda *a: None)
+    monkeypatch.setattr(rdmachan, "_write", lambda *a: None)
+    monkeypatch.setattr(ipcchan, "_wait", lambda *a: None)
+    monkeypatch.setattr(ipcchan, "_write", lambda *a: None)
+    cur = SimpleNamespace(cuda_stream=1)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda dev=None: cur)
+
+    rx = object.__new__(rdmachan.PushRx)
+    rx.n, rx.slot_bytes, rx.dptr, rx.device = 4, 4096, 0, None
+    rx.arr = np.zeros(8, dtype=np.uint32)
+    rx.ring = torch.zeros(4 * 4096, dtype=torch.uint8)
+    rx.lock, rx.pending, rx.streams = threading.Lock(), {}, {}
+    rx.hi, rx.retired, rx.last = 0, False, -1
+    rx.arr[0] = 1                       # message 0 arrived
+    rx.wait(0, epoch=2)
+    rx.done(0)
+    rx.wait(5, epoch=2)                 # never pushed (sender hung)
+    rx.done(5)
+    assert set(rx.pending) == {5}       # 0 passed and was pruned, 5 still blocks
+    assert rx.release_below(3) == 1 and rx.arr[5 % 4] == 6
+
+    ch = object.__new__(ipcchan.RxChannel)
+    ch.n, ch.slot_bytes, ch.device = 4, 4096, None
+    ch.flags = SimpleNamespace(arr=np.zeros(8, dtype=np.uint32), ready_addr=lambda s: s,
+                               free_addr=lambda s: s)
+    ch.ring = torch.zeros(4 * 4096, dtype=torch.uint8)
+    ch.pending, ch.streams, ch.hi, ch.retired = {}, {}, 0, False
+    ch.wait(2, epoch=1)
+    ch.done(2)
+    assert ch.release_below(2) == 1 and ch.flags.arr[2] == 3
+
+
+@needs_vllm
+def test_dying_stage_is_failed_over_without_waiting_for_its_connections():
+    from connex.adapters.vllm.pp import executor as exm
+
+    r = exm.Replica(1, 0, exm.control_url("10.0.0.1:47100", 1, 0), "d0", alive=True)
+    done = threading.Event()
+    calls = []
+    ex = SimpleNamespace(replicas=[[r]], num_stages=2, lock=threading.RLock(), seq=7,
+                         _failover=lambda rep, why: (calls.append((rep, why)), done.set()))
+    ex._find = exm.ConnexPPExecutor._find.__get__(ex)
+    exm.ConnexPPExecutor._on_message(ex, ("cxpp", 1, exm.CTL_SHARD, 0), ("DYING", "worker 5 died"))
+    assert done.wait(2) and calls == [(r, "stage exiting")] and not r.alive

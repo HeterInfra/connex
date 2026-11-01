@@ -2,6 +2,93 @@
 
 ## Unreleased
 
+**PP fix round (failover gap, false failures, control-port auth)**
+- PP failover: a receiver's channel waits (push channels across hosts,
+  CUDA IPC channels on one host) stayed registered only until the matching
+  `done()` was queued, not until the stream had passed them. The wait and
+  the `done()` are queued back to back, so an abort found nothing to
+  release, and stage 0 stayed blocked on the sampled tokens of the replaced
+  replica until that replica's process was gone (0.3-0.8 s into the
+  failover). Waits now stay pending until their flag is reached. Largest
+  no-token window across hosts: PP2xTP2 0.34-0.40 s (was 0.64-0.69 s, and
+  1.35 s on the first failover onto a spare that had never served), PP=2
+  0.36-0.39 s in 8 of 9 kills (one 0.72 s).
+- PP: a stage that loses a worker tells stage 0 (`DYING`) before it exits,
+  so the failover does not wait for its connections to close (~0.1 s).
+- PP stage server: a failure event about a live stage 0 (a heartbeat missed
+  under load) released the owner, and the same owner's next step then
+  dropped every request the stage held; the runner lost their state and the
+  stage died on the next step (with no spare, all requests hung). The owner
+  now keeps its requests when it comes back.
+- PP stage server: a replica that had been failed over while alive and was
+  chosen again kept the requests of the old epoch in its runner (slots that
+  never freed). A step of a newer epoch now finishes every request the
+  stage still holds (merged into that step's `finished_req_ids`; the runner
+  finishes before it adds, so a request resumed in the same step is added
+  cleanly). Stage 0 forgets a replica's reported progress when it comes back.
+- Security: control frames between the stages (pickled vLLM step objects)
+  carry an HMAC-SHA256 tag with a per-pipeline key (`CONNEX_PP_SECRET` or
+  `CONNEX_PP_SECRET_FILE`); frames without a valid tag are dropped before
+  unpickling. A control endpoint refuses to start without a key unless
+  `CONNEX_PP_AUTH=off`. `docker/launch_stage.sh` can generate the key in a
+  shared volume (`CONNEX_PP_SECRET_PATH`, used by docker-compose),
+  `deploy/k8s/manifests.py` reads it from the Secret `PREFIX-pp-auth`
+  (`--pp-auth-secret NAME`; `--pp-auth-secret-create` emits one). Cost: 3-7 us
+  per frame at decode-step sizes, about 28 us at 26 KB. See SECURITY.md.
+- Stage 0 re-resolves replica names off its lock during a failover (a slow
+  DNS lookup no longer holds OUT/HELLO_OK handling).
+- `docker/Dockerfile` builds again on the current vLLM image (CUDA 13): UCX
+  1.20.0 (1.18.1 does not compile against CUDA 13), the NVML headers UCX
+  needs are installed from the image's CUDA repository, and Mooncake and
+  ucx-py are picked for the image's CUDA major version
+  (`UCX_PY_PKG`/`MOONCAKE_PKG=auto`; on CUDA 13 ucx-py is left out, no
+  build exists, it only serves the legacy UCX backend).
+  `VLLM_PRECOMPILED_WHEEL_LOCATION` lets the build use a pre-downloaded vLLM
+  wheel. Built (`BASE_IMAGE=vllm/vllm-openai:v0.31.0`) and run through
+  `deploy/k8s/manifests.py pipeline` on one node: 16/16 greedy requests, and
+  16/16 with the active stage-1 pod force-deleted, 0 of 9,600 tokens off the
+  argmax.
+- `CONNEX_PP_TRACE=1` also records worker step calls, chain completions,
+  failure events, aborts and a wall-clock anchor per file, so traces of
+  several hosts can be merged.
+
+**Performance**
+- `import connex` no longer imports torch, vLLM or UCX: the package
+  resolves its public names lazily. On one host, `import connex` went from
+  about 4.5 s to 30 ms, and `--help` of `connex-front-router`,
+  `connex-directory` and `connex-pd-router` from about 4.5 s to 0.08 to
+  0.2 s.
+- `docker/launch_stage.sh`: `KV_CACHE_MEMORY` passes
+  `--kv-cache-memory-bytes`, which skips vLLM's profiling passes; restart in
+  place of an 8B stage takes 24 s instead of 28 s.
+- PP stage restart: the READY announce goes to every remembered stage 0 in
+  parallel, newest first (a stale one no longer delays the live one), and
+  stage 0 logs `announced itself` when it was the announce that brought the
+  replica back (the old check read a field the stage never sends).
+- Tests: the PD group lease test no longer flakes on a loaded machine.
+
+**Cross-host round: fixes**
+- PP over connex-rs: UCX_NET_DEVICES is no longer pinned to the RDMA device
+  and its IPoIB interface when the endpoint's address is on another
+  interface (127.0.0.1, a pod or bridge network). The interface that carries
+  the address is listed too. Before, every connect on such an address
+  joined, failed with "Destination is unreachable" and failed again on
+  each retry (the push-channel tests hung on hosts whose default address is
+  not on IPoIB).
+- PP stage 0 re-resolves the host names of replicas it has lost
+  (`docker/launch_stage.sh` exports the names as `CONNEX_PP_STAGE_NAMES`).
+  A recreated downstream pod comes back under its Service name at a new IP.
+  Before, stage 0 kept sending HELLO to the old address, so the replica
+  never came back.
+- The HELLO that stage 0 sends while waiting for a replacement carries its
+  control URL, as the other HELLOs do.
+- `docker/Dockerfile` builds connex-rs v0.1.5 by default (was v0.1.0, whose
+  `put_chain` has no cancel word, so cross-host push was silently off).
+- `CONNEX_PP_TRACE=1` writes per-step timestamps through EXEC, stage server,
+  workers and OUT; `benchmarks/pp_upstream/trace_steps.py` merges them.
+- Tests: `test_launch_stage.py` no longer needs connex installed in the
+  interpreter (it passes the checkout on PYTHONPATH).
+
 **Full review: fixes**
 - Security: `connex.ucx_transport` no longer unpickles received payloads (a
   strict GDIR header parser; dtypes without a GDIR code go the bytes path

@@ -55,6 +55,11 @@ x-stage: &stage
     UCX_TLS: ${UCX_TLS:-tcp,sm,self,cuda_copy,cuda_ipc}
     UCX_WARN_UNUSED_ENV_VARS: "n"
     VLLM_USE_FLASHINFER_SAMPLER: "0"
+    # Key that authenticates the stages' control frames: CONNEX_PP_SECRET if
+    # exported, else generated once by the first stage in the volume all
+    # stages share.
+    CONNEX_PP_SECRET: ${CONNEX_PP_SECRET:-}
+    CONNEX_PP_SECRET_PATH: /root/.cache/huggingface/.connex-pp-secret
 
 services:
   # stage 1, replica 0 (preferred route) and replica 1 (spare)
