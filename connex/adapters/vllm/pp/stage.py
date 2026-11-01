@@ -122,7 +122,7 @@ class StageServer:
             tr("s_rx_" + kind, msg[1])
             self.q.put((peer, msg))
 
-    def _on_failed(self, peer, reason) -> None:
+    def _on_failed(self, peer, reason, ts=None) -> None:
         if self.owner_peer is not None and tuple(peer) == tuple(self.owner_peer):
             log.warning("connex-pp: owner %s of stage %d replica %d failed", self.owner,
                         self.stage, self.replica)

@@ -148,7 +148,10 @@ class ControlLink:
                 return
             if ev and ev.get("type") == "failed" and self.on_failed is not None:
                 try:
-                    self.on_failed(tuple(ev.get("peer") or ()), ev.get("reason"))
+                    ts = ev.get("ts_ns")
+                    # ts_ns is CLOCK_MONOTONIC, the clock of time.monotonic().
+                    self.on_failed(tuple(ev.get("peer") or ()), ev.get("reason"),
+                                   ts * 1e-9 if ts else None)
                 except Exception:  # noqa: BLE001
                     log.exception("connex-pp: failure handler failed")
 
@@ -424,11 +427,17 @@ class ConnexPPExecutor(MultiprocExecutor):
             threading.Thread(target=self._failover, args=(r, "busy"), name="cx-pp-failover",
                              daemon=True).start()
 
-    def _on_failed(self, peer: tuple, reason) -> None:
+    def _on_failed(self, peer: tuple, reason, ts: float | None = None) -> None:
         r = self._find(peer)
         if r is None:
             return
         tr("h_failed", self.seq)
+        if r.alive and ts is not None and ts < r.alive_since:
+            # Queued before the current incarnation answered HELLO: about an
+            # earlier one (or a failed connect attempt). No PING needed.
+            log.debug("connex-pp: dropping stale failure event for s%dr%d (%s)",
+                      r.stage, r.idx, reason)
+            return
         if (r.alive and time.monotonic() - r.alive_since < 30.0
                 and self._answers_ping(r, timeout=0.5)):
             # A late event about an earlier incarnation (a replica restarted
@@ -441,7 +450,11 @@ class ConnexPPExecutor(MultiprocExecutor):
         log.warning("connex-pp: replica s%dr%d failed (%s)", r.stage, r.idx, reason)
         with self.lock:
             r.alive = False
-        self._failover(r, f"peer failed: {reason}")
+        # Not on this (the failure event) thread: without a spare the
+        # failover waits up to replace_timeout for a replacement, and the
+        # failure events of other stages must not queue behind it.
+        threading.Thread(target=self._failover, args=(r, f"peer failed: {reason}"),
+                         name="cx-pp-failover", daemon=True).start()
 
     def _answers_ping(self, r: Replica, timeout: float = 1.5) -> bool:
         t = time.monotonic()
