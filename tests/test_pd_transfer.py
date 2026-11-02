@@ -281,3 +281,27 @@ def test_control_timeout_keeps_meta_but_restart_refreshes_it():
         assert ops.count("meta") == 2
     finally:
         cons.close(), prod.close()
+
+
+def test_control_sockets_are_reused_per_producer(monkeypatch):
+    """Issue #9: acquire/meta/release reuse a connected socket."""
+    src, dst, prod, cons, addr = make_pair(release_after_pull=True)
+    made = []
+    orig = cons._ctx.socket
+
+    class Ctx:
+        def socket(self, kind):
+            made.append(kind)
+            return orig(kind)
+    cons._ctx = Ctx()
+    try:
+        for i in range(5):
+            prod.hold(f"r{i}", f"t{i}", [1, 2])
+            cons.pull(f"r{i}", addr, f"t{i}", [0, 1])
+            assert wait_done(cons)[0].ok
+        assert len(made) <= cons._pool._max_workers      # was 3 per pull
+        prod.close()                                       # dead producer: timeout,
+        cons.pull("x", addr, "t0", [0])                   # socket dropped, not reused
+        assert wait_done(cons)[0].why == "producer unreachable"
+    finally:
+        cons.close()

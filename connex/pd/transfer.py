@@ -265,21 +265,36 @@ class KVConsumer:
         self._lock = threading.Lock()
         self._done: list[PullResult] = []
         self._ctx = zmq.Context.instance()
+        self._socks: dict[str, list] = {}     # idle control sockets per producer
+        self._closed = False
         self.stats = {"pulls": 0, "failed": 0, "bytes": 0, "seconds": 0.0}
 
     def _call(self, addr: str, msg: dict) -> Optional[dict]:
-        s = self._ctx.socket(zmq.REQ)
-        s.setsockopt(zmq.LINGER, 0)
-        s.setsockopt(zmq.RCVTIMEO, self.ctrl_timeout_ms)
-        s.setsockopt(zmq.SNDTIMEO, self.ctrl_timeout_ms)
-        try:
+        # Connected REQ sockets are pooled per producer (a new socket per
+        # call paid a TCP connect on every acquire/meta/release). A socket
+        # that timed out is stuck mid request/reply: closed, never reused.
+        with self._lock:
+            idle = self._socks.get(addr)
+            s = idle.pop() if idle else None
+        if s is None:
+            s = self._ctx.socket(zmq.REQ)
+            s.setsockopt(zmq.LINGER, 0)
+            s.setsockopt(zmq.RCVTIMEO, self.ctrl_timeout_ms)
+            s.setsockopt(zmq.SNDTIMEO, self.ctrl_timeout_ms)
             s.connect(f"tcp://{addr}")
+        try:
             s.send(_pack(msg))
-            return _unpack(s.recv())
+            rep = _unpack(s.recv())
         except zmq.ZMQError:
-            return None
-        finally:
             s.close(0)
+            return None
+        with self._lock:
+            if not self._closed:
+                self._socks.setdefault(addr, []).append(s)
+                s = None
+        if s is not None:
+            s.close(0)
+        return rep
 
     def peer_meta(self, addr: str, refresh: bool = False) -> Optional[_PeerMeta]:
         with self._lock:
@@ -297,6 +312,9 @@ class KVConsumer:
     def forget_peer(self, addr: str) -> None:
         with self._lock:
             self._meta.pop(addr, None)
+            socks = self._socks.pop(addr, [])
+        for s in socks:
+            s.close(0)
 
     def pull(self, req_id: str, addr: str, transfer_id: str, local_blocks: Sequence[int],
              first_block: int = 0,
@@ -460,3 +478,9 @@ class KVConsumer:
     def close(self) -> None:
         self._pool.shutdown(wait=True, cancel_futures=False)
         self._src_pool.shutdown(wait=True, cancel_futures=False)
+        with self._lock:
+            self._closed = True
+            socks, self._socks = self._socks, {}
+        for lst in socks.values():
+            for s in lst:
+                s.close(0)
