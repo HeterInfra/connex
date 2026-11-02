@@ -73,6 +73,9 @@ class HostStaging:
             self._starts.append(start)
             self._spans.append((start, n, dev, mirror))
         self._stream = torch.cuda.Stream(device=self.device)
+        # Built on the engine thread: its current stream is the engine's.
+        # stage_in runs on a pull thread, where that stream is not current.
+        self._engine_stream = torch.cuda.current_stream(self.device)
         log.info("connex PD: host staging of %d KV spans (%.1f GB pinned)", len(self._spans),
                  sum(n for _, n, _, _ in self._spans) / 1e9)
 
@@ -123,9 +126,13 @@ class HostStaging:
         return ev
 
     def stage_in(self, ranges) -> None:
-        """Copy mirror ranges to the device and wait (side stream)."""
+        """Copy mirror ranges to the device and wait (side stream). The copy
+        is ordered after the work already queued on the engine stream: a step
+        queued before the blocks were handed to this request (async
+        scheduling) may still write them; it must not land after the KV."""
         torch = self.torch
         with torch.cuda.device(self.device), torch.cuda.stream(self._stream):
+            self._stream.wait_stream(self._engine_stream)
             self._copy(ranges, to_host=False)
         self._stream.synchronize()
 
