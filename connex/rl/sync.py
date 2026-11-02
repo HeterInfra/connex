@@ -79,7 +79,7 @@ class WeightSubscriber:
     """One per engine worker. ``member`` is its logical id in the registry."""
 
     def __init__(self, registry, transport, member, device="cpu", chunk_bytes=DEFAULT_CHUNK,
-                 max_source_failures=16, heartbeat_s=2.0, window=4):
+                 max_source_failures=16, heartbeat_s=2.0, window=16):
         self.reg = registry
         self.t = transport
         self.member = member
@@ -166,12 +166,18 @@ class WeightSubscriber:
                     if src is None:
                         raise RuntimeError(f"no source holds version {version}")
                     sources.append(src["member"])
+                rolling = hasattr(self.t, "read_window")
                 ops = [(src["addr"] + off, off, min(self.chunk, m.total - off))
-                       for off in offs[i:i + self.window]]
+                       for off in (offs[i:] if rolling else offs[i:i + self.window])]
                 try:
-                    self.t.read_batch(src["url"], ops, self.arena)
+                    if rolling:     # keep `window` chunks in flight, no gap between batches
+                        self.t.read_window(src["url"], ops, self.arena, self.window)
+                    else:
+                        self.t.read_batch(src["url"], ops, self.arena)
                     i += len(ops)
                 except TransferError as e:
+                    if rolling:
+                        i += getattr(e, "done", 0)
                     failures += 1
                     log.warning("%s: read of v%d from %s failed (%s); switching source",
                                 self.member, version, src["member"], e)

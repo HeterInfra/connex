@@ -197,3 +197,27 @@ def test_pool_churn_join_and_failure():
         assert pool.stats["completed"] == 30 and pool.stats["failed"] == 0
         assert sorted(pool.slots) == ["r1", "r2"]
     asyncio.run(main())
+
+
+def test_rolling_read_resumes_after_the_completed_prefix():
+    """Issue #7: reads keep a rolling window in flight; after a source fails
+    the pull goes on from the first chunk that did not complete."""
+    reg, pub, subs = setup(2, fanout=1, chunk=256)
+    pub.publish(named(1))
+    subs[0].sync(lambda it: None)
+    v2 = pub.publish(named(2))
+    subs[0].sync(lambda it: None)
+    orig, calls = subs[1].t.read, [0]
+
+    def read(url, *a, **k):
+        calls[0] += 1
+        if calls[0] == 4:
+            subs[0].t.kill()
+        return orig(url, *a, **k)
+    subs[1].t.read = read
+    st = subs[1].sync(lambda it: None)
+    check(subs[1], v2)
+    nchunks = -(-subs[1].manifest.total // 256)
+    assert st["source_failures"] == 1
+    assert calls[0] == nchunks + 1          # 3 good chunks kept, 1 failed, the rest once
+

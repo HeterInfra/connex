@@ -88,6 +88,16 @@ class LocalTransport:
         for dst, ops in batches:
             self.read_batch(remote_url, ops, dst, timeout_ms)
 
+    def read_window(self, remote_url, ops, dst, window=16, timeout_ms=None):
+        """Read ``ops`` in order; on failure ``TransferError.done`` is the
+        number of leading ops that completed."""
+        for k, (remote_addr, dst_off, length) in enumerate(ops):
+            try:
+                self.read(remote_url, remote_addr, dst, dst_off, length, timeout_ms)
+            except TransferError as e:
+                e.done = k
+                raise
+
     def kill(self):
         """Simulate process death: further reads from this url fail."""
         with self._lock:
@@ -174,6 +184,41 @@ class ConnexRsTransport:
             raise TransferError(f"{remote_url}: {err}") from err
         self.reads += len(ops)
         self.bytes += sum(o[2] for o in ops)
+
+    def read_window(self, remote_url, ops, dst, window=16, timeout_ms=None):
+        """Read ``ops`` [(remote_addr, dst_off, len)] with up to ``window``
+        reads in flight, posting the next one as the oldest completes (no
+        idle link between batches, unlike ``read_batch`` in a loop). On
+        failure raises TransferError whose ``done`` is the number of
+        leading ops that completed (reads are idempotent: the caller goes
+        on from there, elsewhere)."""
+        base = dst.data_ptr()
+        to = timeout_ms or self.timeout_ms
+        inflight, err, done, nxt = [], None, 0, 0
+        while (nxt < len(ops) or inflight) and err is None:
+            try:
+                while nxt < len(ops) and len(inflight) < window:
+                    remote_addr, dst_off, length = ops[nxt]
+                    inflight.append(self.e.get_async(remote_url, base + dst_off, remote_addr,
+                                                     length, to))
+                    nxt += 1
+                if not inflight[0].wait(to + 1000):
+                    raise TimeoutError("read timed out")
+                inflight.pop(0)
+                done += 1
+            except Exception as ex:  # noqa: BLE001
+                err = ex
+        for h in inflight:          # let posted reads finish before the caller reuses dst
+            try:
+                h.wait(to + 1000)
+            except Exception:  # noqa: BLE001
+                pass
+        self.reads += done
+        self.bytes += sum(o[2] for o in ops[:done])
+        if err is not None:
+            e = TransferError(f"{remote_url}: {err}")
+            e.done = done
+            raise e from err
 
     def read_many(self, remote_url, batches, timeout_ms=None):
         """Like ``read_batch`` for several destination tensors: every read of
