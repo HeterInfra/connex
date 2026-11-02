@@ -305,3 +305,37 @@ def test_control_sockets_are_reused_per_producer(monkeypatch):
         assert wait_done(cons)[0].why == "producer unreachable"
     finally:
         cons.close()
+
+
+class _SlowEvent:
+    """A staged copy that completes ``delay`` seconds after it was queued."""
+
+    def __init__(self, delay):
+        self.t = time.monotonic() + delay
+
+    def query(self):
+        return time.monotonic() >= self.t
+
+    def synchronize(self):
+        time.sleep(max(0.0, self.t - time.monotonic()))
+
+
+def test_waiting_acquire_does_not_block_other_requests():
+    """Issue #11: an acquire that waits for its staged copy is answered when
+    the copy is done, without holding up other consumers' requests."""
+    src, dst, prod, cons, addr = make_pair()
+    try:
+        prod.hold("slow", "ts", [1])
+        prod._holds["ts"].ready = _SlowEvent(0.5)
+        prod.hold("fast", "tf", [2])
+        cons.pull("slow", addr, "ts", [0])
+        time.sleep(0.05)                           # the slow acquire is waiting
+        t0 = time.monotonic()
+        cons.pull("fast", addr, "tf", [1])
+        done = wait_done(cons)
+        assert done[0].req_id == "fast" and done[0].ok
+        assert time.monotonic() - t0 < 0.3         # was ~0.45 s (behind the slow one)
+        late = wait_done(cons)
+        assert late[0].req_id == "slow" and late[0].ok
+    finally:
+        cons.close(), prod.close()

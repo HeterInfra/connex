@@ -94,7 +94,9 @@ class KVProducer:
         else:
             self._staging = getattr(plane, "_connex_staging", None)
         self._ctx = zmq.Context.instance()
-        self._sock = self._ctx.socket(zmq.REP)
+        # ROUTER (REQ clients unchanged): replies that wait for a staged
+        # copy go out when it completes, without holding up other requests.
+        self._sock = self._ctx.socket(zmq.ROUTER)
         self._sock.setsockopt(zmq.LINGER, 0)
         if port:
             self._sock.bind(f"tcp://{bind_ip}:{port}")
@@ -195,18 +197,36 @@ class KVProducer:
     def _serve(self) -> None:
         poller = zmq.Poller()
         poller.register(self._sock, zmq.POLLIN)
+        waiting: list = []      # (event, envelope, reply): staged copy not done yet
         while not self._stop.is_set():
-            if not poller.poll(100):
-                continue
-            try:
-                msg = _unpack(self._sock.recv())
-                rep = self._handle(msg)
-                ev = rep.pop("_wait", None)
-                if ev is not None:
-                    ev.synchronize()   # staged copy done before the reader reads
-            except Exception as e:  # noqa: BLE001
-                rep = {"ok": False, "why": f"error: {e}"}
-            self._sock.send(_pack(rep))
+            if poller.poll(1 if waiting else 100):
+                frames = self._sock.recv_multipart()
+                env, body = frames[:-1], frames[-1]
+                try:
+                    rep = self._handle(_unpack(body))
+                    ev = rep.pop("_wait", None)
+                except Exception as e:  # noqa: BLE001
+                    rep, ev = {"ok": False, "why": f"error: {e}"}, None
+                if ev is not None and not self._ready(ev):
+                    waiting.append((ev, env, rep))   # staged copy done before the reader reads
+                else:
+                    self._sock.send_multipart(env + [_pack(rep)])
+            if waiting:
+                still = []
+                for ev, env, rep in waiting:
+                    if self._ready(ev):
+                        self._sock.send_multipart(env + [_pack(rep)])
+                    else:
+                        still.append((ev, env, rep))
+                waiting = still
+
+    @staticmethod
+    def _ready(ev) -> bool:
+        try:
+            return bool(ev.query())
+        except Exception:  # noqa: BLE001
+            ev.synchronize()
+            return True
 
     def close(self) -> None:
         self._stop.set()
