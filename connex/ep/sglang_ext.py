@@ -511,10 +511,8 @@ class SGLangEPWorker(ConnexEPWorker):
         rank = self._ep_rank()
         mine = [p for p in (slots or range(rank * S, (rank + 1) * S)) if p // S == rank]
         layers = self._expert_layers()
-        out = {str(p): float(sum(w[p % S].double().sum().item() for ps in layers for w in ps))
-               for p in mine}
-        torch.cuda.synchronize()
-        return out
+        from .vllm_ext import _slot_sums
+        return _slot_sums(layers, mine, S)
 
     def connex_ep_poison(self, slots="[]", value="nan"):
         import torch
