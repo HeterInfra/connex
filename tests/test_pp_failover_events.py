@@ -103,9 +103,24 @@ def test_step_timeout_follows_measured_steps():
     h.step_timeout, h.step_timeout_min = 60.0, 10.0
     h.step_times = __import__("collections").deque(maxlen=512)
     assert h.current_step_timeout() == 60.0
-    h.step_times.extend([0.03] * 40)
-    assert h.current_step_timeout() == 10.0
-    h.step_times.append(1.0)
-    assert h.current_step_timeout() == 20.0
-    h.step_times.append(5.0)
-    assert h.current_step_timeout() == 60.0
+    h.step_times.extend([(0.03, 64)] * 40)
+    assert h.current_step_timeout(64) == 10.0
+    h.step_times.append((1.0, 64))
+    assert h.current_step_timeout(64) == 20.0
+    h.step_times.append((5.0, 64))
+    assert h.current_step_timeout(64) == 60.0
+
+
+def test_step_timeout_compares_steps_of_the_same_size():
+    """Issue #18: after many small decode steps, a step larger than every
+    measured one (a long prefill) keeps the backstop instead of the 10 s
+    floor, so a healthy stage is not failed over."""
+    h = _head()
+    h.step_timeout, h.step_timeout_min = 60.0, 10.0
+    h.step_times = __import__("collections").deque(maxlen=512)
+    h.step_times.extend([(0.03, 32)] * 40)
+    assert h.current_step_timeout(32) == 10.0
+    assert h.current_step_timeout(8192) == 60.0       # never seen a step this large
+    h.step_times.append((1.5, 8192))
+    assert h.current_step_timeout(8192) == 30.0       # 20 x the slowest large step
+    assert h.current_step_timeout(32) == 30.0         # small steps: bounded by every step

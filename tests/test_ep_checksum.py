@@ -22,3 +22,19 @@ def test_slot_sums_match_per_expert_loop():
     for k in old:
         assert new[k] == pytest.approx(old[k], rel=1e-12, abs=1e-9)
     assert _slot_sums(layers, [], S) == {}
+
+
+def test_slot_sums_chunked_matches():
+    """Issue #19: slots are summed in chunks (bounded float64 transient);
+    a chunk of one slot gives the same values."""
+    g = torch.Generator().manual_seed(1)
+    S = 8
+    layers = [[torch.randn(S, 16, 4, generator=g).half(), torch.randn(S, 5, generator=g)]
+              for _ in range(3)]
+    slots = list(range(8, 16))              # rank 1 of S=8
+    old = _old(layers, slots, S)
+    for budget in (1, 16 * 4 * 8 * 3, 1 << 30):
+        new = _slot_sums(layers, slots, S, budget=budget)
+        assert new.keys() == old.keys()
+        for k in old:
+            assert new[k] == pytest.approx(old[k], rel=1e-12, abs=1e-9)

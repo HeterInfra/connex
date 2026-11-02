@@ -339,3 +339,29 @@ def test_waiting_acquire_does_not_block_other_requests():
         assert late[0].req_id == "slow" and late[0].ok
     finally:
         cons.close(), prod.close()
+
+
+def test_bad_control_reply_closes_socket():
+    """Issue #20: a reply that does not decode closes the pooled socket and
+    the call reports the producer as unreachable (None)."""
+    import threading
+    import zmq
+    src, dst, prod, cons, addr = make_pair()
+    ctx = zmq.Context.instance()
+    rep = ctx.socket(zmq.REP)
+    rep.setsockopt(zmq.LINGER, 0)
+    port = rep.bind_to_random_port("tcp://127.0.0.1")
+
+    def serve():
+        rep.recv()
+        rep.send(b"\xc1")                 # never valid msgpack
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    bad = f"127.0.0.1:{port}"
+    try:
+        assert cons._call(bad, {"op": "meta"}) is None
+        assert not cons._socks.get(bad)
+    finally:
+        t.join(5)
+        rep.close(0)
+        cons.close(), prod.close()

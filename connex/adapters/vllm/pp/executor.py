@@ -33,7 +33,9 @@ Configuration (stage 0):
                          one behind on the step, is failed over. Once 32
                          steps came back, the timeout is
                          max(CONNEX_PP_STEP_TIMEOUT_MIN_S (10), 20 x the
-                         slowest of the last 512 steps), at most this value
+                         slowest of the last 512 steps that scheduled at
+                         least as many tokens), at most this value; a step
+                         larger than all of them keeps this value
   CONNEX_PP_REPLACE_TIMEOUT_S how long to wait for a live replica (120)
 """
 
@@ -193,6 +195,7 @@ class Pending:
     output: ModelRunnerOutput | None = None
     t_send: float = 0.0
     lost: bool = False
+    tokens: int = 0             # scheduled tokens (the step timeout compares like with like)
 
 
 def pick_stuck(route: list, late: list, t_ping: float) -> tuple:
@@ -253,7 +256,7 @@ class ConnexPPExecutor(MultiprocExecutor):
         self.owner = f"{self.replica_id}:{os.getpid()}"
         self.step_timeout = float(os.getenv("CONNEX_PP_STEP_TIMEOUT_S", "60"))
         self.step_timeout_min = float(os.getenv("CONNEX_PP_STEP_TIMEOUT_MIN_S", "10"))
-        self.step_times: deque[float] = deque(maxlen=512)
+        self.step_times: deque[tuple[float, int]] = deque(maxlen=512)   # (seconds, tokens)
         self.replace_timeout = float(os.getenv("CONNEX_PP_REPLACE_TIMEOUT_S", "120"))
         self.max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.replicas: list[list[Replica]] = [
@@ -394,7 +397,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                 p.output = out
                 p.event.set()
                 if p.t_send:
-                    self.step_times.append(time.monotonic() - p.t_send)
+                    self.step_times.append((time.monotonic() - p.t_send, p.tokens))
             return
         r = self._find(peer)
         if r is None:
@@ -552,14 +555,21 @@ class ConnexPPExecutor(MultiprocExecutor):
         for u in [e for u in urls for e in u.split(";")]:
             threading.Thread(target=one, args=(u,), name="cx-pp-abort", daemon=True).start()
 
-    def current_step_timeout(self) -> float:
+    def current_step_timeout(self, tokens: int = 0) -> float:
         """A hung (not crashed) stage is found by its late step. The fixed
         backstop (60 s) is longer than client timeouts, so once enough steps
-        came back the limit follows the measured step time."""
+        came back the limit follows the measured step time, of steps at
+        least as large as this one (``tokens`` scheduled): after many small
+        decode steps, a long prefill is not a hang. A step larger than every
+        measured one keeps the backstop (a false failover recomputes every
+        request and quarantines a healthy stage)."""
         st = getattr(self, "step_times", None)
         if not st or len(st) < 32:
             return self.step_timeout
-        return min(self.step_timeout, max(self.step_timeout_min, 20.0 * max(st)))
+        slowest = max((dt for dt, tk in st if tk >= tokens), default=None)
+        if slowest is None:
+            return self.step_timeout
+        return min(self.step_timeout, max(self.step_timeout_min, 20.0 * slowest))
 
     def _rehello_down(self, now: float) -> None:
         """(Re)discover replicas that are down: a restarted one becomes a
@@ -578,9 +588,9 @@ class ConnexPPExecutor(MultiprocExecutor):
             self._rehello_down(time.monotonic())
             now = time.monotonic()
             with self.lock:
-                limit = self.current_step_timeout()
                 late = [p for p in self.pending.values()
-                        if not p.event.is_set() and now - p.t_send > limit]
+                        if not p.event.is_set()
+                        and now - p.t_send > self.current_step_timeout(p.tokens)]
                 route = list(self.route)
             if not late:
                 continue
@@ -625,7 +635,8 @@ class ConnexPPExecutor(MultiprocExecutor):
             self.live_reqs.difference_update(so.finished_req_ids)
             if forward:
                 self.await_sample.append(seq)
-                p = Pending(seq, epoch, list(so.num_scheduled_tokens), t_send=time.monotonic())
+                p = Pending(seq, epoch, list(so.num_scheduled_tokens), t_send=time.monotonic(),
+                            tokens=so.total_num_scheduled_tokens)
                 self.pending[seq] = p
                 if doomed:
                     p.lost = True

@@ -305,8 +305,10 @@ class KVConsumer:
         try:
             s.send(_pack(msg))
             rep = _unpack(s.recv())
-        except zmq.ZMQError:
+        except Exception as e:  # noqa: BLE001  timeout, or a reply that does not decode
             s.close(0)
+            if not isinstance(e, zmq.ZMQError):
+                log.warning("connex PD: bad control reply from %s: %s", addr, e)
             return None
         with self._lock:
             if not self._closed:
