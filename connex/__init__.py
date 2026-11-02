@@ -25,7 +25,7 @@ The pipeline-parallel core used with inference engines is ``connex.pp``
 proxy is ``connex.serving.proxy``.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 # Public names are resolved lazily (PEP 562) so that ``import connex`` and
 # ``import connex.<subpackage>`` do not pull in torch/vLLM/UCX up front.

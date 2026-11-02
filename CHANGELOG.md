@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
+
+Summary of the changes since 0.1.1: pipeline parallelism now runs on
+upstream vLLM through a plugin (no fork), with GPU-driven cross-host hops
+over connex-rs `put_chain`, same-host hops over CUDA IPC, one endpoint per
+TP rank, and faster failover and restart; tensor parallelism treats a TP
+group as one mobile endpoint with group-level recovery; `connex.ep` adds
+expert parallelism (MoE) with placement epochs, expert moves and EP-group
+failover on vLLM and SGLang; PD, TP and EP are validated across hosts and
+mixed GPUs; `import connex` no longer loads torch or vLLM; a full security
+and robustness review removed pickle from network receive paths and added
+control-frame HMAC and admin auth; `connex-ai[rs]` now requires
+`connex-rs>=0.1.6,<0.2`. Details follow.
 
 **connex-rs 0.1.6**
 - `connex-ai[rs]` requires `connex-rs>=0.1.6,<0.2` (fast connect, fenced
