@@ -41,9 +41,10 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# Client-side knobs.  Defaults keep historical behaviour (10 s heartbeat,
-# 5 s API timeout).  For fast failover use CONNEX_HEARTBEAT_INTERVAL_S=1 on
-# clients together with CONNEX_HEARTBEAT_TIMEOUT_S=3 on the Front Router.
+# Client-side knobs.  Defaults: 1 s heartbeat (matching the router's 3 s
+# lease, CONNEX_HEARTBEAT_TIMEOUT_S) and 5 s API timeout.  Earlier, the
+# heartbeat was 10 s: a client that sets CONNEX_HEARTBEAT_INTERVAL_S above a
+# third of the router lease is flagged unhealthy between heartbeats.
 ENV_HEARTBEAT_INTERVAL = "CONNEX_HEARTBEAT_INTERVAL_S"
 ENV_API_TIMEOUT_MS = "CONNEX_EPC_API_TIMEOUT_MS"
 ENV_HEARTBEAT_TIMEOUT_MS = "CONNEX_EPC_HEARTBEAT_TIMEOUT_MS"
@@ -213,7 +214,7 @@ class EPCV2ClientConfig:
     # Heartbeat configuration (env CONNEX_HEARTBEAT_INTERVAL_S overrides the
     # default; an explicit constructor value always wins).
     heartbeat_interval_s: float = field(
-        default_factory=lambda: _env_float(ENV_HEARTBEAT_INTERVAL, 10.0)
+        default_factory=lambda: _env_float(ENV_HEARTBEAT_INTERVAL, 1.0)
     )
     
     # Request timeouts.  On timeout the REQ socket is recreated (a REQ socket

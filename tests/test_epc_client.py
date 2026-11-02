@@ -436,6 +436,20 @@ def test_env_config(monkeypatch):
     from connex.front_router import MemberManager
     mm = MemberManager(RouteManager())
     assert mm.HEARTBEAT_TIMEOUT_S == 3.0 and mm.check_interval_s == 0.75
-    monkeypatch.delenv("CONNEX_HEARTBEAT_TIMEOUT_S")
+    monkeypatch.setenv("CONNEX_HEARTBEAT_TIMEOUT_S", "30")
     mm = MemberManager(RouteManager())
     assert mm.HEARTBEAT_TIMEOUT_S == 30.0 and mm.check_interval_s == 5.0
+
+
+def test_default_failure_detection_is_seconds(monkeypatch):
+    """Issue #6: by default a silent client is detected in ~3 s, not 30 s,
+    and the default client heartbeat fits the default lease."""
+    for k in ("CONNEX_HEARTBEAT_INTERVAL_S", "CONNEX_HEARTBEAT_TIMEOUT_S",
+              "CONNEX_UNHEALTHY_GRACE_S", "CONNEX_HEALTH_CHECK_INTERVAL_S"):
+        monkeypatch.delenv(k, raising=False)
+    from connex.front_router import MemberManager
+    mm = MemberManager(RouteManager())
+    hb = EPCV2ClientConfig().heartbeat_interval_s
+    assert mm.HEARTBEAT_TIMEOUT_S == 3.0 and mm.GRACE_PERIOD_S == 10.0
+    assert hb * 3 <= mm.HEARTBEAT_TIMEOUT_S
+    assert mm.HEARTBEAT_TIMEOUT_S + mm.check_interval_s <= 4.0

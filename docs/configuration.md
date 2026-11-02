@@ -78,10 +78,10 @@ the fork's extensions fail to load `libcudart`.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CONNEX_HEARTBEAT_TIMEOUT_S` | `30` | router: route lease; a stage without heartbeat is marked unhealthy |
-| `CONNEX_UNHEALTHY_GRACE_S` | `60` | router: keep unhealthy routes this long before removal |
+| `CONNEX_HEARTBEAT_TIMEOUT_S` | `3` | router: route lease; a stage without heartbeat is marked unhealthy |
+| `CONNEX_UNHEALTHY_GRACE_S` | `10` | router: keep unhealthy routes this long before removal |
 | `CONNEX_HEALTH_CHECK_INTERVAL_S` | `min(5, timeout/4)` | router: health sweep period |
-| `CONNEX_HEARTBEAT_INTERVAL_S` | `10` | client heartbeat period (use 0.5 with a 2 s router lease) |
+| `CONNEX_HEARTBEAT_INTERVAL_S` | `1` | client heartbeat period (at most a third of the router lease; 0.5 with a 2 s lease) |
 | `CONNEX_EPC_API_TIMEOUT_MS` | `5000` | client API request timeout |
 | `CONNEX_EPC_HEARTBEAT_TIMEOUT_MS` | `0` (= API timeout) | client heartbeat request timeout |
 | `CONNEXTE_FRONT_ROUTER_API`, `CONNEXTE_FRONT_ROUTER_EVENTS` | derived from `--pipeline-front-router-addr` | explicit router API / event addresses (`FRONT_ROUTER_API`/`FRONT_ROUTER_EVENTS` also accepted) |

@@ -42,9 +42,10 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# Failure-detection knobs (router side). Defaults keep the historical
-# behaviour (30 s timeout, 60 s grace). For fast failover set e.g.
-#   CONNEX_HEARTBEAT_TIMEOUT_S=3  (with client CONNEX_HEARTBEAT_INTERVAL_S=1)
+# Failure-detection knobs (router side). Defaults: 3 s timeout (clients
+# heartbeat every 1 s), 10 s grace. Earlier they were 30 s and 60 s,
+# with 10 s client heartbeats; set CONNEX_HEARTBEAT_TIMEOUT_S=30 for old
+# clients that still heartbeat every 10 s.
 # The check interval defaults to min(5 s, timeout / 4) so detection latency
 # is bounded by roughly timeout * 1.25 instead of timeout + 5 s.
 ENV_HEARTBEAT_TIMEOUT = "CONNEX_HEARTBEAT_TIMEOUT_S"
@@ -496,7 +497,7 @@ class RouteManager:
                         self._persistence.delete(f"routes/{key}")
         return newly_unhealthy, removed
     
-    def get_unhealthy_routes(self, timeout_s: float = 30.0) -> List[RouteEntry]:
+    def get_unhealthy_routes(self, timeout_s: float = 3.0) -> List[RouteEntry]:
         """Get ACTIVE routes that haven't sent heartbeat within timeout."""
         cutoff = time.time() - timeout_s
         with self._lock:
@@ -575,15 +576,15 @@ class MemberManager:
     """Manages endpoint membership with heartbeat tracking.
 
     Timing is configurable per instance (constructor args) or via env:
-    ``CONNEX_HEARTBEAT_TIMEOUT_S`` (default 30), ``CONNEX_UNHEALTHY_GRACE_S``
-    (default 60) and ``CONNEX_HEALTH_CHECK_INTERVAL_S`` (default
+    ``CONNEX_HEARTBEAT_TIMEOUT_S`` (default 3), ``CONNEX_UNHEALTHY_GRACE_S``
+    (default 10) and ``CONNEX_HEALTH_CHECK_INTERVAL_S`` (default
     min(5, timeout/4)).  Worst-case detection latency is
-    ``timeout + check_interval``.  Recommended fast-failover setting:
-    client interval 1 s, router timeout 3 s (check interval 0.75 s).
+    ``timeout + check_interval``.  The defaults are the fast-failover
+    setting: client interval 1 s, router timeout 3 s (check interval 0.75 s).
     """
     
-    HEARTBEAT_TIMEOUT_S = 30.0
-    GRACE_PERIOD_S = 60.0  # Keep route after unhealthy before removal
+    HEARTBEAT_TIMEOUT_S = 3.0
+    GRACE_PERIOD_S = 10.0  # Keep route after unhealthy before removal
     
     def __init__(
         self,
