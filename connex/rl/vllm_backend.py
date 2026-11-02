@@ -98,7 +98,7 @@ class ConnexWeightTransferEngine(
         # sync the worker's own device before offering the copy; a bare
         # torch.accelerator.synchronize() fails on CPU-only workers
         if torch.device(self.device).type == "cuda":
-            torch.cuda.synchronize(self.device)
+            torch.cuda.current_stream(self.device).synchronize()
         self.sub.commit(m.version)
         self.last_stats = dict(self.sub.stats)
 

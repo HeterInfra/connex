@@ -29,6 +29,15 @@ log = logging.getLogger("connex.rl")
 DEFAULT_CHUNK = 64 << 20
 
 
+def _stream_sync(t):
+    """Wait for the work queued so far on the current stream of ``t``'s
+    device (not the whole device: the engine's other streams keep running)."""
+    if t is not None and t.is_cuda:
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(t.device))
+        ev.synchronize()
+
+
 class WeightPublisher:
     def __init__(self, registry, transport, device="cpu", buffers=2, idle_timeout=30.0):
         self.reg = registry
@@ -68,8 +77,7 @@ class WeightPublisher:
             self.t.register(a)
             self.arenas.append([a, None])
         pack_into(a, m, named)
-        if a.is_cuda:
-            torch.cuda.synchronize(a.device)
+        _stream_sync(a)
         self.arenas[slot][1] = v
         self.reg.publish(version=v, manifest=m.to_dict(), url=self.t.url, addr=a.data_ptr())
         self.version, self.manifest = v, m
@@ -148,8 +156,6 @@ class WeightSubscriber:
                         "reading again", self.member, version)
         else:
             raise RuntimeError(f"v{version}: sources kept changing during the read")
-        if self.arena.is_cuda:
-            torch.cuda.synchronize(self.arena.device)
         self.manifest = m
         self.stats = {"version": version, "bytes": m.total, "pull_s": time.perf_counter() - t0,
                       "sources": sources, "source_failures": failures}
@@ -167,6 +173,9 @@ class WeightSubscriber:
                 self.t.unregister(self.arena)
             self.arena = torch.empty(m.total, dtype=torch.uint8, device=self.device,
                                      pin_memory=self.pin)
+            # The NIC writes outside any stream: kernels queued on the
+            # memory's previous user (caching allocator) must be done first.
+            _stream_sync(self.arena)
             self.t.register(self.arena)
         offs = list(range(0, m.total, self.chunk))
         stale = False
@@ -236,8 +245,7 @@ class WeightSubscriber:
         m = self.pull(version)
         t0 = time.perf_counter()
         apply(self.tensors())
-        if self.arena.is_cuda:
-            torch.cuda.synchronize(self.arena.device)
+        _stream_sync(self.arena)
         self.stats["apply_s"] = time.perf_counter() - t0
         self.commit(m.version)
         return self.stats

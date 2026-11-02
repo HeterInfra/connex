@@ -82,6 +82,6 @@ def connex_load(model, named_tensors):
     m = sub.pull(ctl.get("version"))
     model.load_weights(list(sub.tensors()))
     if dev.type == "cuda":
-        torch.cuda.synchronize()
+        torch.cuda.current_stream(dev).synchronize()   # the loads, not the whole device
     sub.commit(m.version)
     last_stats = dict(sub.stats)
