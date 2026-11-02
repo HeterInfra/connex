@@ -326,7 +326,7 @@ def test_waiting_acquire_does_not_block_other_requests():
     src, dst, prod, cons, addr = make_pair()
     try:
         prod.hold("slow", "ts", [1])
-        prod._holds["ts"].ready = _SlowEvent(0.5)
+        prod._holds["ts"].ready = _SlowEvent(0.3)       # under the 500 ms control timeout
         prod.hold("fast", "tf", [2])
         cons.pull("slow", addr, "ts", [0])
         time.sleep(0.05)                           # the slow acquire is waiting
@@ -334,7 +334,7 @@ def test_waiting_acquire_does_not_block_other_requests():
         cons.pull("fast", addr, "tf", [1])
         done = wait_done(cons)
         assert done[0].req_id == "fast" and done[0].ok
-        assert time.monotonic() - t0 < 0.3         # was ~0.45 s (behind the slow one)
+        assert time.monotonic() - t0 < 0.15        # was ~0.25 s (behind the slow one)
         late = wait_done(cons)
         assert late[0].req_id == "slow" and late[0].ok
     finally:
