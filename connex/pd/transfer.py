@@ -75,6 +75,10 @@ class KVProducer:
         self.layouts = list(layouts)
         self.retain_s = retain_s
         self.engine_id = engine_id
+        # Incarnation of this producer: sent with meta and every acquire, so
+        # a consumer can keep cached meta across a control timeout and still
+        # notice a restart at the same address.
+        self.inc = os.urandom(8).hex()
         self.block_size = block_size
         self.device = device
         self._holds: dict[str, _Hold] = {}
@@ -90,7 +94,9 @@ class KVProducer:
         else:
             self._staging = getattr(plane, "_connex_staging", None)
         self._ctx = zmq.Context.instance()
-        self._sock = self._ctx.socket(zmq.REP)
+        # ROUTER (REQ clients unchanged): replies that wait for a staged
+        # copy go out when it completes, without holding up other requests.
+        self._sock = self._ctx.socket(zmq.ROUTER)
         self._sock.setsockopt(zmq.LINGER, 0)
         if port:
             self._sock.bind(f"tcp://{bind_ip}:{port}")
@@ -142,7 +148,7 @@ class KVProducer:
     def _handle(self, m: dict) -> dict:
         op = m.get("op")
         if op == "meta":
-            return {"ok": True, "v": PROTO_VERSION, "url": self.plane.local_url,
+            return {"ok": True, "v": PROTO_VERSION, "inc": self.inc, "url": self.plane.local_url,
                     "backend": self.plane.name, "engine_id": self.engine_id,
                     "block_size": self.block_size, "device": self.device,
                     "layouts": [(self._staging.translate(lo) if self._staging else lo).to_dict()
@@ -159,7 +165,7 @@ class KVProducer:
                     h.owner = m.get("who")
                 h.deadline = time.monotonic() + self.retain_s
                 self.stats["acquires"] += 1
-                return {"ok": True, "blocks": h.blocks, "_wait": h.ready}
+                return {"ok": True, "blocks": h.blocks, "inc": self.inc, "_wait": h.ready}
             if op == "release":
                 self.stats["releases"] += 1
                 # several decode TP ranks may read this rank (decode TP larger
@@ -191,18 +197,36 @@ class KVProducer:
     def _serve(self) -> None:
         poller = zmq.Poller()
         poller.register(self._sock, zmq.POLLIN)
+        waiting: list = []      # (event, envelope, reply): staged copy not done yet
         while not self._stop.is_set():
-            if not poller.poll(100):
-                continue
-            try:
-                msg = _unpack(self._sock.recv())
-                rep = self._handle(msg)
-                ev = rep.pop("_wait", None)
-                if ev is not None:
-                    ev.synchronize()   # staged copy done before the reader reads
-            except Exception as e:  # noqa: BLE001
-                rep = {"ok": False, "why": f"error: {e}"}
-            self._sock.send(_pack(rep))
+            if poller.poll(1 if waiting else 100):
+                frames = self._sock.recv_multipart()
+                env, body = frames[:-1], frames[-1]
+                try:
+                    rep = self._handle(_unpack(body))
+                    ev = rep.pop("_wait", None)
+                except Exception as e:  # noqa: BLE001
+                    rep, ev = {"ok": False, "why": f"error: {e}"}, None
+                if ev is not None and not self._ready(ev):
+                    waiting.append((ev, env, rep))   # staged copy done before the reader reads
+                else:
+                    self._sock.send_multipart(env + [_pack(rep)])
+            if waiting:
+                still = []
+                for ev, env, rep in waiting:
+                    if self._ready(ev):
+                        self._sock.send_multipart(env + [_pack(rep)])
+                    else:
+                        still.append((ev, env, rep))
+                waiting = still
+
+    @staticmethod
+    def _ready(ev) -> bool:
+        try:
+            return bool(ev.query())
+        except Exception:  # noqa: BLE001
+            ev.synchronize()
+            return True
 
     def close(self) -> None:
         self._stop.set()
@@ -225,6 +249,7 @@ class _PeerMeta:
         self.url = d["url"]
         self.backend = d.get("backend")
         self.engine_id = d.get("engine_id")
+        self.inc = d.get("inc")
         self.block_size = d.get("block_size", 0)
         self.device = d.get("device", "")
         self.layouts = [TensorLayout.from_dict(x) for x in d["layouts"]]
@@ -254,25 +279,44 @@ class KVConsumer:
         else:
             self._staging = getattr(plane, "_connex_staging", None)
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="connex-pd-pull")
+        self._src_pool = ThreadPoolExecutor(max_workers=max(8, 2 * workers),
+                                            thread_name_prefix="connex-pd-src")
         self._meta: dict[str, _PeerMeta] = {}
         self._lock = threading.Lock()
         self._done: list[PullResult] = []
         self._ctx = zmq.Context.instance()
+        self._socks: dict[str, list] = {}     # idle control sockets per producer
+        self._closed = False
         self.stats = {"pulls": 0, "failed": 0, "bytes": 0, "seconds": 0.0}
 
     def _call(self, addr: str, msg: dict) -> Optional[dict]:
-        s = self._ctx.socket(zmq.REQ)
-        s.setsockopt(zmq.LINGER, 0)
-        s.setsockopt(zmq.RCVTIMEO, self.ctrl_timeout_ms)
-        s.setsockopt(zmq.SNDTIMEO, self.ctrl_timeout_ms)
-        try:
+        # Connected REQ sockets are pooled per producer (a new socket per
+        # call paid a TCP connect on every acquire/meta/release). A socket
+        # that timed out is stuck mid request/reply: closed, never reused.
+        with self._lock:
+            idle = self._socks.get(addr)
+            s = idle.pop() if idle else None
+        if s is None:
+            s = self._ctx.socket(zmq.REQ)
+            s.setsockopt(zmq.LINGER, 0)
+            s.setsockopt(zmq.RCVTIMEO, self.ctrl_timeout_ms)
+            s.setsockopt(zmq.SNDTIMEO, self.ctrl_timeout_ms)
             s.connect(f"tcp://{addr}")
+        try:
             s.send(_pack(msg))
-            return _unpack(s.recv())
-        except zmq.ZMQError:
-            return None
-        finally:
+            rep = _unpack(s.recv())
+        except Exception as e:  # noqa: BLE001  timeout, or a reply that does not decode
             s.close(0)
+            if not isinstance(e, zmq.ZMQError):
+                log.warning("connex PD: bad control reply from %s: %s", addr, e)
+            return None
+        with self._lock:
+            if not self._closed:
+                self._socks.setdefault(addr, []).append(s)
+                s = None
+        if s is not None:
+            s.close(0)
+        return rep
 
     def peer_meta(self, addr: str, refresh: bool = False) -> Optional[_PeerMeta]:
         with self._lock:
@@ -290,6 +334,9 @@ class KVConsumer:
     def forget_peer(self, addr: str) -> None:
         with self._lock:
             self._meta.pop(addr, None)
+            socks = self._socks.pop(addr, [])
+        for s in socks:
+            s.close(0)
 
     def pull(self, req_id: str, addr: str, transfer_id: str, local_blocks: Sequence[int],
              first_block: int = 0,
@@ -328,9 +375,19 @@ class KVConsumer:
     def _pull_sources(self, req_id, sources, tid, local, first, t0) -> PullResult:
         if self.inject_delay_s:
             time.sleep(self.inject_delay_s)
+        # One read per remote TP rank, all at once (each is a separate
+        # producer: its control round trips and RDMA overlap). Not on
+        # self._pool: this runs on it, and waiting there for its own
+        # queue could deadlock when every worker does the same.
+        if len(sources) == 1:
+            results = [self._pull_inner(req_id, sources[0][0], tid, local, first, t0,
+                                        src=sources[0][1], delay=False)]
+        else:
+            futs = [self._src_pool.submit(self._pull_inner, req_id, addr, tid, local, first, t0,
+                                          src=src, delay=False) for addr, src in sources]
+            results = [f.result() for f in futs]
         nbytes = 0
-        for addr, src in sources:
-            r = self._pull_inner(req_id, addr, tid, local, first, t0, src=src, delay=False)
+        for (addr, src), r in zip(sources, results):
             if not r.ok:
                 r.why = f"TP rank {src.remote_rank} ({addr}): {r.why}"
                 return r
@@ -353,7 +410,13 @@ class KVConsumer:
             time.sleep(delay)
             delay = min(delay * 2, 0.05)
         if r is None:
-            self.forget_peer(addr)
+            # A control timeout alone says nothing about the metadata: keep
+            # it when the producer reports its incarnation (a restart shows
+            # up as a new one on the next acquire); older producers do not.
+            with self._lock:
+                m = self._meta.get(addr)
+            if m is None or not m.inc:
+                self.forget_peer(addr)
             return PullResult(req_id, False, "producer unreachable")
         if not r.get("ok"):
             return PullResult(req_id, False, f"producer: {r.get('why')}")
@@ -365,6 +428,8 @@ class KVConsumer:
             return PullResult(req_id, False, f"producer holds {len(remote_all)} blocks, "
                                              f"need {first + len(local)}")
         meta = self.peer_meta(addr)
+        if meta is not None and r.get("inc") and meta.inc != r["inc"]:
+            meta = self.peer_meta(addr, refresh=True)    # restarted at the same address
         if meta is None:
             return PullResult(req_id, False, "producer meta unavailable")
         if self.block_size and meta.block_size and meta.block_size != self.block_size:
@@ -434,3 +499,10 @@ class KVConsumer:
 
     def close(self) -> None:
         self._pool.shutdown(wait=True, cancel_futures=False)
+        self._src_pool.shutdown(wait=True, cancel_futures=False)
+        with self._lock:
+            self._closed = True
+            socks, self._socks = self._socks, {}
+        for lst in socks.values():
+            for s in lst:
+                s.close(0)

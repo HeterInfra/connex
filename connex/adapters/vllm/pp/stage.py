@@ -122,7 +122,7 @@ class StageServer:
             tr("s_rx_" + kind, msg[1])
             self.q.put((peer, msg))
 
-    def _on_failed(self, peer, reason) -> None:
+    def _on_failed(self, peer, reason, ts=None) -> None:
         if self.owner_peer is not None and tuple(peer) == tuple(self.owner_peer):
             log.warning("connex-pp: owner %s of stage %d replica %d failed", self.owner,
                         self.stage, self.replica)
@@ -240,12 +240,50 @@ class StageServer:
                 tr("s_out_sent!", seq)
 
 
+def _proc_age() -> float | None:
+    """Seconds since this process started (Linux), or None."""
+    try:
+        with open("/proc/self/stat") as f:
+            start = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        return up - start / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+class _Phases:
+    """Startup timeline of the stage process: one log line at the end, so a
+    slow restart in place can be attributed (restart time bounds recovery
+    without a spare)."""
+
+    def __init__(self):
+        self.t0 = time.monotonic()
+        age = _proc_age()
+        self.base = (age or 0.0)   # time spent before main() (interpreter, imports)
+        self.marks: list[tuple[str, float]] = [("process start -> main", self.base)]
+        self.last = self.t0
+
+    def mark(self, name: str) -> None:
+        now = time.monotonic()
+        self.marks.append((name, now - self.last))
+        self.last = now
+
+    def total(self) -> float:
+        return self.base + (self.last - self.t0)
+
+    def line(self) -> str:
+        return ", ".join(f"{n} {d:.1f}s" for n, d in self.marks) + f"; total {self.total():.1f}s"
+
+
 def main(argv: list[str] | None = None) -> None:
+    ph = _Phases()
     from vllm.engine.arg_utils import EngineArgs
     from vllm.usage.usage_lib import UsageContext
     from vllm.utils.argparse_utils import FlexibleArgumentParser
     from vllm.v1.engine.core import EngineCore
     from vllm.v1.executor import Executor
+    ph.mark("vllm imports")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     parser = FlexibleArgumentParser(description="Connex pipeline stage server")
@@ -258,13 +296,19 @@ def main(argv: list[str] | None = None) -> None:
     if engine_args.pipeline_stage_rank in (None, 0):
         sys.exit("the stage server runs stages 1..N-1 (--pipeline-stage-rank k >= 1)")
     vllm_config = engine_args.create_engine_config(UsageContext.ENGINE_CONTEXT)
+    ph.mark("engine config")
     core = EngineCore(vllm_config, Executor.get_class(vllm_config), log_stats=False,
                       executor_fail_callback=lambda: os._exit(1))
+    ph.mark("engine core (workers, model load, KV cache, graphs)")
     server = StageServer(core, vllm_config, args.connex_control_port, args.connex_replica)
+    ph.mark("control link")
     signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     print(f"CONNEX_PP_STAGE_READY stage={server.stage} replica={args.connex_replica} "
           f"control={server.ctl.url}", flush=True)
     server.announce()
+    ph.mark("announce")
+    log.info("connex-pp: stage %d replica %d startup: %s", server.stage, args.connex_replica,
+             ph.line())
     server.serve_forever()
 
 

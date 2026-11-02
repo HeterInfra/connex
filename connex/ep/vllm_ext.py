@@ -111,6 +111,31 @@ def enable_olmoe_eplb():
 enable_olmoe_eplb()
 
 
+
+def _slot_sums(layers, slots, S, budget=64 << 20):
+    """float64 sum of every MoE layer's weights per global slot, computed on
+    the device and copied back once (one .item() per expert per layer was
+    thousands of device syncs). Slots go in chunks of at most ``budget``
+    bytes of float64: all slots of a layer at once would need a float64
+    copy of the whole rank's experts (GBs on a live engine)."""
+    import torch
+    if not slots:
+        return {}
+    acc = None
+    for ps in layers:
+        for w in ps:
+            per = max(1, w[0].numel() * 8)          # float64 bytes of one slot
+            k = max(1, budget // per)
+            parts = []
+            for j in range(0, len(slots), k):
+                idx = torch.tensor([p % S for p in slots[j:j + k]], device=w.device)
+                parts.append(w.index_select(0, idx).double().reshape(len(idx), -1).sum(1))
+            part = torch.cat(parts) if len(parts) > 1 else parts[0]
+            acc = part if acc is None else acc + part.to(acc.device)
+    vals = acc.tolist() if acc is not None else [0.0] * len(slots)
+    return {str(p): float(v) for p, v in zip(slots, vals)}
+
+
 class ConnexEPWorker:
     """Mixed into vLLM's worker (``--worker-extension-cls``)."""
 
@@ -285,12 +310,7 @@ class ConnexEPWorker:
         rank = self._ep_rank()
         mine = [p for p in (slots or range(rank * S, (rank + 1) * S)) if p // S == rank]
         layers = [list(m.get_expert_weights()) for m in ms.model.moe_layers]
-        out = {}
-        for p in mine:
-            i = p % S
-            out[str(p)] = float(sum(w[i].double().sum().item() for ps in layers for w in ps))
-        torch.cuda.synchronize()
-        return out
+        return _slot_sums(layers, mine, S)
 
     def connex_ep_poison(self, slots="[]", value="nan"):
         """Overwrite the given global slots of this rank with ``value``

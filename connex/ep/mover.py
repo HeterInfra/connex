@@ -186,7 +186,8 @@ class ExpertStore:
         if any(m.dst // slots_per_rank == self.rank for m in moves):
             dev = self.layers[0][0].device if self.layers else None
             if dev is not None and dev.type == "cuda":
-                torch.cuda.synchronize(dev)
+                # the local copies above; RDMA reads are complete on return
+                torch.cuda.current_stream(dev).synchronize()
         self.stats["seconds"] += time.perf_counter() - t0
         self.stats["moves"] += len(mine)
         return out
@@ -204,7 +205,7 @@ class ExpertStore:
             # a peer-to-peer copy is ordered on the source device's stream:
             # wait for it there too, or "done" could precede the bytes
             for d in devs:
-                torch.cuda.synchronize(d)
+                torch.cuda.current_stream(d).synchronize()
             self.stats["ipc_bytes"] += sum(rb for m in moves for _, rb in peer["layers"][m.layer])
             return
         url = peer["url"]

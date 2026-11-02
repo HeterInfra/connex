@@ -197,3 +197,55 @@ def test_pool_churn_join_and_failure():
         assert pool.stats["completed"] == 30 and pool.stats["failed"] == 0
         assert sorted(pool.slots) == ["r1", "r2"]
     asyncio.run(main())
+
+
+def test_rolling_read_resumes_after_the_completed_prefix():
+    """Issue #7: reads keep a rolling window in flight; after a source fails
+    the pull goes on from the first chunk that did not complete."""
+    reg, pub, subs = setup(2, fanout=1, chunk=256)
+    pub.publish(named(1))
+    subs[0].sync(lambda it: None)
+    v2 = pub.publish(named(2))
+    subs[0].sync(lambda it: None)
+    orig, calls = subs[1].t.read, [0]
+
+    def read(url, *a, **k):
+        calls[0] += 1
+        if calls[0] == 4:
+            subs[0].t.kill()
+        return orig(url, *a, **k)
+    subs[1].t.read = read
+    st = subs[1].sync(lambda it: None)
+    check(subs[1], v2)
+    nchunks = -(-subs[1].manifest.total // 256)
+    assert st["source_failures"] == 1
+    assert calls[0] == nchunks + 1          # 3 good chunks kept, 1 failed, the rest once
+
+
+def test_non_relay_member_frees_its_arena_after_apply():
+    """Issue #10: a member that does not relay keeps no second full copy of
+    the weights after apply, and is not handed out as a source."""
+    reg = WeightRegistry(fanout=2)
+    pub = WeightPublisher(reg, LocalTransport("nr-trainer"))
+    sub = WeightSubscriber(reg, LocalTransport("nr-e0"), "e0", chunk_bytes=512,
+                           heartbeat_s=0, relay=False)
+    got = {}
+    v = pub.publish(named(1))
+    sub.sync(lambda it: got.update({n: t.clone() for n, t in it}))
+    assert sub.arena is None and sub.version == v
+    assert reg.status()["members"]["e0"] == v
+    assert "e0" not in reg.status()["holders"][str(v)]
+    for n, t in named(1):
+        assert torch.equal(got[n], t)
+    v2 = pub.publish(named(2))
+    sub.sync(lambda it: None)                 # pulls again into a fresh arena
+    assert sub.version == v2 and sub.arena is None
+
+
+def test_host_arena_option(monkeypatch):
+    monkeypatch.setenv("CONNEX_RL_ARENA", "host")
+    reg = WeightRegistry(fanout=2)
+    sub = WeightSubscriber(reg, LocalTransport("ha-e0"), "e0", device="cuda:0", heartbeat_s=0)
+    assert sub.device.type == "cpu"
+    with pytest.raises(ValueError):
+        WeightSubscriber(reg, LocalTransport("ha-e1"), "e1", heartbeat_s=0, arena="nvme")

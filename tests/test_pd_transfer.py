@@ -248,3 +248,120 @@ def test_host_staging_reads_go_through_the_mirrors(monkeypatch):
         assert cons._staging.staged_in == 1
     finally:
         cons.close(), prod.close()
+
+
+def test_control_timeout_keeps_meta_but_restart_refreshes_it():
+    """Issue #5: one control timeout does not cost a meta round trip on the
+    next pull; a producer restart at the same address still refreshes it."""
+    src, dst, prod, cons, addr = make_pair()
+    ops, orig = [], cons._call
+    drop = {"n": 0}
+
+    def call(a, msg):
+        ops.append(msg["op"])
+        if drop["n"]:
+            drop["n"] -= 1
+            return None                                   # control timeout
+        return orig(a, msg)
+    cons._call = call
+    try:
+        prod.hold("r1", "t1", [1, 2])
+        cons.pull("r1", addr, "t1", [0, 1])
+        assert wait_done(cons)[0].ok
+        assert ops.count("meta") == 1
+        drop["n"] = 1
+        cons.pull("r2", addr, "t1", [0, 1])
+        assert wait_done(cons)[0].why == "producer unreachable"
+        cons.pull("r3", addr, "t1", [0, 1])
+        assert wait_done(cons)[0].ok
+        assert ops.count("meta") == 1                     # was 2 before
+        prod.inc = "restarted"
+        cons.pull("r4", addr, "t1", [0, 1])
+        assert wait_done(cons)[0].ok
+        assert ops.count("meta") == 2
+    finally:
+        cons.close(), prod.close()
+
+
+def test_control_sockets_are_reused_per_producer(monkeypatch):
+    """Issue #9: acquire/meta/release reuse a connected socket."""
+    src, dst, prod, cons, addr = make_pair(release_after_pull=True)
+    made = []
+    orig = cons._ctx.socket
+
+    class Ctx:
+        def socket(self, kind):
+            made.append(kind)
+            return orig(kind)
+    cons._ctx = Ctx()
+    try:
+        for i in range(5):
+            prod.hold(f"r{i}", f"t{i}", [1, 2])
+            cons.pull(f"r{i}", addr, f"t{i}", [0, 1])
+            assert wait_done(cons)[0].ok
+        assert len(made) <= cons._pool._max_workers      # was 3 per pull
+        prod.close()                                       # dead producer: timeout,
+        cons.pull("x", addr, "t0", [0])                   # socket dropped, not reused
+        assert wait_done(cons)[0].why == "producer unreachable"
+    finally:
+        cons.close()
+
+
+class _SlowEvent:
+    """A staged copy that completes ``delay`` seconds after it was queued."""
+
+    def __init__(self, delay):
+        self.t = time.monotonic() + delay
+
+    def query(self):
+        return time.monotonic() >= self.t
+
+    def synchronize(self):
+        time.sleep(max(0.0, self.t - time.monotonic()))
+
+
+def test_waiting_acquire_does_not_block_other_requests():
+    """Issue #11: an acquire that waits for its staged copy is answered when
+    the copy is done, without holding up other consumers' requests."""
+    src, dst, prod, cons, addr = make_pair()
+    try:
+        prod.hold("slow", "ts", [1])
+        prod._holds["ts"].ready = _SlowEvent(0.3)       # under the 500 ms control timeout
+        prod.hold("fast", "tf", [2])
+        cons.pull("slow", addr, "ts", [0])
+        time.sleep(0.05)                           # the slow acquire is waiting
+        t0 = time.monotonic()
+        cons.pull("fast", addr, "tf", [1])
+        done = wait_done(cons)
+        assert done[0].req_id == "fast" and done[0].ok
+        assert time.monotonic() - t0 < 0.15        # was ~0.25 s (behind the slow one)
+        late = wait_done(cons)
+        assert late[0].req_id == "slow" and late[0].ok
+    finally:
+        cons.close(), prod.close()
+
+
+def test_bad_control_reply_closes_socket():
+    """Issue #20: a reply that does not decode closes the pooled socket and
+    the call reports the producer as unreachable (None)."""
+    import threading
+    import zmq
+    src, dst, prod, cons, addr = make_pair()
+    ctx = zmq.Context.instance()
+    rep = ctx.socket(zmq.REP)
+    rep.setsockopt(zmq.LINGER, 0)
+    port = rep.bind_to_random_port("tcp://127.0.0.1")
+
+    def serve():
+        rep.recv()
+        rep.send(b"\xc1")                 # never valid msgpack
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    bad = f"127.0.0.1:{port}"
+    try:
+        assert cons._call(bad, {"op": "meta"}) is None
+        assert not cons._socks.get(bad)
+    finally:
+        t.join(5)
+        rep.close(0)
+        cons.close(), prod.close()

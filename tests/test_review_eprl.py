@@ -103,3 +103,28 @@ def test_idle_sessions_expire():
     p._next_sweep = 0.0
     p.get_session("b")
     assert set(p.sessions) == {"b"}
+
+
+def test_no_new_reader_of_a_copy_being_overwritten():
+    """Issue #4: after the publisher's wait for idle readers times out it
+    overwrites the copy; a reader assigned after that (a re-read after a
+    stale read, or any reader with one buffer) must not get it."""
+    reg = WeightRegistry(fanout=2)
+    reg.publish(1, {}, "u", 0)
+    reg.join("r")
+    reg.assign(1, "r")
+    assert not reg.wait_idle(1, timeout=0.05, retire=True)["ok"]
+    reg.join("r2")
+    assert reg.assign(1, "r2") is None              # no torn source handed out
+    assert reg.release(1, PUBLISHER, member="r").get("stale")
+
+
+def test_single_buffer_publisher_retires_the_overwritten_version():
+    reg = WeightRegistry(fanout=2)
+    pub = WeightPublisher(reg, LocalTransport("sb-trainer"), buffers=1, idle_timeout=0.05)
+    pub.publish([("w", torch.zeros(8))])
+    reg.join("r")
+    reg.assign(1, "r")                              # slow reader of v1
+    pub.publish([("w", torch.ones(8))])             # overwrites v1's arena
+    assert PUBLISHER not in reg.holders.get(1, {})
+    assert reg.release(1, PUBLISHER, member="r").get("stale")

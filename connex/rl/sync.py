@@ -14,6 +14,7 @@ alive. After the last chunk the subscriber hands the arena to ``apply``
 ``v`` so later pullers can read from it (tree fan-out).
 """
 import logging
+import os
 import threading
 import time
 
@@ -26,6 +27,15 @@ from .weights import WeightManifest, pack_into, unpack
 log = logging.getLogger("connex.rl")
 
 DEFAULT_CHUNK = 64 << 20
+
+
+def _stream_sync(t):
+    """Wait for the work queued so far on the current stream of ``t``'s
+    device (not the whole device: the engine's other streams keep running)."""
+    if t is not None and t.is_cuda:
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream(t.device))
+        ev.synchronize()
 
 
 class WeightPublisher:
@@ -52,11 +62,11 @@ class WeightPublisher:
             a, old = self.arenas[slot]
             if old is not None:
                 ok = self.reg.wait_idle(version=old, member=PUBLISHER,
-                                        timeout=self.idle_timeout)
+                                        timeout=self.idle_timeout, retire=True)
                 if not (ok or {}).get("ok", True):
                     log.warning("publisher: readers of v%s still active after %.0fs; "
-                                "overwriting its arena (they may read torn weights)",
-                                old, self.idle_timeout)
+                                "overwriting its arena (they are told their read is stale "
+                                "and read again)", old, self.idle_timeout)
             if a.numel() < m.total:
                 self.t.unregister(a)
                 a = torch.empty(m.total, dtype=torch.uint8, device=self.device)
@@ -67,8 +77,7 @@ class WeightPublisher:
             self.t.register(a)
             self.arenas.append([a, None])
         pack_into(a, m, named)
-        if a.is_cuda:
-            torch.cuda.synchronize(a.device)
+        _stream_sync(a)
         self.arenas[slot][1] = v
         self.reg.publish(version=v, manifest=m.to_dict(), url=self.t.url, addr=a.data_ptr())
         self.version, self.manifest = v, m
@@ -79,11 +88,23 @@ class WeightSubscriber:
     """One per engine worker. ``member`` is its logical id in the registry."""
 
     def __init__(self, registry, transport, member, device="cpu", chunk_bytes=DEFAULT_CHUNK,
-                 max_source_failures=16, heartbeat_s=2.0, window=4):
+                 max_source_failures=16, heartbeat_s=2.0, window=16, arena=None, relay=None):
+        """``arena``: where the pulled copy lives, "device" (``device``, the
+        default) or "host" (pinned host memory: no second full copy of the
+        weights in GPU memory; apply copies host to device). Env
+        CONNEX_RL_ARENA. ``relay``: serve the copy to later pullers (default);
+        False frees the arena after apply. Env CONNEX_RL_RELAY=0."""
         self.reg = registry
         self.t = transport
         self.member = member
-        self.device = torch.device(device)
+        arena = arena or os.environ.get("CONNEX_RL_ARENA", "device")
+        if arena not in ("device", "host"):
+            raise ValueError(f"arena must be 'device' or 'host', got {arena!r}")
+        if relay is None:
+            relay = os.environ.get("CONNEX_RL_RELAY", "1").lower() not in ("0", "false", "no")
+        self.relay = relay
+        self.pin = arena == "host" and torch.cuda.is_available()
+        self.device = torch.device("cpu") if arena == "host" else torch.device(device)
         self.chunk = chunk_bytes
         self.window = window       # chunks in flight per source
         self.max_fail = max_source_failures
@@ -135,8 +156,6 @@ class WeightSubscriber:
                         "reading again", self.member, version)
         else:
             raise RuntimeError(f"v{version}: sources kept changing during the read")
-        if self.arena.is_cuda:
-            torch.cuda.synchronize(self.arena.device)
         self.manifest = m
         self.stats = {"version": version, "bytes": m.total, "pull_s": time.perf_counter() - t0,
                       "sources": sources, "source_failures": failures}
@@ -152,7 +171,11 @@ class WeightSubscriber:
         if self.arena is None or self.arena.numel() < m.total:
             if self.arena is not None:
                 self.t.unregister(self.arena)
-            self.arena = torch.empty(m.total, dtype=torch.uint8, device=self.device)
+            self.arena = torch.empty(m.total, dtype=torch.uint8, device=self.device,
+                                     pin_memory=self.pin)
+            # The NIC writes outside any stream: kernels queued on the
+            # memory's previous user (caching allocator) must be done first.
+            _stream_sync(self.arena)
             self.t.register(self.arena)
         offs = list(range(0, m.total, self.chunk))
         stale = False
@@ -166,12 +189,18 @@ class WeightSubscriber:
                     if src is None:
                         raise RuntimeError(f"no source holds version {version}")
                     sources.append(src["member"])
+                rolling = hasattr(self.t, "read_window")
                 ops = [(src["addr"] + off, off, min(self.chunk, m.total - off))
-                       for off in offs[i:i + self.window]]
+                       for off in (offs[i:] if rolling else offs[i:i + self.window])]
                 try:
-                    self.t.read_batch(src["url"], ops, self.arena)
+                    if rolling:     # keep `window` chunks in flight, no gap between batches
+                        self.t.read_window(src["url"], ops, self.arena, self.window)
+                    else:
+                        self.t.read_batch(src["url"], ops, self.arena)
                     i += len(ops)
                 except TransferError as e:
+                    if rolling:
+                        i += getattr(e, "done", 0)
                     failures += 1
                     log.warning("%s: read of v%d from %s failed (%s); switching source",
                                 self.member, version, src["member"], e)
@@ -199,18 +228,24 @@ class WeightSubscriber:
         return unpack(self.arena, self.manifest)
 
     def commit(self, version):
-        """Mark ``version`` applied and offer it to other pullers."""
+        """Mark ``version`` applied and offer it to other pullers (unless
+        this member does not relay: then its arena is freed)."""
         self.version = version
-        self.reg.done(version=version, member=self.member, url=self.t.url,
-                      addr=self.arena.data_ptr())
+        if self.relay:
+            self.reg.done(version=version, member=self.member, url=self.t.url,
+                          addr=self.arena.data_ptr())
+            return
+        self.reg.done(version=version, member=self.member, url=self.t.url, addr=0, hold=False)
+        self.t.unregister(self.arena)
+        self.arena = None
+        self.manifest = None
 
     def sync(self, apply, version=None):
         """pull + apply(iterable of (name, tensor)) + commit. Returns stats."""
         m = self.pull(version)
         t0 = time.perf_counter()
         apply(self.tensors())
-        if self.arena.is_cuda:
-            torch.cuda.synchronize(self.arena.device)
+        _stream_sync(self.arena)
         self.stats["apply_s"] = time.perf_counter() - t0
         self.commit(m.version)
         return self.stats

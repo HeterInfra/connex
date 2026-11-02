@@ -30,7 +30,12 @@ Configuration (stage 0):
   CONNEX_PP_REPLICA      this pipeline's replica index (preferred route)
   CONNEX_PP_STEP_TIMEOUT_S   backstop for a step without reply (60): the
                          stage that does not answer a ping, else the first
-                         one behind on the step, is failed over
+                         one behind on the step, is failed over. Once 32
+                         steps came back, the timeout is
+                         max(CONNEX_PP_STEP_TIMEOUT_MIN_S (10), 20 x the
+                         slowest of the last 512 steps that scheduled at
+                         least as many tokens), at most this value; a step
+                         larger than all of them keeps this value
   CONNEX_PP_REPLACE_TIMEOUT_S how long to wait for a live replica (120)
 """
 
@@ -148,7 +153,10 @@ class ControlLink:
                 return
             if ev and ev.get("type") == "failed" and self.on_failed is not None:
                 try:
-                    self.on_failed(tuple(ev.get("peer") or ()), ev.get("reason"))
+                    ts = ev.get("ts_ns")
+                    # ts_ns is CLOCK_MONOTONIC, the clock of time.monotonic().
+                    self.on_failed(tuple(ev.get("peer") or ()), ev.get("reason"),
+                                   ts * 1e-9 if ts else None)
                 except Exception:  # noqa: BLE001
                     log.exception("connex-pp: failure handler failed")
 
@@ -174,6 +182,8 @@ class Replica:
     done_seq: int = -1          # last step it reported done (with the pong)
     quarantine_until: float = 0.0   # failed over for a hung step: not chosen before
     announced: float = 0.0      # when it last announced itself (READY), for the log
+    hello_every: float = 2.0    # watchdog re-HELLO interval while down (backs off)
+    next_hello: float = 0.0
 
 
 @dataclass
@@ -185,6 +195,7 @@ class Pending:
     output: ModelRunnerOutput | None = None
     t_send: float = 0.0
     lost: bool = False
+    tokens: int = 0             # scheduled tokens (the step timeout compares like with like)
 
 
 def pick_stuck(route: list, late: list, t_ping: float) -> tuple:
@@ -244,6 +255,8 @@ class ConnexPPExecutor(MultiprocExecutor):
         self.replica_id = int(os.getenv("CONNEX_PP_REPLICA", "0"))
         self.owner = f"{self.replica_id}:{os.getpid()}"
         self.step_timeout = float(os.getenv("CONNEX_PP_STEP_TIMEOUT_S", "60"))
+        self.step_timeout_min = float(os.getenv("CONNEX_PP_STEP_TIMEOUT_MIN_S", "10"))
+        self.step_times: deque[tuple[float, int]] = deque(maxlen=512)   # (seconds, tokens)
         self.replace_timeout = float(os.getenv("CONNEX_PP_REPLACE_TIMEOUT_S", "120"))
         self.max_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
         self.replicas: list[list[Replica]] = [
@@ -277,11 +290,21 @@ class ConnexPPExecutor(MultiprocExecutor):
             for r in lst:
                 self._hello(r)
         deadline = time.monotonic() + float(os.getenv("CONNEX_PP_CONNECT_TIMEOUT_S", "600"))
-        # Give every replica a moment to answer, so the preferred one is used.
+        # Give every replica a moment to answer, so the preferred one is used:
+        # at most CONNEX_PP_SETTLE_S (10), and only CONNEX_PP_SETTLE_GRACE_S
+        # (1) more once every stage has a live replica (a replica that is
+        # down would otherwise always cost the full 10 s).
         settle = time.monotonic() + float(os.getenv("CONNEX_PP_SETTLE_S", "10"))
+        grace = float(os.getenv("CONNEX_PP_SETTLE_GRACE_S", "1"))
         with self.cv:
+            covered_at = None
             while (time.monotonic() < settle
                    and not all(r.alive for lst in self.replicas for r in lst)):
+                if covered_at is None and all(any(r.alive for r in lst)
+                                              for lst in self.replicas):
+                    covered_at = time.monotonic()
+                if covered_at is not None and time.monotonic() - covered_at >= grace:
+                    break
                 self.cv.wait(0.2)
             while not self._choose_route():
                 if time.monotonic() > deadline:
@@ -373,6 +396,8 @@ class ConnexPPExecutor(MultiprocExecutor):
                     return
                 p.output = out
                 p.event.set()
+                if p.t_send:
+                    self.step_times.append((time.monotonic() - p.t_send, p.tokens))
             return
         r = self._find(peer)
         if r is None:
@@ -392,6 +417,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                                                                 * 1e3)
                     log.info("connex-pp: replica s%dr%d is up (%s)", r.stage, r.idx, how)
                 r.announced = 0.0
+                r.hello_every, r.next_hello = 2.0, 0.0
                 r.alive = True
                 r.busy = owner not in (None, self.owner)
                 self.cv.notify_all()
@@ -424,11 +450,17 @@ class ConnexPPExecutor(MultiprocExecutor):
             threading.Thread(target=self._failover, args=(r, "busy"), name="cx-pp-failover",
                              daemon=True).start()
 
-    def _on_failed(self, peer: tuple, reason) -> None:
+    def _on_failed(self, peer: tuple, reason, ts: float | None = None) -> None:
         r = self._find(peer)
         if r is None:
             return
         tr("h_failed", self.seq)
+        if r.alive and ts is not None and ts < r.alive_since:
+            # Queued before the current incarnation answered HELLO: about an
+            # earlier one (or a failed connect attempt). No PING needed.
+            log.debug("connex-pp: dropping stale failure event for s%dr%d (%s)",
+                      r.stage, r.idx, reason)
+            return
         if (r.alive and time.monotonic() - r.alive_since < 30.0
                 and self._answers_ping(r, timeout=0.5)):
             # A late event about an earlier incarnation (a replica restarted
@@ -438,10 +470,22 @@ class ConnexPPExecutor(MultiprocExecutor):
             log.info("connex-pp: ignoring failure event for s%dr%d (%s): it answers",
                      r.stage, r.idx, reason)
             return
-        log.warning("connex-pp: replica s%dr%d failed (%s)", r.stage, r.idx, reason)
         with self.lock:
-            r.alive = False
-        self._failover(r, f"peer failed: {reason}")
+            was_alive, r.alive = r.alive, False
+            if was_alive:
+                r.hello_every, r.next_hello = 2.0, 0.0
+            on_route = self.route[r.stage - 1] is r
+        if not was_alive and not on_route:
+            # A failed (re)connect to a replica that is already down (the
+            # watchdog's HELLO): no state change, nothing to fail over.
+            log.debug("connex-pp: s%dr%d still down (%s)", r.stage, r.idx, reason)
+            return
+        log.warning("connex-pp: replica s%dr%d failed (%s)", r.stage, r.idx, reason)
+        # Not on this (the failure event) thread: without a spare the
+        # failover waits up to replace_timeout for a replacement, and the
+        # failure events of other stages must not queue behind it.
+        threading.Thread(target=self._failover, args=(r, f"peer failed: {reason}"),
+                         name="cx-pp-failover", daemon=True).start()
 
     def _answers_ping(self, r: Replica, timeout: float = 1.5) -> bool:
         t = time.monotonic()
@@ -511,22 +555,42 @@ class ConnexPPExecutor(MultiprocExecutor):
         for u in [e for u in urls for e in u.split(";")]:
             threading.Thread(target=one, args=(u,), name="cx-pp-abort", daemon=True).start()
 
+    def current_step_timeout(self, tokens: int = 0) -> float:
+        """A hung (not crashed) stage is found by its late step. The fixed
+        backstop (60 s) is longer than client timeouts, so once enough steps
+        came back the limit follows the measured step time, of steps at
+        least as large as this one (``tokens`` scheduled): after many small
+        decode steps, a long prefill is not a hang. A step larger than every
+        measured one keeps the backstop (a false failover recomputes every
+        request and quarantines a healthy stage)."""
+        st = getattr(self, "step_times", None)
+        if not st or len(st) < 32:
+            return self.step_timeout
+        slowest = max((dt for dt, tk in st if tk >= tokens), default=None)
+        if slowest is None:
+            return self.step_timeout
+        return min(self.step_timeout, max(self.step_timeout_min, 20.0 * slowest))
+
+    def _rehello_down(self, now: float) -> None:
+        """(Re)discover replicas that are down: a restarted one becomes a
+        spare. It also announces itself (see stage.py), so the HELLO here
+        backs off (2 s doubling to 30 s) while it stays down."""
+        for lst in self.replicas:
+            for r in lst:
+                if not r.alive and now >= r.next_hello:
+                    r.next_hello = now + r.hello_every
+                    r.hello_every = min(r.hello_every * 2, 30.0)
+                    self._hello(r, resolve=True)
+
     def _watchdog(self) -> None:
-        tick = 0
         while not self.ctl.closed:
             time.sleep(1.0)
-            tick += 1
-            if tick % 2 == 0:
-                # (Re)discover replicas that are down: a restarted one becomes
-                # a spare (it also announces itself, see stage.py).
-                for lst in self.replicas:
-                    for r in lst:
-                        if not r.alive:
-                            self._hello(r, resolve=True)
+            self._rehello_down(time.monotonic())
             now = time.monotonic()
             with self.lock:
                 late = [p for p in self.pending.values()
-                        if not p.event.is_set() and now - p.t_send > self.step_timeout]
+                        if not p.event.is_set()
+                        and now - p.t_send > self.current_step_timeout(p.tokens)]
                 route = list(self.route)
             if not late:
                 continue
@@ -571,7 +635,8 @@ class ConnexPPExecutor(MultiprocExecutor):
             self.live_reqs.difference_update(so.finished_req_ids)
             if forward:
                 self.await_sample.append(seq)
-                p = Pending(seq, epoch, list(so.num_scheduled_tokens), t_send=time.monotonic())
+                p = Pending(seq, epoch, list(so.num_scheduled_tokens), t_send=time.monotonic(),
+                            tokens=so.total_num_scheduled_tokens)
                 self.pending[seq] = p
                 if doomed:
                     p.lost = True
