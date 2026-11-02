@@ -179,13 +179,14 @@ class WeightRegistry:
                 self.holders.get(version, {}).pop(member, None)
             return {"ok": bool(ok)}
 
-    def done(self, version, member, url, addr):
-        """``member`` holds a full copy of ``version`` and has applied it."""
+    def done(self, version, member, url, addr, hold=True):
+        """``member`` has applied ``version``; with ``hold`` it keeps a full
+        copy and serves it."""
         with self.cv:
             if member not in self.members:
                 self.members[member] = {"url": url, "version": None, "last_seen": time.time()}
             self.members[member].update(version=version, last_seen=time.time())
-            if version in self.holders:
+            if hold and version in self.holders:
                 self.holders[version][member] = {"url": url, "addr": addr, "load": 0,
                                                  "publisher": False}
             self._ev("applied", member, version)

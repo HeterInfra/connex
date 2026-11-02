@@ -14,6 +14,7 @@ alive. After the last chunk the subscriber hands the arena to ``apply``
 ``v`` so later pullers can read from it (tree fan-out).
 """
 import logging
+import os
 import threading
 import time
 
@@ -79,11 +80,23 @@ class WeightSubscriber:
     """One per engine worker. ``member`` is its logical id in the registry."""
 
     def __init__(self, registry, transport, member, device="cpu", chunk_bytes=DEFAULT_CHUNK,
-                 max_source_failures=16, heartbeat_s=2.0, window=16):
+                 max_source_failures=16, heartbeat_s=2.0, window=16, arena=None, relay=None):
+        """``arena``: where the pulled copy lives, "device" (``device``, the
+        default) or "host" (pinned host memory: no second full copy of the
+        weights in GPU memory; apply copies host to device). Env
+        CONNEX_RL_ARENA. ``relay``: serve the copy to later pullers (default);
+        False frees the arena after apply. Env CONNEX_RL_RELAY=0."""
         self.reg = registry
         self.t = transport
         self.member = member
-        self.device = torch.device(device)
+        arena = arena or os.environ.get("CONNEX_RL_ARENA", "device")
+        if arena not in ("device", "host"):
+            raise ValueError(f"arena must be 'device' or 'host', got {arena!r}")
+        if relay is None:
+            relay = os.environ.get("CONNEX_RL_RELAY", "1").lower() not in ("0", "false", "no")
+        self.relay = relay
+        self.pin = arena == "host" and torch.cuda.is_available()
+        self.device = torch.device("cpu") if arena == "host" else torch.device(device)
         self.chunk = chunk_bytes
         self.window = window       # chunks in flight per source
         self.max_fail = max_source_failures
@@ -152,7 +165,8 @@ class WeightSubscriber:
         if self.arena is None or self.arena.numel() < m.total:
             if self.arena is not None:
                 self.t.unregister(self.arena)
-            self.arena = torch.empty(m.total, dtype=torch.uint8, device=self.device)
+            self.arena = torch.empty(m.total, dtype=torch.uint8, device=self.device,
+                                     pin_memory=self.pin)
             self.t.register(self.arena)
         offs = list(range(0, m.total, self.chunk))
         stale = False
@@ -205,10 +219,17 @@ class WeightSubscriber:
         return unpack(self.arena, self.manifest)
 
     def commit(self, version):
-        """Mark ``version`` applied and offer it to other pullers."""
+        """Mark ``version`` applied and offer it to other pullers (unless
+        this member does not relay: then its arena is freed)."""
         self.version = version
-        self.reg.done(version=version, member=self.member, url=self.t.url,
-                      addr=self.arena.data_ptr())
+        if self.relay:
+            self.reg.done(version=version, member=self.member, url=self.t.url,
+                          addr=self.arena.data_ptr())
+            return
+        self.reg.done(version=version, member=self.member, url=self.t.url, addr=0, hold=False)
+        self.t.unregister(self.arena)
+        self.arena = None
+        self.manifest = None
 
     def sync(self, apply, version=None):
         """pull + apply(iterable of (name, tensor)) + commit. Returns stats."""

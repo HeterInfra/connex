@@ -221,3 +221,31 @@ def test_rolling_read_resumes_after_the_completed_prefix():
     assert st["source_failures"] == 1
     assert calls[0] == nchunks + 1          # 3 good chunks kept, 1 failed, the rest once
 
+
+def test_non_relay_member_frees_its_arena_after_apply():
+    """Issue #10: a member that does not relay keeps no second full copy of
+    the weights after apply, and is not handed out as a source."""
+    reg = WeightRegistry(fanout=2)
+    pub = WeightPublisher(reg, LocalTransport("nr-trainer"))
+    sub = WeightSubscriber(reg, LocalTransport("nr-e0"), "e0", chunk_bytes=512,
+                           heartbeat_s=0, relay=False)
+    got = {}
+    v = pub.publish(named(1))
+    sub.sync(lambda it: got.update({n: t.clone() for n, t in it}))
+    assert sub.arena is None and sub.version == v
+    assert reg.status()["members"]["e0"] == v
+    assert "e0" not in reg.status()["holders"][str(v)]
+    for n, t in named(1):
+        assert torch.equal(got[n], t)
+    v2 = pub.publish(named(2))
+    sub.sync(lambda it: None)                 # pulls again into a fresh arena
+    assert sub.version == v2 and sub.arena is None
+
+
+def test_host_arena_option(monkeypatch):
+    monkeypatch.setenv("CONNEX_RL_ARENA", "host")
+    reg = WeightRegistry(fanout=2)
+    sub = WeightSubscriber(reg, LocalTransport("ha-e0"), "e0", device="cuda:0", heartbeat_s=0)
+    assert sub.device.type == "cpu"
+    with pytest.raises(ValueError):
+        WeightSubscriber(reg, LocalTransport("ha-e1"), "e1", heartbeat_s=0, arena="nvme")
