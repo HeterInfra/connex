@@ -259,6 +259,8 @@ class KVConsumer:
         else:
             self._staging = getattr(plane, "_connex_staging", None)
         self._pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="connex-pd-pull")
+        self._src_pool = ThreadPoolExecutor(max_workers=max(8, 2 * workers),
+                                            thread_name_prefix="connex-pd-src")
         self._meta: dict[str, _PeerMeta] = {}
         self._lock = threading.Lock()
         self._done: list[PullResult] = []
@@ -333,9 +335,19 @@ class KVConsumer:
     def _pull_sources(self, req_id, sources, tid, local, first, t0) -> PullResult:
         if self.inject_delay_s:
             time.sleep(self.inject_delay_s)
+        # One read per remote TP rank, all at once (each is a separate
+        # producer: its control round trips and RDMA overlap). Not on
+        # self._pool: this runs on it, and waiting there for its own
+        # queue could deadlock when every worker does the same.
+        if len(sources) == 1:
+            results = [self._pull_inner(req_id, sources[0][0], tid, local, first, t0,
+                                        src=sources[0][1], delay=False)]
+        else:
+            futs = [self._src_pool.submit(self._pull_inner, req_id, addr, tid, local, first, t0,
+                                          src=src, delay=False) for addr, src in sources]
+            results = [f.result() for f in futs]
         nbytes = 0
-        for addr, src in sources:
-            r = self._pull_inner(req_id, addr, tid, local, first, t0, src=src, delay=False)
+        for (addr, src), r in zip(sources, results):
             if not r.ok:
                 r.why = f"TP rank {src.remote_rank} ({addr}): {r.why}"
                 return r
@@ -447,3 +459,4 @@ class KVConsumer:
 
     def close(self) -> None:
         self._pool.shutdown(wait=True, cancel_futures=False)
+        self._src_pool.shutdown(wait=True, cancel_futures=False)

@@ -269,3 +269,23 @@ def test_find_heads_dims():
     assert find_heads_dims((5140, 16, 16, 256), 5140, 16, 16, "LBNHC") == (1, 2)
     assert find_heads_dims((5140, 4, 16, 256), 5140, 8, 16) is None
     assert find_heads_dims((5140, 8, 16, 256), 999, 8, 16) is None
+
+
+def test_tp_sources_are_read_in_parallel(monkeypatch):
+    """Issue #8: a decode rank reading 8 prefill ranks overlaps the reads."""
+    orig = LoopbackPlane.read
+
+    def slow(self, url, ops):
+        time.sleep(0.1)                     # one network read
+        return orig(self, url, ops)
+    monkeypatch.setattr(LoopbackPlane, "read", slow)
+    full, dsh, prods, cons, _ = run_pd(8, 1)
+    try:
+        (res,) = wait_done(cons[0])
+        assert res.ok, res.why
+        assert res.seconds < 0.5, res.seconds        # serial: >= 0.8 s
+        for got, w in zip(dsh[0], shard(full, 0, 1, False)):
+            assert torch.equal(got[:, 4:7], w[:, 1:4])
+    finally:
+        for x in prods + cons:
+            x.close()
