@@ -164,13 +164,19 @@ class WeightRegistry:
                 hs.pop(member, None)
             return {"ok": True}
 
-    def wait_idle(self, version, member=PUBLISHER, timeout=5.0):
+    def wait_idle(self, version, member=PUBLISHER, timeout=5.0, retire=False):
+        """Wait (bounded) until nobody reads ``version`` from ``member``.
+        ``retire``: ``member`` is about to overwrite that copy, so stop
+        handing it out too (else a reader assigned after the wait, e.g. one
+        that re-reads after a stale read, would read torn bytes unnoticed)."""
         with self.cv:
             ok = self.cv.wait_for(
                 lambda: self.holders.get(version, {}).get(member, {"load": 0})["load"] == 0,
                 timeout=timeout)
             if not ok:
                 self._invalidate(version, member)
+            if retire:
+                self.holders.get(version, {}).pop(member, None)
             return {"ok": bool(ok)}
 
     def done(self, version, member, url, addr):

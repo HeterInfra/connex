@@ -52,11 +52,11 @@ class WeightPublisher:
             a, old = self.arenas[slot]
             if old is not None:
                 ok = self.reg.wait_idle(version=old, member=PUBLISHER,
-                                        timeout=self.idle_timeout)
+                                        timeout=self.idle_timeout, retire=True)
                 if not (ok or {}).get("ok", True):
                     log.warning("publisher: readers of v%s still active after %.0fs; "
-                                "overwriting its arena (they may read torn weights)",
-                                old, self.idle_timeout)
+                                "overwriting its arena (they are told their read is stale "
+                                "and read again)", old, self.idle_timeout)
             if a.numel() < m.total:
                 self.t.unregister(a)
                 a = torch.empty(m.total, dtype=torch.uint8, device=self.device)
