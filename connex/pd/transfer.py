@@ -75,6 +75,10 @@ class KVProducer:
         self.layouts = list(layouts)
         self.retain_s = retain_s
         self.engine_id = engine_id
+        # Incarnation of this producer: sent with meta and every acquire, so
+        # a consumer can keep cached meta across a control timeout and still
+        # notice a restart at the same address.
+        self.inc = os.urandom(8).hex()
         self.block_size = block_size
         self.device = device
         self._holds: dict[str, _Hold] = {}
@@ -142,7 +146,7 @@ class KVProducer:
     def _handle(self, m: dict) -> dict:
         op = m.get("op")
         if op == "meta":
-            return {"ok": True, "v": PROTO_VERSION, "url": self.plane.local_url,
+            return {"ok": True, "v": PROTO_VERSION, "inc": self.inc, "url": self.plane.local_url,
                     "backend": self.plane.name, "engine_id": self.engine_id,
                     "block_size": self.block_size, "device": self.device,
                     "layouts": [(self._staging.translate(lo) if self._staging else lo).to_dict()
@@ -159,7 +163,7 @@ class KVProducer:
                     h.owner = m.get("who")
                 h.deadline = time.monotonic() + self.retain_s
                 self.stats["acquires"] += 1
-                return {"ok": True, "blocks": h.blocks, "_wait": h.ready}
+                return {"ok": True, "blocks": h.blocks, "inc": self.inc, "_wait": h.ready}
             if op == "release":
                 self.stats["releases"] += 1
                 # several decode TP ranks may read this rank (decode TP larger
@@ -225,6 +229,7 @@ class _PeerMeta:
         self.url = d["url"]
         self.backend = d.get("backend")
         self.engine_id = d.get("engine_id")
+        self.inc = d.get("inc")
         self.block_size = d.get("block_size", 0)
         self.device = d.get("device", "")
         self.layouts = [TensorLayout.from_dict(x) for x in d["layouts"]]
@@ -353,7 +358,13 @@ class KVConsumer:
             time.sleep(delay)
             delay = min(delay * 2, 0.05)
         if r is None:
-            self.forget_peer(addr)
+            # A control timeout alone says nothing about the metadata: keep
+            # it when the producer reports its incarnation (a restart shows
+            # up as a new one on the next acquire); older producers do not.
+            with self._lock:
+                m = self._meta.get(addr)
+            if m is None or not m.inc:
+                self.forget_peer(addr)
             return PullResult(req_id, False, "producer unreachable")
         if not r.get("ok"):
             return PullResult(req_id, False, f"producer: {r.get('why')}")
@@ -365,6 +376,8 @@ class KVConsumer:
             return PullResult(req_id, False, f"producer holds {len(remote_all)} blocks, "
                                              f"need {first + len(local)}")
         meta = self.peer_meta(addr)
+        if meta is not None and r.get("inc") and meta.inc != r["inc"]:
+            meta = self.peer_meta(addr, refresh=True)    # restarted at the same address
         if meta is None:
             return PullResult(req_id, False, "producer meta unavailable")
         if self.block_size and meta.block_size and meta.block_size != self.block_size:

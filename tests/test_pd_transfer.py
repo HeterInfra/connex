@@ -248,3 +248,36 @@ def test_host_staging_reads_go_through_the_mirrors(monkeypatch):
         assert cons._staging.staged_in == 1
     finally:
         cons.close(), prod.close()
+
+
+def test_control_timeout_keeps_meta_but_restart_refreshes_it():
+    """Issue #5: one control timeout does not cost a meta round trip on the
+    next pull; a producer restart at the same address still refreshes it."""
+    src, dst, prod, cons, addr = make_pair()
+    ops, orig = [], cons._call
+    drop = {"n": 0}
+
+    def call(a, msg):
+        ops.append(msg["op"])
+        if drop["n"]:
+            drop["n"] -= 1
+            return None                                   # control timeout
+        return orig(a, msg)
+    cons._call = call
+    try:
+        prod.hold("r1", "t1", [1, 2])
+        cons.pull("r1", addr, "t1", [0, 1])
+        assert wait_done(cons)[0].ok
+        assert ops.count("meta") == 1
+        drop["n"] = 1
+        cons.pull("r2", addr, "t1", [0, 1])
+        assert wait_done(cons)[0].why == "producer unreachable"
+        cons.pull("r3", addr, "t1", [0, 1])
+        assert wait_done(cons)[0].ok
+        assert ops.count("meta") == 1                     # was 2 before
+        prod.inc = "restarted"
+        cons.pull("r4", addr, "t1", [0, 1])
+        assert wait_done(cons)[0].ok
+        assert ops.count("meta") == 2
+    finally:
+        cons.close(), prod.close()
