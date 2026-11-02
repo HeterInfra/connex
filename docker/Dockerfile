@@ -49,7 +49,7 @@ ARG BASE_IMAGE=vllm/vllm-openai:latest
 FROM ${BASE_IMAGE} AS connex-rs-build
 ARG BUILD_CONNEX_RS=1
 ARG CONNEX_RS_REPO=https://github.com/HeterInfra/connex-rs.git
-ARG CONNEX_RS_REF=v0.1.6
+ARG CONNEX_RS_REF=v0.1.7
 ARG UCX_VERSION=1.20.0
 ARG RUST_TOOLCHAIN=1.86.0
 ARG MAX_JOBS=8

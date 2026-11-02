@@ -1,5 +1,102 @@
 # Changelog
 
+## 0.2.1
+
+This release speeds up the control paths of PD, RL and EP, makes PP
+failure handling faster and quieter, and fixes several correctness holes
+found in review (issues #3-#20). `connex-ai[rs]` still accepts
+`connex-rs>=0.1.6`; the submodule and the Docker default are now at
+connex-rs v0.1.7, whose shared put flush raises the small-put rate
+1.6-2.2x.
+
+**Upgrade note:** the front router now defaults to a 3 s lease, and clients
+heartbeat every 1 s. A client older than 0.2.1 heartbeats every 10 s and
+is marked unhealthy between heartbeats. Run such clients with
+`CONNEX_HEARTBEAT_INTERVAL_S=1`, or set `CONNEX_HEARTBEAT_TIMEOUT_S=30` on
+the router.
+
+**Performance**
+
+| Path | 0.2.0 | 0.2.1 |
+|---|---|---|
+| PD pull control path (acquire, read, release; loopback) | 0.83-0.87 ms | 0.27-0.34 ms |
+| PD pull from 2 / 4 / 8 prefill TP ranks (20 ms per read) | 45 / 85-90 / 172-178 ms | 22-23 / 24-25 / 28 ms |
+| PD ready pull queued behind a 50 ms staged copy | 45.9 ms | 0.5-0.7 ms |
+| Front-router failure detection (defaults) | 34.7 s | 3.46 s |
+| PP hung stage (worker stopped, control alive) detected | 62.8 s | 12.6 s |
+| PP requests completed in a 100 s window with a hung stage | 80 | 176 |
+| PP head ready with one configured replica down | 64 s | 52.5 s |
+| RL publish wait while another stream runs a 160 ms kernel | 160 ms | 0.3 ms |
+| RL GPU memory on a non-relaying member (4 GiB model) | 8 GiB | 4 GiB |
+| EP expert checksum (48 layers x 3 tensors x 32 slots) | 233 ms | 31 ms |
+
+The PD, EP and RL rows are microbenchmarks on one 4-GPU A40 host, run
+against 0.2.0 on the same host. The PP rows come from PP=2 runs
+on upstream vLLM that stop or kill a stage-1 replica. RL pulls stay at
+about 7.9 GB/s between two GPUs of one host, and 8.35 GB/s from host
+memory across hosts over RDMA, in both versions: four 64 MiB reads in
+flight already fill the link.
+
+**PD (`connex.pd`)**
+- Control sockets are pooled per producer. Each acquire, meta or release
+  used to pay a TCP connect. A socket that timed out is closed, never
+  reused (#9).
+- The producer serves with a ROUTER socket (REQ clients are unchanged). An
+  acquire that waits for a staged copy is parked and answered when the copy
+  completes, so the requests behind it are no longer held up (#11).
+- A request whose KV is spread over several prefill TP ranks pulls from
+  all of them in parallel (#8).
+- Host staging: `stage_in` is ordered after the work already queued on the
+  engine stream. The side stream is non-blocking, so a step queued earlier
+  could write the blocks after the KV landed (#3).
+- A control timeout no longer discards cached peer metadata. Producers
+  report an incarnation id, and a restart at the same address is detected
+  by it (#5).
+- A control reply that fails to decode closes the socket and counts as
+  unreachable (#20).
+
+**PP on upstream vLLM**
+- Failure events are handled off the event thread. A failover that waits
+  for a replacement no longer delays the failure events of other stages.
+  Events older than the replica's current incarnation are dropped without
+  a ping (0 instead of about 230 "ignoring failure event" lines per
+  rejoin) (af31375).
+- The step timeout follows measured step times:
+  max(`CONNEX_PP_STEP_TIMEOUT_MIN_S` (10 s), 20 x the slowest recent step
+  that scheduled at least as many tokens). It is capped by
+  `CONNEX_PP_STEP_TIMEOUT_S` (60 s), which also applies to a step larger
+  than any measured one (#15, #18).
+- The watchdog re-HELLOs down replicas with backoff (2 s doubling to 30 s)
+  and logs only state changes. Log lines over three outages: 704 to 16
+  (#14).
+- The startup settle wait ends one grace period (`CONNEX_PP_SETTLE_GRACE_S`,
+  1 s) after every stage has a live replica (#16).
+- Stage servers log a startup timeline (imports, engine config, engine
+  core, control link) for restarts in place.
+
+**RL weight sync (`connex.rl`)**
+- The publisher retires its copy before it overwrites the copy. A reader
+  that was assigned after the wait timed out could otherwise read torn
+  weights (#4).
+- Waits use an event on the current stream, not a full-device
+  synchronize (#12). Memory is synchronized before the NIC writes into a
+  freshly allocated arena.
+- Optional pinned host arena (`arena="host"`, `CONNEX_RL_ARENA=host`) and
+  `relay=False` (`CONNEX_RL_RELAY=0`): either one avoids a second
+  full-weight copy in GPU memory (#10).
+- Pulls keep a rolling window of chunk reads in flight (default 16) (#7).
+
+**EP (`connex.ep`)**
+- The expert checksum is computed on the device and copied back once, in
+  chunks of at most 64 MiB of float64. This avoids one host sync per
+  expert per layer, and the transient memory of a one-shot float64 copy
+  (+75 MiB instead of +960 MiB for a Qwen3-30B-A3B-sized rank) (#13, #19).
+- Expert moves wait for the current stream, not the whole device (#12).
+
+**Front router**
+- Defaults: 3 s lease, 10 s unhealthy grace, 1 s client heartbeat (was
+  30 s, 60 s and 10 s) (#6).
+
 ## 0.2.0
 
 Summary of the changes since 0.1.1: pipeline parallelism now runs on
