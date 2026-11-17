@@ -53,7 +53,7 @@ from connex.adapters.vllm.pp.trace import tr
 
 log = logging.getLogger("vllm.connex_pp")
 
-ZCOPY_THRESH = 4096
+from connex.pd.dataplane import ZCOPY_THRESH  # noqa: E402
 _ALIGN = 256
 
 # message kinds
@@ -108,23 +108,6 @@ _DTYPES = {str(d): d for d in (torch.float16, torch.bfloat16, torch.float32, tor
                                torch.int32, torch.uint8, torch.float8_e4m3fn)}
 
 
-def _setup_ucx_env(ip: str) -> None:
-    os.environ.setdefault("UCX_TCP_CM_REUSEADDR", "y")
-    # Reads into GPU memory must stay zero-copy (see connex.pd.dataplane).
-    os.environ.setdefault("UCX_ZCOPY_THRESH", str(ZCOPY_THRESH))
-    # No CUDA IPC between processes: a mapping of a dead peer's memory keeps
-    # its GPU allocation alive (see insight on connex-rs + cuda_ipc).
-    if os.getenv("CONNEX_RS_CUDA_IPC", "0") != "1" and not os.getenv("UCX_TLS"):
-        os.environ["UCX_TLS"] = "^cuda_ipc"
-    if not os.getenv("UCX_NET_DEVICES"):
-        from connex.pp.transports import ucx_net_devices_for_ip
-
-        nd = os.getenv("CONNEX_RS_NET_DEVICES", "auto")
-        nd = ucx_net_devices_for_ip(ip) if nd == "auto" else nd
-        if nd:
-            os.environ["UCX_NET_DEVICES"] = nd
-
-
 def local_ip() -> str:
     for name in ("CONNEX_RS_LOCAL_IP", "CONNEX_HOST_IP", "VLLM_HOST_IP"):
         if os.getenv(name):
@@ -143,7 +126,9 @@ def make_engine(model: str, stage: int, shard: int, replica: int, port: int = 0,
     import connex_rs  # type: ignore
 
     ip = ip or local_ip()
-    _setup_ucx_env(ip)
+    from connex.pd.dataplane import setup_ucx_env
+
+    setup_ucx_env(ip)
     if torch.cuda.is_available() and torch.cuda.is_initialized():
         # connex-rs classifies GPU memory with the registering thread's
         # current CUDA context.
@@ -704,12 +689,6 @@ class StageLink:
     def send_bytes(self, peer_url: str, key: tuple, data: Any, event=None) -> None:
         """Send a small picklable payload (after ``event`` completes)."""
         self._tx.put((event, peer_url, (BYTES, key, self.url, data)))
-
-    def send_abort(self, peer_url: str, epoch: int) -> None:
-        self._tx.put((None, peer_url, (ABORT, epoch)))
-
-    def send_control(self, peer: Any, msg: Any) -> None:
-        self._tx.put((None, peer, (CONTROL, msg)))
 
     def _tx_loop(self) -> None:
         while not self._closed:

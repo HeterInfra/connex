@@ -54,18 +54,9 @@ class ConnexRsTransferEngine:
 
             engine_cls = connex_rs.Engine
         from connex.pd.membership import PD_STAGE
-        from connex.pp.transports import ucx_net_devices_for_ip
+        from connex.pd.dataplane import setup_ucx_env
 
-        from connex.pd.dataplane import ZCOPY_THRESH
-
-        os.environ.setdefault("UCX_TCP_CM_REUSEADDR", "y")
-        # see connex.pd.dataplane.ConnexRsPlane: no bcopy on GPU memory
-        os.environ.setdefault("UCX_ZCOPY_THRESH", str(ZCOPY_THRESH))
-        if not os.getenv("UCX_NET_DEVICES"):
-            nd = os.getenv("CONNEX_RS_NET_DEVICES", "auto")
-            nd = ucx_net_devices_for_ip(hostname) if nd == "auto" else nd
-            if nd:
-                os.environ["UCX_NET_DEVICES"] = nd
+        setup_ucx_env(hostname)
         # SGLang parses session ids as host:port, so the logical identity of
         # an endpoint is derived from its address: (sglang-pd, role, 0, port).
         # A peer's URL is then rebuilt from the session id alone.

@@ -32,6 +32,40 @@ TIMEOUT = -3
 INVALID = -4
 
 
+def setup_ucx_env(ip: str) -> None:
+    """UCX defaults for every connex-rs engine in this package (PD, PP, RL,
+    EP, SGLang); explicit ``UCX_*`` settings win.
+
+    * ``UCX_ZCOPY_THRESH``: UCX v1 RMA picks bcopy (a CPU memcpy into the
+      destination) for reads below its zero-copy threshold, whatever the
+      memory type. Without a registration cache that threshold grows past a
+      KV block, and the cache is unavailable in processes where UCX cannot
+      install its memory hooks (any process that imported OpenCV, e.g.
+      vLLM): reads into GPU memory then segfault. Pin it below block size;
+      control messages (< 4 KB) stay bcopy.
+    * ``UCX_TLS=^cuda_ipc`` (unless ``CONNEX_RS_CUDA_IPC=1``): a reader that
+      mapped a peer's GPU memory through cuda_ipc keeps that allocation alive
+      after the peer dies (the mapping outlives the exporting process), so a
+      killed instance cannot be restarted on its GPUs until every reader
+      exits. RDMA (GPUDirect, NIC loopback on one host) has no such tie and
+      measured the same.
+    * ``UCX_NET_DEVICES`` from ``CONNEX_RS_NET_DEVICES`` (``auto``: the RDMA
+      device and interface that carry ``ip``; otherwise UCX also tries
+      calico / tailscale interfaces).
+    """
+    os.environ.setdefault("UCX_TCP_CM_REUSEADDR", "y")
+    os.environ.setdefault("UCX_ZCOPY_THRESH", str(ZCOPY_THRESH))
+    if os.getenv("CONNEX_RS_CUDA_IPC", "0") != "1" and not os.getenv("UCX_TLS"):
+        os.environ["UCX_TLS"] = "^cuda_ipc"
+    if not os.getenv("UCX_NET_DEVICES"):
+        from connex.pp.transports import ucx_net_devices_for_ip
+
+        nd = os.getenv("CONNEX_RS_NET_DEVICES", "auto")
+        nd = ucx_net_devices_for_ip(ip) if nd == "auto" else nd
+        if nd:
+            os.environ["UCX_NET_DEVICES"] = nd
+
+
 class KVDataPlane(Protocol):
     name: str
     local_url: str
@@ -86,30 +120,7 @@ class ConnexRsPlane:
             import connex_rs  # type: ignore
 
             engine_cls = connex_rs.Engine
-        os.environ.setdefault("UCX_TCP_CM_REUSEADDR", "y")
-        # UCX v1 RMA picks bcopy (a CPU memcpy into the destination) for reads
-        # below its zero-copy threshold, whatever the memory type. Without a
-        # registration cache that threshold grows past a KV block, and the
-        # cache is unavailable in processes where UCX cannot install its
-        # memory hooks (any process that imported OpenCV, e.g. vLLM): reads
-        # into GPU memory then segfault. Pin the threshold below block size;
-        # control messages (< 4 KB) stay bcopy.
-        os.environ.setdefault("UCX_ZCOPY_THRESH", str(ZCOPY_THRESH))
-        # No CUDA IPC between instances on one host: a reader that mapped a
-        # peer's KV cache through cuda_ipc keeps that GPU memory allocated
-        # after the peer dies (the mapping outlives the exporting process),
-        # so a killed prefill instance cannot be restarted on its GPUs until
-        # every decode instance that read from it exits. RDMA (GPUDirect,
-        # NIC loopback on one host) has no such tie and measured the same.
-        if os.getenv("CONNEX_RS_CUDA_IPC", "0") != "1" and not os.getenv("UCX_TLS"):
-            os.environ["UCX_TLS"] = "^cuda_ipc"
-        if not os.getenv("UCX_NET_DEVICES"):
-            from connex.pp.transports import ucx_net_devices_for_ip
-
-            nd = os.getenv("CONNEX_RS_NET_DEVICES", "auto")
-            nd = ucx_net_devices_for_ip(ip) if nd == "auto" else nd
-            if nd:
-                os.environ["UCX_NET_DEVICES"] = nd
+        setup_ucx_env(ip)
         # identity: (model, role, rank, replica); peer-death events and
         # same-identity rejoin come with it
         _make_cuda_ctx_current()

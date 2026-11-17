@@ -53,7 +53,7 @@ from connex.adapters.vllm.pp.ipcchan import (AHEAD, MASK, _ALIGN, _check, _cu, _
 
 log = logging.getLogger("vllm.connex_pp")
 
-# Smallest RMA on GPU memory (UCX_ZCOPY_THRESH set by link._setup_ucx_env).
+# Smallest RMA on GPU memory (UCX_ZCOPY_THRESH set by connex.pd.dataplane.setup_ucx_env).
 ZCOPY_MIN = 4096
 _CANCEL_WORDS = 64
 _qids = itertools.count(1)
