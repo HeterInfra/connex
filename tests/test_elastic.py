@@ -9,8 +9,7 @@ import pytest
 
 from connex.directory import DirectoryClient, MembershipEvent
 from connex.directory_server import DirectoryServer
-from connex.elastic import ElasticPeerSet
-from connex.ucx_transport import TransportMode, UCXTransport
+from connex.elastic import ElasticPeerSet, ZmqTransport
 
 
 def _free_port() -> int:
@@ -54,10 +53,7 @@ def make(server):
 
 
 def _zmq(port=None):
-    t = UCXTransport("127.0.0.1", port or _free_port(), mode=TransportMode.ZEROMQ,
-                     device="cpu", buffer_size=1024, num_buffers=1)
-    t.start_sync()
-    return t
+    return ZmqTransport("127.0.0.1", port or 0)
 
 
 def test_push_events_join_and_leave(make):

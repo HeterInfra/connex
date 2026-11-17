@@ -36,7 +36,6 @@ setup(
     python_requires=">=3.10",
     install_requires=["torch", "pyzmq", "msgpack", "numpy", "safetensors"],
     extras_require={
-        "ucx": ["ucx-py-cu12"],
         # connex-rs data plane (Rust over UCX), its own repository and package
         # (https://github.com/HeterInfra/connex-rs). For RDMA/GPUDirect, build
         # the wheel against your UCX (third_party/connex-rs submodule, maturin)

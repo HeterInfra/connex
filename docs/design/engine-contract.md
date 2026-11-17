@@ -389,5 +389,3 @@ development, not interop.
   `tests/test_vllm_adapter_equivalence.py`.
 * SGLang: communication prototype (`connex.adapters.sglang`), see
   `sglang-adapter.md`; the engine side does not exist yet.
-* UCX: `integrations/vllm/connex_communicator.py` (UCX data plane, own wire
-  format) has not been moved onto `connex.pp` yet.

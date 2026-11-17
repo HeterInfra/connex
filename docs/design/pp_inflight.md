@@ -287,7 +287,7 @@ lease. Since f85713e UNHEALTHY was handled like DEREGISTERED.
 
 Fixes:
 - DEALER identities are unique per socket (_dealer_identity), as the older
-  connex_communicator already did, so a re-created socket or two upstream
+  UCX communicator (since removed) did, so a re-created socket or two upstream
   replicas sharing a downstream peer can never collide.
 - A stage-0 deregistration no longer closes the last stage's return sockets
   (each reply names its own stage-0 origin); socket close/reset in the event

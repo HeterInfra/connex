@@ -135,19 +135,6 @@ the fork's extensions fail to load `libcudart`.
 | `CONNEX_RS_NET_DEVICES` | `auto` | as above (`UCX_NET_DEVICES` for the KV plane) |
 | `CONNEX_RS_CUDA_IPC` | `0` | allow UCX CUDA IPC between instances on one host (off: a reader's mapping keeps a dead peer's GPU memory allocated) |
 
-### Connex UCX data plane (`connex_communicator.py`, `connex.ucx_transport`)
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `CONNEX_GPU_DIRECT` | `1` in the communicator, `0` in the transport | send GPU tensors without host staging |
-| `CONNEX_ASYNC_SEND` | `0` | asynchronous sends |
-| `CONNEX_UCX_DIRECT_RECV` | `0` | receive directly into the destination tensor |
-| `CONNEX_RECV_TIMEOUT_MS` | `8000` | receive timeout |
-| `CONNEX_UCX_PORT_FALLBACK` | `16` | ports to try when the base port is taken |
-| `CONNEX_UCX_RCACHE_RETRIES` | `5` | RDMA init attempts with the registration cache before falling back to eager |
-| `CONNEX_UCX_ALLOW_TCP_FALLBACK` | `0` | allow RDMA init failure to downgrade to TCP (logged at ERROR) |
-| `UCX_*` | UCX defaults | passed through (e.g. `UCX_TLS`, `UCX_NET_DEVICES`, `UCX_RNDV_THRESH`) |
-
 ### Engine patches (`integrations/vllm/patches`, applied at image build)
 
 | Variable | Default | Meaning |
@@ -173,8 +160,6 @@ the fork's extensions fail to load `libcudart`.
 | Tool | Measures |
 |---|---|
 | `benchmarks/control_plane_bench.py` | route update / lookup / notification latency at N endpoints |
-| `benchmarks/elastic_bench.py`, `run_elastic_matrix.sh` | scale-out readiness, leave lag, kill stall |
-| `benchmarks/ucx_bandwidth.py` | UCX per-message time and bandwidth |
 | `benchmarks/k8s/gen_trace.py` + `trace_load.py` + `run_trace.sh` | open-loop trace replay, goodput (all tokens within the timeout) |
 | `benchmarks/k8s/churn.py`, `run_churn.sh`, `churn_matrix.sh` | trace replay while replica 1 goes down/up (`soft` deregistration or `hard` kill); `PROXY=local` routes the load through the resume proxy |
 | `benchmarks/proxy_overhead.py` | per-chunk cost of the resume proxy (CPU, fake backend) |

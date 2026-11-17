@@ -1,5 +1,5 @@
 # Connex + vLLM + connex-rs (default data plane, Rust over UCX; from the
-# third_party/connex-rs submodule or CONNEX_RS_REPO) + ucx-py + Mooncake
+# third_party/connex-rs submodule or CONNEX_RS_REPO) + Mooncake
 # Transfer Engine (optional data plane).
 #
 #   make image IMAGE=<registry>/connex-vllm:<tag>
@@ -28,7 +28,7 @@
 #
 # Everything comes from public sources: the base image (BASE_IMAGE, default the
 # public vLLM image on Docker Hub, tag latest), vLLM and the PP branches on
-# GitHub, PyPI (ucx-py, Mooncake) and this repository (the build context). No
+# GitHub, PyPI (Mooncake) and this repository (the build context). No
 # model is baked in: stages load MODEL_PATH at runtime, either a mounted
 # directory or a Hugging Face model id (set HF_TOKEN for gated models and mount
 # a cache).
@@ -113,11 +113,9 @@ ARG VLLM_PRECOMPILED_WHEEL_LOCATION=
 ARG VLLM_FORK_REPO=
 ARG VLLM_FORK_REF=380186d57
 ARG FORK_INSTALL=overlay
-# auto: the builds for the base image's CUDA major version (torch.version.cuda):
-# CUDA 12: ucx-py-cu12 + mooncake-transfer-engine; CUDA 13:
-# mooncake-transfer-engine-cuda13 and no ucx-py (no CUDA 13 build is
-# published; it only serves the legacy UCX backend). "none" skips a package.
-ARG UCX_PY_PKG=auto
+# auto: the Mooncake build for the base image's CUDA major version
+# (torch.version.cuda): mooncake-transfer-engine for CUDA 12,
+# mooncake-transfer-engine-cuda13 for CUDA 13. "none" skips it.
 ARG MOONCAKE_PKG=auto
 ARG APPLY_PATCHES=all
 ARG MAX_JOBS=8
@@ -169,11 +167,9 @@ RUN set -eux; \
 # ---- communication libraries ----------------------------------------------
 RUN set -eux; \
     cu=$(python3 -c 'import torch; print((torch.version.cuda or "12").split(".")[0])' 2>/dev/null || echo 12); \
-    ucx="${UCX_PY_PKG}"; \
-    if [ "$ucx" = auto ]; then ucx=none; [ "$cu" -le 12 ] && ucx="ucx-py-cu${cu}"; fi; \
     mc="${MOONCAKE_PKG}"; \
     if [ "$mc" = auto ]; then mc=mooncake-transfer-engine; [ "$cu" -ge 13 ] && mc=mooncake-transfer-engine-cuda13; fi; \
-    pkgs=""; for p in "$ucx" "$mc"; do [ "$p" = none ] || pkgs="$pkgs $p"; done; \
+    pkgs=""; for p in "$mc"; do [ "$p" = none ] || pkgs="$pkgs $p"; done; \
     echo "CUDA $cu:$pkgs"; \
     pip install ${PIP_INDEX_URL:+-i $PIP_INDEX_URL} $pkgs msgpack pyzmq
 
@@ -201,8 +197,7 @@ RUN set -eux; \
         elif [ "${APPLY_PATCHES}" = block_table ]; then \
             python3 /opt/connex/integrations/vllm/patches/fast_external_pp_block_table.py "$vdir/v1/worker/gpu_model_runner.py"; \
         fi; \
-        cp /opt/connex/integrations/vllm/connex_communicator.py \
-           /opt/connex/integrations/vllm/connexte_communicator.py \
+        cp /opt/connex/integrations/vllm/connexte_communicator.py \
            "$vdir/distributed/device_communicators/"; \
     else \
         python3 -c "import vllm.engine.arg_utils as a, vllm.v1.outputs as o; \
@@ -217,8 +212,8 @@ assert 'lost_all_kv' in o.KVConnectorOutput.__dataclass_fields__, 'vLLM lacks KV
     stubdir=/tmp/libcuda-stub; mkdir -p "$stubdir"; \
     stub=$(ls /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/targets/*/lib/stubs/libcuda.so 2>/dev/null | head -1 || true); \
     [ -n "$stub" ] && ln -sf "$stub" "$stubdir/libcuda.so.1"; \
-    LD_LIBRARY_PATH=${cudart}:${stubdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} python3 -c "import importlib.util as u, connex; mods = [m for m in ('ucp', 'mooncake.engine') if u.find_spec(m.split('.')[0])]; [__import__(m) for m in mods]; print('connex', connex.__version__, 'loaded', mods)" || \
-      { echo "ERROR: ucx-py/Mooncake do not load in this base image; UCX_PY_PKG and MOONCAKE_PKG (default: picked from torch.version.cuda) must match the base image's CUDA major version" >&2; exit 1; }; \
+    LD_LIBRARY_PATH=${cudart}:${stubdir}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} python3 -c "import importlib.util as u, connex; mods = [m for m in ('mooncake.engine',) if u.find_spec(m.split('.')[0])]; [__import__(m) for m in mods]; print('connex', connex.__version__, 'loaded', mods)" || \
+      { echo "ERROR: Mooncake does not load in this base image; MOONCAKE_PKG (default: picked from torch.version.cuda) must match the base image's CUDA major version" >&2; exit 1; }; \
     if [ -d /opt/ucx/lib ] && ls /opt/ucx/lib/libucp.so* >/dev/null 2>&1; then \
       LD_LIBRARY_PATH=${stubdir} python3 -c "import connex_rs; e = connex_rs.Engine('build', 0, listen_ip='127.0.0.1'); print('connex-rs', e.local_url); e.close()" || \
         { echo "ERROR: connex_rs does not load (UCX in /opt/ucx?)" >&2; exit 1; }; \

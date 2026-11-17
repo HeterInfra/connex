@@ -31,10 +31,10 @@ such a change.
   directory (`connex.front_router`, `connex.directory`), heartbeat, and are
   evicted when their lease expires. Peers receive JOIN, LEAVE, failure and
   re-registration (address change) events, or poll.
-* **Versioned routes and cutover.** Routes carry epochs
-  (`connex.mobility_control.VersionedRouteTable`); a newer epoch for the same
-  LID supersedes the old one, a draining route takes no new traffic, and the
-  cutover state machine (`connex.cutover_fsm`) orders the switch.
+* **Versioned routes and cutover.** Routes carry epochs (front-router
+  `RouteManager`, client cache `connex.epc_client.RouteTableCache`); a newer
+  epoch for the same LID supersedes the old one, and a draining route takes
+  no new traffic while its in-flight work finishes (`connex.elastic`).
 * **Step-level delivery contract.** Every message step carries a correlation
   id; sends and receives are idempotent and retried, a reply cache answers
   duplicates, and stale replies are filtered (`connex.pp`). This is what lets
@@ -55,10 +55,10 @@ release:
 | Scenario | Uses | Status |
 |---|---|---|
 | Pipeline parallelism, many replica chains | all primitives; `connex.pp`, vLLM adapter | implemented and validated on GPUs (`docs/results.md`) |
-| Scale up / down | membership, sticky choice | implemented and validated (pipeline replicas; `ElasticPeerSet` benchmark in `elastic-scaling-performance.md`) |
+| Scale up / down | membership, sticky choice | implemented and validated (pipeline replicas, PD pools, RL rollout pools) |
 | Failover with in-flight handover across replicas | step contract, fast handover, state hooks, resume proxy | implemented and validated for pipeline stages |
 | Migration (same LID, new address) | re-registration events, versioned routes | implemented, partly unit-tested, not validated at scale |
-| Heterogeneous transports / hardware | ConnexTE (Mooncake RDMA/TCP), UCX, ZeroMQ, capability negotiation | transports validated; mixed GPU types not validated |
+| Heterogeneous transports / hardware | connex-rs (UCX: RDMA/TCP, GPUDirect), Mooncake RDMA/TCP, ZeroMQ, PD host staging | transports validated; mixed GPU types not validated |
 | Prefill-decode disaggregation (prefill and decode pools) | PD roles in LIDs, membership, KV holds and pulls (`connex.pd`), vLLM connector, SGLang backend, PD router | implemented and validated on upstream vLLM 0.32.0 and SGLang 0.5.22 on one host (`pd-disaggregation.md`) |
 | Attention-FFN disaggregation | generic primitives | roadmap |
 
@@ -73,10 +73,10 @@ chains whose stages fail over to each other.
 * `engine-contract.md`: what an engine adapter must implement.
 * `engine-agnostic-core.md`: how `connex.pp` was split out of the vLLM
   communicator and how equivalence is checked.
-* `vllm-churn-resilience.md`, `reprefill-on-failover.md`, `pp_inflight.md`:
+* `reprefill-on-failover.md`, `pp_inflight.md`:
   the failover and K-in-flight mechanisms.
 * `request-resume-proxy.md`: hiding front-end replica deaths from clients.
-* `elastic-scaling-performance.md`, `connexte-cluster-performance.md`:
+* `connexte-cluster-performance.md`:
   measurements and the reasons behind the defaults.
 * `public-deploy-validation.md`: the image and k8s path checked end to end
   on GPUs, and what that check found.

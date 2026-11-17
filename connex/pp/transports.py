@@ -17,11 +17,6 @@ carry it:
   tests;
 * none: the endpoint falls back to the ZeroMQ-only path
   (:mod:`connex.pp.zmq_base`).
-
-UCX: the UCX-based communicator (integrations/vllm/connex_communicator.py,
-built on :mod:`connex.ucx_transport`) is a separate, older data plane with
-its own wire format; it is not routed through this interface yet (see
-docs/design/engine-contract.md, "Status").
 """
 
 from __future__ import annotations

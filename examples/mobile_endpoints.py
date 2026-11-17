@@ -13,8 +13,7 @@ import time
 
 from connex.directory import DirectoryClient
 from connex.directory_server import DirectoryServer
-from connex.elastic import ElasticPeerSet
-from connex.ucx_transport import TransportMode, UCXTransport
+from connex.elastic import ElasticPeerSet, ZmqTransport
 
 GROUP = 1  # the logical group the sender talks to (the "stage" field of the LID)
 
@@ -25,11 +24,8 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def transport() -> UCXTransport:
-    t = UCXTransport("127.0.0.1", free_port(), mode=TransportMode.ZEROMQ,
-                     device="cpu", buffer_size=1 << 16, num_buffers=1)
-    t.start_sync()
-    return t
+def transport() -> ZmqTransport:
+    return ZmqTransport("127.0.0.1")
 
 
 def until(cond, timeout=5.0) -> None:
@@ -45,7 +41,7 @@ def main() -> None:
     directory = DirectoryServer(f"127.0.0.1:{free_port()}", f"127.0.0.1:{free_port()}")
     directory.start()
 
-    def member(replica: int, rx: UCXTransport) -> DirectoryClient:
+    def member(replica: int, rx: ZmqTransport) -> DirectoryClient:
         """A worker JOINs under the logical id (model, group, shard, replica)."""
         c = DirectoryClient(directory.bind_addr, "demo", stage_idx=GROUP, replica_idx=replica,
                             local_addresses=[f"127.0.0.1:{rx.local_port}"])

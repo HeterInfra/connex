@@ -54,7 +54,7 @@ git clone <vllm-fork-repo> /path/to/vllm-fork && git -C /path/to/vllm-fork check
 VLLM_FORK_DIR=/path/to/vllm-fork python -m pytest -q tests
 ```
 
-Without `VLLM_FORK_DIR`, ucx-py or GPUs, the affected tests skip.
+Without `VLLM_FORK_DIR`, connex-rs or GPUs, the affected tests skip.
 
 ## Guidelines
 

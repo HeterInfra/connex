@@ -27,6 +27,10 @@ Typical use on an upstream stage::
 
 ``send``, ``pick`` and ``mark_failed`` must be called from one thread, the
 same one that owns ``directory_client``'s request socket.
+
+``transport`` is anything with ``connect_sync(host, port) -> endpoint``,
+``send_sync(endpoint, data, tag)`` and ``close_endpoint(endpoint)``;
+:class:`ZmqTransport` is a small CPU one for demos and tests.
 """
 
 from __future__ import annotations
@@ -261,3 +265,63 @@ class ElasticPeerSet:
             self.transport.close_endpoint(ep)
         except Exception as e:
             logger.debug("close_endpoint failed: %s", e)
+
+
+class ZmqTransport:
+    """Minimal message transport over ZeroMQ PUSH/PULL (CPU, no GPU memory):
+    the ``transport`` surface ``ElasticPeerSet`` needs, plus ``recv_sync``
+    for the receiving side. Endpoints are cached by address, like the RDMA
+    transports, so a peer that rejoins at the same address reuses one."""
+
+    def __init__(self, host: str = "127.0.0.1", port: int = 0):
+        import zmq
+
+        self._zmq = zmq
+        self._ctx = zmq.Context.instance()
+        self._lock = threading.Lock()
+        self._eps: dict[tuple[str, int], Any] = {}
+        self._rx = self._ctx.socket(zmq.PULL)
+        self._rx.setsockopt(zmq.LINGER, 0)
+        if port:
+            self._rx.bind(f"tcp://{host}:{port}")
+            self.local_port = port
+        else:
+            self.local_port = self._rx.bind_to_random_port(f"tcp://{host}")
+
+    def start_sync(self) -> None:   # kept for symmetry with other transports
+        pass
+
+    def connect_sync(self, host: str, port: int) -> Any:
+        with self._lock:
+            ep = self._eps.get((host, port))
+            if ep is None:
+                ep = self._ctx.socket(self._zmq.PUSH)
+                ep.setsockopt(self._zmq.LINGER, 0)
+                ep.setsockopt(self._zmq.SNDTIMEO, 2000)
+                ep.connect(f"tcp://{host}:{port}")
+                self._eps[(host, port)] = ep
+            return ep
+
+    def send_sync(self, ep: Any, data: bytes, tag: int = 0) -> None:
+        with self._lock:
+            ep.send(data)
+
+    def recv_sync(self, timeout_ms: int = 1000) -> Optional[bytes]:
+        if self._rx.poll(timeout_ms):
+            return self._rx.recv()
+        return None
+
+    def close_endpoint(self, ep: Any) -> bool:
+        with self._lock:
+            for k, v in list(self._eps.items()):
+                if v is ep:
+                    del self._eps[k]
+        ep.close(0)
+        return True
+
+    def stop_sync(self) -> None:
+        with self._lock:
+            for ep in self._eps.values():
+                ep.close(0)
+            self._eps.clear()
+        self._rx.close(0)

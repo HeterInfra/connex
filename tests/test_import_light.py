@@ -25,6 +25,6 @@ def test_lazy_names_resolve():
     import connex
 
     assert set(connex.__all__) <= set(dir(connex))
-    assert connex.RouteTable.__name__ == "RouteTable"
+    assert connex.ElasticPeerSet.__name__ == "ElasticPeerSet"
     with pytest.raises(AttributeError):
         connex.no_such_name

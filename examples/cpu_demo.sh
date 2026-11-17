@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the Connex project
 # CPU-only end-to-end demo, no GPU, RDMA or vLLM needed:
 #   1. two pipeline stages find each other through the Connex directory and
-#      exchange a tensor (ZeroMQ, or UCX over TCP if ucx-py is installed);
+#      exchange a tensor over ZeroMQ;
 #   2. the request retry/resume proxy in front of two deterministic fake
 #      OpenAI backends: one backend is killed mid-stream, the client still
 #      receives the full, correct completion.

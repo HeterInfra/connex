@@ -38,10 +38,10 @@ jobs:
           pip install -e ".[test]"
       - name: Shell syntax and lint
         run: |
-          for f in docker/*.sh benchmarks/*.sh benchmarks/k8s/*.sh examples/*.sh; do bash -n "$f"; done
-          shellcheck -S warning docker/*.sh benchmarks/*.sh benchmarks/k8s/*.sh examples/*.sh
+          for f in docker/*.sh benchmarks/k8s/*.sh examples/*.sh; do bash -n "$f"; done
+          shellcheck -S warning docker/*.sh benchmarks/k8s/*.sh examples/*.sh
       - name: Unit tests
-        # Tests that need the vLLM fork source (VLLM_FORK_DIR), ucx-py or GPUs skip.
+        # Tests that need the vLLM fork source (VLLM_FORK_DIR), connex-rs or GPUs skip.
         run: python -m pytest -q -p no:cacheprovider tests
       - name: CPU-only end-to-end demo (directory + ZeroMQ, resume proxy)
         run: examples/cpu_demo.sh

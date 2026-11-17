@@ -37,7 +37,7 @@
 #                  memory and CUDA-graph profiling passes at start, ~3.5 s off
 #                  every (re)start of an 8B stage; must cover NUM_GPU_BLOCKS
 # Common env (defaults in brackets):
-#   BACKEND        (fork) connexte | connex [connexte]
+#   BACKEND        (fork) pipeline communicator [connexte]
 #   REPLICA        replica index of this stage [0]
 #   MODEL_PATH     model directory inside the container, or a Hugging Face
 #                  model id downloaded at start (HF_TOKEN for gated models) [/model]

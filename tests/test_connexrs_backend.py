@@ -32,7 +32,7 @@ from test_pp_core import (  # noqa: E402
 @pytest.fixture(autouse=True)
 def _ucx_env(monkeypatch):
     # UCX reads its environment when an engine starts; keep it local to
-    # these tests (other tests use ucx-py with their own transports).
+    # these tests.
     monkeypatch.setenv("UCX_TLS", os.environ.get("CONNEX_RS_TEST_TLS", "tcp"))
     monkeypatch.setenv("UCX_TCP_CM_REUSEADDR", "y")
     monkeypatch.setenv("UCX_WARN_UNUSED_ENV_VARS", "n")

@@ -22,7 +22,6 @@ fi
   echo "{"
   echo "\"connex_head\": \"$(git -C ../.. rev-parse --short HEAD 2>/dev/null || echo unknown)\","
   echo "\"connexte_md5\": \"$(md5sum ../../integrations/vllm/connexte_communicator.py | cut -c1-12)\","
-  echo "\"connex_md5\": \"$(md5sum ../../integrations/vllm/connex_communicator.py | cut -c1-12)\","
   echo "\"pods\": $pods,"
   echo "\"trace\": \"$TRACE\", \"endpoints\": \"$EP\""
   echo "}"

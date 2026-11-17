@@ -90,7 +90,7 @@ a CPU demo to Kubernetes: [`docs/deploy.md`](docs/deploy.md).
 ## How it works
 
 <p align="center">
-  <img alt="Connex control plane (front router / directory, mobility, step protocol) and the pluggable data plane (connex-rs, Mooncake TE, UCX, ZeroMQ)" src="docs/assets/architecture.svg" width="860">
+  <img alt="Connex control plane (front router / directory, mobility, step protocol) and the pluggable data plane (connex-rs, Mooncake TE, host staging, ZeroMQ)" src="docs/assets/architecture.svg" width="860">
 </p>
 
 Connex separates *who talks to whom, and what happens when that changes*
@@ -101,7 +101,7 @@ work to another replica. Bytes move through a pluggable data plane: on RDMA
 hosts the default is [**connex-rs**](https://github.com/HeterInfra/connex-rs),
 our Rust data plane over UCX, which reports a dead peer within milliseconds
 and lets a restarted process rejoin under the same identity. Mooncake
-Transfer Engine, UCX and ZeroMQ also work. Details: [`docs/overview.md`](docs/overview.md).
+Transfer Engine and ZeroMQ also work. Details: [`docs/overview.md`](docs/overview.md).
 
 ## Results
 

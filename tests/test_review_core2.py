@@ -1,41 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for review fixes in protocol, front_router, epc_client,
-elastic and mobility_control."""
+"""Regression tests for review fixes in front_router, epc_client and
+elastic."""
 
 import socket
 import time
-
-import pytest
-
-from connex.protocol import (
-    LogicalEndpointID as PLID,
-    MobilityMessage,
-    StreamID,
-    create_data_message,
-    create_heartbeat,
-)
-
-
-def test_protocol_header_roundtrip():
-    src, dst = PLID("m", 0), PLID("m", 1)
-    msg = create_data_message(StreamID("r1", "forward", 3), src, dst,
-                              epoch=7, seqno=42, payload=b"hello")
-    raw = msg.serialize()  # used to raise struct.error (timestamp > uint32)
-    assert len(raw) == 64 + 5
-    back = MobilityMessage.deserialize(raw)
-    assert back.payload == b"hello"
-    assert back.header.epoch == 7 and back.header.seqno == 42
-    assert back.header.timestamp_us == msg.header.timestamp_us & 0xFFFFFFFF
-    hb = MobilityMessage.deserialize(create_heartbeat(src, dst, 1).serialize())
-    assert hb.payload == b""
-
-
-def test_protocol_truncated_payload_rejected():
-    src, dst = PLID("m", 0), PLID("m", 1)
-    raw = create_data_message(StreamID("r", "forward"), src, dst, 0, 0,
-                              b"x" * 10).serialize()
-    with pytest.raises(ValueError):
-        MobilityMessage.deserialize(raw[:-1])
 
 
 class _Bus:
@@ -130,17 +98,3 @@ def test_elastic_draining_endpoint_closed_after_stop():
     time.sleep(0.2)
     assert tr.closed == ["ep0"]
     ps._want(("m", 1, 0, 1), "h:2")  # late event after stop: no exception
-
-
-def test_dual_path_switches_at_cutover_seqno():
-    from connex.mobility_control import (
-        ConnectionCapability, DualPathCutoverManager, VersionedRoute, VersionedRouteTable,
-    )
-    lid = PLID("m", 1)
-    old = VersionedRoute(lid, ["a"], ConnectionCapability(), epoch=0)
-    new = VersionedRoute(lid, ["b"], ConnectionCapability(), epoch=1)
-    mgr = DualPathCutoverManager(VersionedRouteTable(PLID("m", 0)))
-    sid = StreamID("r", "forward")
-    mgr.start_cutover(sid, old, new, cutover_seqno=5)
-    assert mgr.select_path(sid, 4) is old
-    assert mgr.select_path(sid, 5) is new

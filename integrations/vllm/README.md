@@ -129,7 +129,7 @@ instances it served as soon as it is ready).
 | failover | recompute all running requests of the pipeline | recompute only the requests the new replica lacks |
 | a replica shared by several pipelines | no: one pipeline at a time (spares are taken over) | yes |
 | membership | static list in `CONNEX_PP_STAGES` | front-router, leases |
-| data plane | connex-rs | Mooncake TE, connex-rs, UCX, ZeroMQ |
+| data plane | connex-rs | Mooncake TE, connex-rs, ZeroMQ |
 | stage-0 TP > 1 | yes, with failover | with the resume proxy |
 
 Stage pairs on one host exchange the hidden states and the sampled tokens
@@ -172,8 +172,7 @@ BASE_IMAGE=<vLLM image matching the fork's torch>`; deployment:
 | File | Purpose |
 |---|---|
 | `connexte_communicator.py` | ConnexTE: Mooncake TE data plane + Connex control plane (recommended). A re-export shim of `connex.adapters.vllm.connexte`, built on the engine-neutral core `connex.pp` (see `docs/design/engine-contract.md`); needs the Connex package importable |
-| `connex_communicator.py` | Connex over UCX (RDMA/TCP) |
-| `zeromq_communicator.py` | ZeroMQ base communicator the others build on (same as the fork's copy) |
+| `zeromq_communicator.py` | ZeroMQ base communicator ConnexTE builds on (same as the fork's copy) |
 | `pipeline_comm_metrics.py` | Prometheus metrics for pipeline communication (same as the fork's copy) |
 | `patches/` | engine patches for the external-PP fork; `apply_all.py` applies them in order |
 
@@ -194,11 +193,11 @@ The easiest way is the image in `docker/Dockerfile` built with
    checkout; the communicators import `connex.*`;
    remove any vendored `vllm/connex` package from the fork so the standalone
    package is used).
-2. Copy `connex_communicator.py` and `connexte_communicator.py` into
+2. Copy `connexte_communicator.py` into
    `vllm/distributed/device_communicators/`.
 3. `python patches/apply_all.py <vllm>/v1/worker/gpu_model_runner.py`
    (patches the runner and its siblings; idempotent).
-4. Start stages with `--pipeline-comm-backend connexte` (or `connex`); see
+4. Start stages with `--pipeline-comm-backend connexte`; see
    `docker/launch_stage.sh` for the full command line.
 
 Runtime knobs are listed in the configuration tables of the top-level

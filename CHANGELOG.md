@@ -1,5 +1,39 @@
 # Changelog
 
+## Unreleased
+
+This release removes the pre-0.2 endpoint stack that no supported path
+used (about 12k lines) and gives every connex-rs engine the same UCX
+defaults.
+
+**Breaking:** the following modules are gone, together with their names in
+the lazy `connex.<Name>` exports: `epc_v3`, `epc_v31`, `epc_api`,
+`ucx_transport`, `gpu_fastpath`, `mooncake_integration`, `mobility_control`,
+`mobility_dataplane`, `qos_scheduler`, `stream_manager`, `cutover_fsm`,
+`route_table`. The fork's UCX communicator
+(`integrations/vllm/connex_communicator.py`, `BACKEND=connex`) and the
+`connex-ai[ucx]` extra (ucx-py) are removed; the image no longer installs
+ucx-py. Use connex-rs (`connex-ai[rs]`) or ConnexTE (Mooncake) instead.
+`connex.protocol` keeps only `LogicalEndpointID` and `PDRole`. (#24, #25)
+
+### Fixes
+
+- RL weight sync and the SGLang PD backend now set `UCX_TLS=^cuda_ipc` like
+  PD and PP, so a reader on the same host no longer keeps a dead peer's GPU
+  memory mapped; RL also honours `CONNEX_RS_NET_DEVICES`. All four call
+  `connex.pd.dataplane.setup_ucx_env`. (#21)
+
+### Other changes
+
+- The CPU examples (`examples/mobile_endpoints.py`,
+  `examples/two_stage_pipeline.py`, `examples/cpu_demo.sh`) run over the new
+  `connex.elastic.ZmqTransport`.
+- Removed the UCX-only benchmarks (`elastic_bench.py`,
+  `run_elastic_matrix.sh`, `summarize.py`, `ucx_bandwidth.py`) and the design
+  notes that described the removed code; docs and the architecture figure
+  no longer point at removed modules. (#26)
+- Removed unused `StageLink.send_abort` / `send_control`. (#24)
+
 ## 0.2.1
 
 This release speeds up the control paths of PD, RL and EP, makes PP

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Two pipeline stages that find each other through the directory and exchange
-a tensor. Runs on one machine with no GPU; uses UCX if ucx-py is installed,
-otherwise ZeroMQ.
+a tensor. Runs on one machine with no GPU, over ZeroMQ.
 
     python examples/two_stage_pipeline.py
 """
@@ -14,9 +13,7 @@ import torch
 
 from connex.directory import DirectoryClient
 from connex.directory_server import DirectoryServer
-from connex.ucx_transport import UCX_AVAILABLE, TransportMode, UCXTransport
-
-MODE = TransportMode.UCX_TCP if UCX_AVAILABLE else TransportMode.ZEROMQ
+from connex.elastic import ZmqTransport
 
 
 def free_port() -> int:
@@ -27,19 +24,14 @@ def free_port() -> int:
 
 def stage1(directory: str, port: int, ready, result) -> None:
     """Downstream stage: JOIN the directory, receive one activation, LEAVE."""
-    transport = UCXTransport("127.0.0.1", port, mode=MODE, device="cpu",
-                             buffer_size=1 << 20, num_buffers=1)
-    transport.start_sync()
+    transport = ZmqTransport("127.0.0.1", port)
     client = DirectoryClient(directory, "demo", stage_idx=1,
                              local_addresses=[f"127.0.0.1:{port}"])
     client.start()
     client.register()
     ready.set()
 
-    if MODE == TransportMode.ZEROMQ:
-        data = transport.recv_sync(timeout_ms=10_000)
-    else:
-        _peer, data = transport.recv_from_queue(timeout=10)
+    data = transport.recv_sync(timeout_ms=10_000)
     result.put(torch.frombuffer(bytearray(data), dtype=torch.float32).tolist())
 
     client.deregister()
@@ -70,12 +62,10 @@ def main() -> None:
         raise SystemExit("stage 1 did not appear in the directory")
     host, port = peer.primary_address.rsplit(":", 1)
 
-    transport = UCXTransport("127.0.0.1", free_port(), mode=MODE, device="cpu",
-                             buffer_size=1 << 20, num_buffers=1)
-    transport.start_sync()
+    transport = ZmqTransport("127.0.0.1")
     ep = transport.connect_sync(host, int(port))
-    transport.send_sync(ep, torch.arange(4, dtype=torch.float32))
-    print(f"[{MODE.value}] stage 1 received:", result.get(timeout=15))
+    transport.send_sync(ep, torch.arange(4, dtype=torch.float32).numpy().tobytes())
+    print("stage 1 received:", result.get(timeout=15))
 
     proc.join(10)
     print("members after stage 1 left:", list(server.members()))
