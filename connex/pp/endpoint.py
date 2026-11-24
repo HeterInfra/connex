@@ -2048,6 +2048,22 @@ class ConnexTEEndpoint(ZmqStageBase):
                 self.forward_socket = self._connect_dealer(endpoint, routing_key)
         return self.forward_socket
 
+    def _with_origin(self, tensor_dict):
+        """ZeroMQ fallback: stamp the originating stage 0 like the GPUDirect path.
+
+        Stage 0 adds its router endpoint and middle stages forward the origin of
+        the step they received, so a last stage shared by several stage-0
+        replicas replies to the one that sent the step (_get_return_socket).
+        """
+        if self.is_last or not isinstance(tensor_dict, dict) or tensor_dict.get("__stage0_endpoint__"):
+            return tensor_dict
+        origin = self.router_endpoint if self.is_first else self._origin_ep()
+        if not origin:
+            return tensor_dict
+        stamped = dict(tensor_dict)
+        stamped["__stage0_endpoint__"] = origin
+        return stamped
+
     def _get_return_socket(self) -> Any:
         """Get return socket for sending results back to stage 0.
 
@@ -2104,7 +2120,7 @@ class ConnexTEEndpoint(ZmqStageBase):
         if self.is_first and self._inflight == 1:
             self._mark_sent()
         if not self._mooncake_available:
-            return super().send_tensor_dict(tensor_dict, dst)
+            return super().send_tensor_dict(self._with_origin(tensor_dict), dst)
 
         import pickle
 
@@ -2211,7 +2227,10 @@ class ConnexTEEndpoint(ZmqStageBase):
         On timeout, returns None so the caller can retry the full send+recv cycle.
         """
         if not self._mooncake_available:
-            return super().recv_tensor_dict(src)
+            td = super().recv_tensor_dict(src)
+            if isinstance(td, dict) and td.get("__stage0_endpoint__"):
+                self._current_originator_endpoint = td["__stage0_endpoint__"]
+            return td
 
         import pickle
 

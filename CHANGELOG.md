@@ -22,6 +22,14 @@ ucx-py. Use connex-rs (`connex-ai[rs]`) or ConnexTE (Mooncake) instead.
   PD and PP, so a reader on the same host no longer keeps a dead peer's GPU
   memory mapped; RL also honours `CONNEX_RS_NET_DEVICES`. All four call
   `connex.pd.dataplane.setup_ucx_env`. (#21)
+- PP: several stage-0 replicas can share one downstream chain on the ZeroMQ
+  fallback path (`CONNEX_PP_BACKEND=zmq`, or no transfer engine), as they
+  already could with connex-rs or Mooncake. Before, stage 0 did not stamp
+  `__stage0_endpoint__` on that path, so the last stage sent every reply to
+  one stage-0 replica. Now stage 0 stamps it, middle stages forward it, and
+  the last stage replies to the stage 0 that sent the step. A new end-to-end
+  test covers two stage-0 replicas over a shared stage 1 and stage 2 on both
+  paths.
 
 ### Other changes
 
