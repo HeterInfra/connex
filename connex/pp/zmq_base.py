@@ -247,10 +247,14 @@ class ZmqStageBase:
         metadata_bytes = pickle.dumps(metadata_with_timestamp)
 
         enqueue_start = time.time()
-        socket.send_multipart([len(metadata_bytes).to_bytes(8, "big"), metadata_bytes,
-                               len(tensor_bytes_list).to_bytes(8, "big")])
+        # One multipart message per step: ZeroMQ delivers it atomically, so steps
+        # from several upstream peers (e.g. stage-0 replicas sharing this stage)
+        # cannot interleave their frames at the receiving ROUTER.
+        frames = [len(metadata_bytes).to_bytes(8, "big"), metadata_bytes,
+                  len(tensor_bytes_list).to_bytes(8, "big")]
         for tensor_bytes in tensor_bytes_list:
-            socket.send_multipart([len(tensor_bytes).to_bytes(8, "big"), tensor_bytes])
+            frames += [len(tensor_bytes).to_bytes(8, "big"), tensor_bytes]
+        socket.send_multipart(frames)
         enqueue_time = time.time() - enqueue_start
 
         total_send_time = time.time() - send_start
@@ -292,8 +296,15 @@ class ZmqStageBase:
             meta_received_time = time.time()
             tensor_bytes_list: list[bytes] = []
             total_bytes_received = len(metadata_bytes) + 16
-            for _ in range(num_tensors):
-                _identity, tensor_parts = self._recv_with_identity(self.router_socket)
+            inline = parts[3:]
+            if inline and len(inline) != 2 * num_tensors:
+                raise RuntimeError(
+                    f"Invalid message format: {len(inline)} tensor frames for {num_tensors} tensors")
+            for i in range(num_tensors):
+                if inline:  # current format: all tensors in the same message
+                    tensor_parts = inline[2 * i:2 * i + 2]
+                else:  # older senders: one message per tensor
+                    _identity, tensor_parts = self._recv_with_identity(self.router_socket)
                 if len(tensor_parts) < 2:
                     raise RuntimeError("Invalid tensor message format")
                 tensor_size = int.from_bytes(tensor_parts[0], "big")

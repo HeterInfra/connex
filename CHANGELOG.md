@@ -30,6 +30,14 @@ ucx-py. Use connex-rs (`connex-ai[rs]`) or ConnexTE (Mooncake) instead.
   the last stage replies to the stage 0 that sent the step. A new end-to-end
   test covers two stage-0 replicas over a shared stage 1 and stage 2 on both
   paths.
+- PP, ZeroMQ fallback: a step is now one multipart message instead of a
+  header message plus one message per tensor. With several upstream peers,
+  their messages could interleave at the receiving stage ("Invalid magic
+  number"). Receivers still accept the old layout, but a receiver older than
+  this release cannot read the new one, so upgrade all stages together.
+- PP, ZeroMQ fallback: recv returns None after the recv timeout
+  (`CONNEXTE_RECV_TIMEOUT_MS`), like the transfer-engine path, instead of
+  blocking forever, so a stage worker can retry or stop.
 
 ### Other changes
 

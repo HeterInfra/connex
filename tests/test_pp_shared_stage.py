@@ -90,14 +90,20 @@ def test_two_stage0_replicas_share_downstream(mk, path, k):
     links = [Stage0Link(s0a, Stage0Engine(), recv_timeout_s=3.0),
              Stage0Link(s0b, Stage0Engine(), recv_timeout_s=3.0)]
     outs, errors = [[], []], []
-    with Pump([StageWorker(s1, e1, e1.compute, commit=e1.commit),
-               StageWorker(s2, e2, e2.compute, commit=e2.commit)]):
+    pump = Pump([StageWorker(s1, e1, e1.compute, commit=e1.commit),
+                 StageWorker(s2, e2, e2.compute, commit=e2.commit)])
+    with pump:
         ts = [threading.Thread(target=_drive, args=(links[0], ["a0", "a1"], 0.0, 6, outs[0], errors)),
               threading.Thread(target=_drive, args=(links[1], ["b0", "b1"], 100.0, 6, outs[1], errors))]
         for t in ts:
             t.start()
         for t in ts:
             t.join(60)
+    # Pump joins for 5 s only; a worker still inside recv when the fixture closes
+    # the endpoints makes ZeroMQ abort the process (seen on one slow CPU).
+    for t in pump.threads:
+        t.join(30)
+    assert not any(t.is_alive() for t in pump.threads)
     assert not errors, errors
     assert outs[0] == [[2.0, 2.0]] * 7
     assert outs[1] == [[102.0, 102.0]] * 7

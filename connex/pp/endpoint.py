@@ -2227,6 +2227,12 @@ class ConnexTEEndpoint(ZmqStageBase):
         On timeout, returns None so the caller can retry the full send+recv cycle.
         """
         if not self._mooncake_available:
+            # same contract as the transfer-engine path: None after the recv
+            # timeout, so a stage worker can retry or stop instead of blocking
+            # forever (the ZeroMQ base is built with timeout_ms=-1)
+            if self.router_socket is not None and not self.router_socket.poll(
+                    self._recv_timeout_ms(), zmq.POLLIN):
+                return None
             td = super().recv_tensor_dict(src)
             if isinstance(td, dict) and td.get("__stage0_endpoint__"):
                 self._current_originator_endpoint = td["__stage0_endpoint__"]
