@@ -100,6 +100,10 @@ READ_TIMEOUT_MS = int(os.getenv("CONNEX_PP_READ_TIMEOUT_MS", "10000"))
 CHAIN_ARM_TIMEOUT_MS = int(os.getenv("CONNEX_PP_CHAIN_ARM_TIMEOUT_MS", "60000"))
 # Waiting for space in the send ring longer than this raises.
 RING_TIMEOUT_S = float(os.getenv("CONNEX_PP_RING_TIMEOUT_S", "60"))
+# A receive waited for on the CPU whose bytes have not come in this long
+# stops the process. Longer than the executor's step timeout plus its wait
+# for a replacement, which release such a wait first (ABORT).
+RECV_WAIT_S = float(os.getenv("CONNEX_PP_RECV_TIMEOUT_S", "300"))
 # Re-announce a push channel to a sender that still sends without it.
 REANNOUNCE_S = 1.0
 # RMA on GPU memory is at least this long (see rdmachan.ZCOPY_MIN).
@@ -650,6 +654,24 @@ class StageLink:
         released, instead of holding ring space and polls."""
         self.close_chans(lambda k: k in self._tx_chans and k[0] and k[0] not in keep)
 
+    def retain_rx(self, keep: set) -> None:
+        """Retire the channels we receive on from peers outside ``keep``
+        (an upstream that left the route and is no spare): otherwise their
+        rings (GPU memory for hidden states, an imported CUDA IPC mapping
+        for same-host peers) stay allocated and registered for the life of
+        the process. The route only changes with a new epoch, so any wait
+        on such a channel belongs to an aborted epoch."""
+        def off(k) -> bool:
+            return bool(k and k[0]) and k[0] not in keep
+
+        with self._chan_lock:
+            # Keys taken up front: close_chans pops the current channels
+            # before it looks at the older push channels of the same keys.
+            gone = {k for k in self._rx_chans if off(k)}
+            gone |= {c.key for c in self._push_rx.values() if off(getattr(c, "key", None))}
+        if gone:
+            self.close_chans(lambda k: k in gone)
+
     def drain_chans(self) -> None:
         if self._graveyard is not None:
             self._graveyard.drain()
@@ -965,14 +987,40 @@ class StageLink:
         slot = self._waiter.post_wait() if not blocking else self._waiter.no_wait()
         self._prev_off = off
         with self._post_lock:
-            stashed = self._ready.pop(key, None)
-            if stashed is None:
+            # abort() raises min_epoch before it takes this lock and releases
+            # the posts it finds. A post of an epoch it has already passed
+            # (aborted between take() and here) would never be filled: its
+            # sender is gone or drops it, so release it here instead.
+            aborted = key[0] < self.min_epoch
+            stashed = None if aborted else self._ready.pop(key, None)
+            if stashed is None and not aborted:
                 self._posted[key] = (off, slot)
+        if aborted:
+            self._waiter.fill(slot, None)
+            if blocking:
+                self._waiter.wait_filled(slot, 0)   # mark the slot free again
+            return None
         if stashed is not None:
             self._read_into(stashed[0], stashed[1], (off, slot))
         if blocking:
-            # Wait on the CPU until the bytes are here (no stream wait).
-            self._waiter.wait_filled(slot)
+            # Wait on the CPU until the bytes are here (no stream wait). An
+            # abort fills the slot; a live step whose bytes never come (a
+            # sender that hangs without the executor failing it over) must
+            # not block this process forever.
+            if not self._waiter.wait_filled(slot, RECV_WAIT_S):
+                with self._post_lock:
+                    self._posted.pop(key, None)
+                if key[0] < self.min_epoch:
+                    self._waiter.fill(slot, None)
+                    self._waiter.wait_filled(slot, 0)
+                    return None
+                self.fatal(f"data for {key} from {item.peer} did not arrive in "
+                           f"{RECV_WAIT_S:.0f} s")
+                self._waiter.fill(slot, None)
+                self._waiter.wait_filled(slot, 0)
+                return None
+            if key[0] < self.min_epoch:
+                return None   # released by an abort: the bytes are not there
         base = self.recv_buf[off:off + item.total]
         out = {}
         for name, dtype, shape, loff, n in item.layout:

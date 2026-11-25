@@ -64,6 +64,10 @@ XHOST_STREAM_WAIT = os.getenv("CONNEX_PP_XHOST_STREAM_WAIT", "0") == "1"
 PUSH_MARGIN = int(os.getenv("CONNEX_PP_PUSH_MARGIN", "8"))
 _SAMPLED_SLOTS = 64
 _SAMPLED_SLOT = 1 << 16
+# A sampled-token receive released by a host thread (XHOST_STREAM_WAIT) whose
+# bytes have not come in this long stops the process instead of leaving the
+# stream (and every later receive queued behind it) waiting forever.
+SAMPLED_WAIT_S = float(os.getenv("CONNEX_PP_SAMPLED_TIMEOUT_S", "60"))
 # Inbox items of the current epoch older than this many steps are dropped.
 _INBOX_HORIZON = 4096
 # One stage per instance with TP > 1: every TP rank is a pipeline endpoint
@@ -107,6 +111,8 @@ class ConnexPPGroup(GroupCoordinator):
         self._waiter = None
         self._pending_slots: dict[tuple, int] = {}
         self._deferred: deque = deque()
+        self._staging: _PinnedStaging | None = None
+        self._slow_logged = False
         self._step_count = 0
         self._push_first: dict[tuple, int] = {}   # (sender url, epoch) -> first key
         self._push_pending: deque = deque()       # keys whose receive waits on a push
@@ -229,6 +235,7 @@ class ConnexPPGroup(GroupCoordinator):
                     keep.add(_peer_id(u))
         try:
             self.link.retain_tx(keep)
+            self.link.retain_rx(keep)
         except Exception:  # noqa: BLE001
             log.exception("connex-pp: retiring channels failed")
         if not spares or os.getenv("CONNEX_PP_WARM_SPARES", "1") != "1":
@@ -520,6 +527,14 @@ class ConnexPPGroup(GroupCoordinator):
                 torch.distributed.broadcast(tensor, src=self.tp.ranks[0],
                                             group=self._tp_sibling)
         else:
+            if not self._slow_logged and self.is_endpoint:
+                from connex.adapters.vllm.pp.link import push_supported
+
+                if not push_supported():
+                    self._slow_logged = True
+                    log.info("connex-pp: sampled tokens from another host are received "
+                             "on the CPU every step (no push channel: connex-rs without "
+                             "Engine.put_chain cancel support, or CONNEX_PP_RDMA_PUSH=0)")
             self._defer_sampled(key, tensor)
 
     def _push_ok(self, src: str | None, key: tuple) -> bool:
@@ -593,8 +608,14 @@ class ConnexPPGroup(GroupCoordinator):
             if self.is_endpoint:
                 data = self.link.take(key, timeout=60.0)
                 if data is not None:
-                    host = torch.frombuffer(bytearray(data), dtype=torch.uint8)
-                    tensor.view(-1).view(torch.uint8).copy_(host, non_blocking=False)
+                    # A blocking copy from pageable memory would wait for all
+                    # the work queued on the stream (the steps in flight),
+                    # every step. Copy from reused pinned memory instead,
+                    # ordered on the stream like the work that reads it.
+                    if self._staging is None:
+                        self._staging = _PinnedStaging()
+                    self._staging.copy(tensor.view(-1).view(torch.uint8), data,
+                                       torch.cuda.current_stream(self.device))
                 elif key[0] >= self.link.min_epoch:
                     # not aborted, just never came: do not decode on garbage
                     raise RuntimeError(f"connex-pp: sampled tokens {key} never came")
@@ -664,8 +685,64 @@ class _SampledFiller:
         g = self.group
         while True:
             key, slot = self.q.get()
-            data = g.link.take(key)   # None once the key's epoch is aborted
+            # None once the key's epoch is aborted, or on timeout
+            data = g.link.take(key, timeout=SAMPLED_WAIT_S)
             if g._pending_slots.get(key) != slot:
                 continue  # already released by an abort
+            if data is None and key[0] >= g.link.min_epoch and not g.link._closed:
+                # Lost for a live step: the stream must not go on with the
+                # tensor as it is, and the receives queued behind this one
+                # must not wait forever.
+                g.link.fatal(f"sampled tokens {key} did not arrive in {SAMPLED_WAIT_S:.0f} s")
             g._pending_slots.pop(key, None)
             g._waiter.fill(slot, data)
+
+
+class _PinnedStaging:
+    """Pinned host buffers, reused, for the host-to-device copies of the
+    sampled tokens received on the CPU. A buffer is written again only once
+    the copy that last read it has run (its event)."""
+
+    MAX_BUFS = 8
+
+    def __init__(self):
+        self.bufs: list[list] = []   # [host uint8 tensor, event of its last copy]
+        self.next = 0
+
+    def _alloc(self, n: int) -> torch.Tensor:
+        return torch.empty(n, dtype=torch.uint8, pin_memory=True)
+
+    def _event(self, stream):
+        ev = torch.cuda.Event()
+        ev.record(stream)
+        return ev
+
+    def _pick(self, n: int) -> list:
+        for b in self.bufs:
+            if b[0].numel() >= n and (b[1] is None or b[1].query()):
+                return b
+        if len(self.bufs) < self.MAX_BUFS:
+            b = [self._alloc(max(n, 4096)), None]
+            self.bufs.append(b)
+            return b
+        # All in flight: wait for the oldest one's copy.
+        b = self.bufs[self.next]
+        self.next = (self.next + 1) % len(self.bufs)
+        if b[1] is not None:
+            b[1].synchronize()
+            b[1] = None
+        if b[0].numel() < n:
+            b[0] = self._alloc(n)
+        return b
+
+    def copy(self, dst: torch.Tensor, data, stream) -> None:
+        """Queue on ``stream`` a copy of the bytes ``data`` into ``dst`` (a
+        uint8 view of the same length)."""
+        import numpy as np
+
+        src = np.frombuffer(data, dtype=np.uint8)
+        b = self._pick(src.size)
+        host = b[0][:src.size]
+        host.numpy()[:] = src
+        dst.copy_(host, non_blocking=True)
+        b[1] = self._event(stream)
