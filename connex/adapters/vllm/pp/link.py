@@ -223,6 +223,17 @@ class _Inbox:
     cv: threading.Condition = field(default_factory=threading.Condition)
 
 
+def chan_reserve_bytes(ipc_slots: int, ipc_slot_bytes: int, rings: int = 2) -> int:
+    """GPU memory to hold for channel rings until the first one is created:
+    CONNEX_PP_CHAN_RESERVE_MB if set (0 = none), else ``rings`` hidden-state
+    rings (2 for a middle stage, which sends and receives; 1 for the first
+    and last stage)."""
+    env = os.getenv("CONNEX_PP_CHAN_RESERVE_MB")
+    if env is not None:
+        return max(0, int(float(env) * (1 << 20)))
+    return max(0, rings) * max(0, ipc_slots) * max(0, ipc_slot_bytes)
+
+
 class StageLink:
     """See the module docstring."""
 
@@ -231,7 +242,8 @@ class StageLink:
                  on_peer_failed: Callable[[tuple], None] | None = None,
                  on_control: Callable[[tuple, Any], None] | None = None,
                  ipc_slot_bytes: int = 0, ipc_slots: int = 3,
-                 sampled_slots: int = 64, sampled_slot_bytes: int = 1 << 16):
+                 sampled_slots: int = 64, sampled_slot_bytes: int = 1 << 16,
+                 chan_rings: int = 2):
         self.device = device
         si = float(os.getenv("CONNEX_PP_SWITCH_INTERVAL_US", "0"))
         if si > 0:
@@ -253,6 +265,14 @@ class StageLink:
                 raise RuntimeError(f"connex-rs: registering {buf.numel()} bytes failed ({rc})")
         self.send_ring = _Ring(nbytes)
         self.recv_ring = _Ring(nbytes)
+        # Channel rings (same-host IPC, cross-host push) are created on first
+        # use, after vLLM has profiled memory and sized the KV cache, so they
+        # came out of the headroom left for activations (issue #39). Hold
+        # their expected size now, while profiling counts it; the first ring
+        # created frees this placeholder and takes its memory.
+        reserve = chan_reserve_bytes(ipc_slots, ipc_slot_bytes, chan_rings)
+        self._chan_reserve = (torch.empty(reserve, dtype=torch.uint8, device=device)
+                              if reserve and device.type == "cuda" else None)
         self.copy_stream = torch.cuda.Stream(device)
         self.on_peer_failed = on_peer_failed
         self.on_control = on_control
@@ -499,6 +519,8 @@ class StageLink:
         host = d_host if host is None else host
         torch.cuda.set_device(self.device)
         k = (tuple(peer), ("p", tag))
+        if not host:
+            self._free_chan_reserve()
         ch = PushRx(self.engine, self.url, self.device, slots, slot_bytes, host=host)
         ch.from_key = announce
         with self._chan_lock:
@@ -615,8 +637,15 @@ class StageLink:
             ch = self._tx_chans.get(k)
             if ch is not None:
                 return ch, False
+            self._free_chan_reserve()
             ch = self._tx_chans[k] = TxChannel(self.device, slots, slot_bytes, f"{tag[0]}")
         return ch, True
+
+    def _free_chan_reserve(self) -> None:
+        """Release the placeholder held for channel rings (see __init__) just
+        before a ring is allocated, so the ring reuses that memory."""
+        if getattr(self, "_chan_reserve", None) is not None:
+            self._chan_reserve = None
 
     def rx_chan(self, peer: tuple, tag: tuple, info):
         from connex.adapters.vllm.pp.ipcchan import RxChannel

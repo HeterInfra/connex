@@ -145,11 +145,13 @@ class ConnexPPGroup(GroupCoordinator):
 
             port = rank_port(int(os.getenv("CONNEX_PP_DATA_PORT", "0")), self.tp_rank)
             if self.is_endpoint or (TP_ENDPOINTS and self.tp_size > 1):
+                middle = 0 < self.stage_rank < num_stages - 1
                 self.link = StageLink(MODEL_ID, self.stage_rank, self.tp_rank, replica, self.device,
                                       port=port, ring_mb=ring_mb, ipc_slot_bytes=step_bytes,
                                       ipc_slots=max(3, parallel_config.pipeline_parallel_size + 1),
                                       sampled_slots=_SAMPLED_SLOTS,
-                                      sampled_slot_bytes=_SAMPLED_SLOT)
+                                      sampled_slot_bytes=_SAMPLED_SLOT,
+                                      chan_rings=2 if middle else 1)
                 self.link.abort_callbacks.append(self._on_abort)
             log.info("Connex PP group: stage %d of %d, TP rank %d%s", self.stage_rank,
                      num_stages, self.tp_rank,
@@ -158,11 +160,13 @@ class ConnexPPGroup(GroupCoordinator):
             # In-process PP: one link per rank, URLs exchanged over gloo.
             self.is_endpoint = True
             if self.world_size > 1:
+                middle = 0 < self.rank_in_group < self.world_size - 1
                 self.link = StageLink(MODEL_ID, self.rank_in_group, self.tp_rank, 0,
                                       self.device, ring_mb=ring_mb, ipc_slot_bytes=step_bytes,
                                       ipc_slots=max(3, self.world_size + 1),
                                       sampled_slots=_SAMPLED_SLOTS,
-                                      sampled_slot_bytes=_SAMPLED_SLOT)
+                                      sampled_slot_bytes=_SAMPLED_SLOT,
+                                      chan_rings=2 if middle else 1)
                 urls: list[Any] = [None] * self.world_size
                 torch.distributed.all_gather_object(urls, self.link.url, group=self.cpu_group)
                 self._route = list(urls)
