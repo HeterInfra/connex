@@ -29,12 +29,24 @@ log = logging.getLogger("connex.rl")
 DEFAULT_CHUNK = 64 << 20
 
 
-def _stream_sync(t):
+def _stream_sync(t, devices=()):
     """Wait for the work queued so far on the current stream of ``t``'s
-    device (not the whole device: the engine's other streams keep running)."""
-    if t is not None and t.is_cuda:
+    device (not the whole device: the engine's other streams keep running).
+
+    A pinned host ``t`` has no device of its own, but copies to or from it
+    with ``non_blocking=True`` are asynchronous: wait on the current stream
+    of each of ``devices`` (default: the current device) instead."""
+    if t is None:
+        return
+    if t.is_cuda:
+        devices = (t.device,)
+    elif torch.cuda.is_available() and t.is_pinned():
+        devices = tuple(devices) or (torch.device("cuda", torch.cuda.current_device()),)
+    else:
+        return
+    for d in devices:
         ev = torch.cuda.Event()
-        ev.record(torch.cuda.current_stream(t.device))
+        ev.record(torch.cuda.current_stream(d))
         ev.synchronize()
 
 
@@ -43,6 +55,9 @@ class WeightPublisher:
         self.reg = registry
         self.t = transport
         self.device = torch.device(device)
+        # a host arena is pinned when CUDA is there: packing GPU weights into
+        # pageable memory is a slower, CPU-blocking copy per tensor
+        self.pin = self.device.type == "cpu" and torch.cuda.is_available()
         self.nbuf = buffers
         self.arenas = []        # [(tensor, version)]
         self.manifest = None
@@ -69,15 +84,17 @@ class WeightPublisher:
                                 "and read again)", old, self.idle_timeout)
             if a.numel() < m.total:
                 self.t.unregister(a)
-                a = torch.empty(m.total, dtype=torch.uint8, device=self.device)
+                a = torch.empty(m.total, dtype=torch.uint8, device=self.device,
+                                pin_memory=self.pin)
                 self.t.register(a)
                 self.arenas[slot][0] = a
         else:
-            a = torch.empty(m.total, dtype=torch.uint8, device=self.device)
+            a = torch.empty(m.total, dtype=torch.uint8, device=self.device, pin_memory=self.pin)
             self.t.register(a)
             self.arenas.append([a, None])
         pack_into(a, m, named)
-        _stream_sync(a)
+        # the packed bytes must be in the arena before readers are told
+        _stream_sync(a, {x.device for _, x in named if x.is_cuda})
         self.arenas[slot][1] = v
         self.reg.publish(version=v, manifest=m.to_dict(), url=self.t.url, addr=a.data_ptr())
         self.version, self.manifest = v, m

@@ -274,18 +274,7 @@ def head_read_ops(local_layouts: Sequence[TensorLayout], remote_layouts: Sequenc
         if local_head0 + nheads > lo.heads or remote_head0 + nheads > ro.heads:
             raise ValueError(f"head range outside the shard ({local_head0}+{nheads} of "
                              f"{lo.heads} local, {remote_head0}+{nheads} of {ro.heads} remote)")
-        # pieces of one block segment: (local offset, remote offset, length)
-        if lo.head_major and ro.head_major:
-            pieces = [(local_head0 * lo.head_stride, remote_head0 * ro.head_stride,
-                       nheads * lo.head_stride)]
-        elif lo.head_stride == lo.head_bytes and ro.head_stride == ro.head_bytes:
-            pieces = [(t * lo.token_stride + local_head0 * lo.head_bytes,
-                       t * ro.token_stride + remote_head0 * ro.head_bytes, nheads * lo.head_bytes)
-                      for t in range(lo.tokens)]
-        else:
-            pieces = [((local_head0 + h) * lo.head_stride + t * lo.token_stride,
-                       (remote_head0 + h) * ro.head_stride + t * ro.token_stride, lo.head_bytes)
-                      for h in range(nheads) for t in range(lo.tokens)]
+        pieces = _head_pieces(lo, ro, local_head0, remote_head0, nheads)
         for o in range(lo.outer):
             lb, rb = lo.base + o * lo.outer_stride, ro.base + o * ro.outer_stride
             for l0, r0, n in runs:
@@ -295,6 +284,47 @@ def head_read_ops(local_layouts: Sequence[TensorLayout], remote_layouts: Sequenc
                     for lo_off, ro_off, ln in pieces:
                         _append_merged(ops, ld + lo_off, rs + ro_off, ln)
     return ops
+
+
+def _head_pieces(lo: TensorLayout, ro: TensorLayout, local_head0: int, remote_head0: int,
+                 nheads: int) -> list[tuple[int, int, int]]:
+    """Pieces of one block segment: (local offset, remote offset, length)."""
+    if lo.head_major and ro.head_major:
+        return [(local_head0 * lo.head_stride, remote_head0 * ro.head_stride,
+                 nheads * lo.head_stride)]
+    if lo.head_stride == lo.head_bytes and ro.head_stride == ro.head_bytes:
+        return [(t * lo.token_stride + local_head0 * lo.head_bytes,
+                 t * ro.token_stride + remote_head0 * ro.head_bytes, nheads * lo.head_bytes)
+                for t in range(lo.tokens)]
+    return [((local_head0 + h) * lo.head_stride + t * lo.token_stride,
+             (remote_head0 + h) * ro.head_stride + t * ro.token_stride, lo.head_bytes)
+            for h in range(nheads) for t in range(lo.tokens)]
+
+
+def head_read_min(local_layouts: Sequence[TensorLayout], remote_layouts: Sequence[TensorLayout],
+                  local_head0: int, remote_head0: int, nheads: int) -> Optional[int]:
+    """Length of the shortest read ``head_read_ops`` is certain to emit for any
+    non-empty block list, or None. Computed from one block segment, so a
+    data plane with a minimum read size can refuse before building the full
+    op list (millions of tuples for a long prompt with per-token pieces).
+
+    Pieces merge only with their neighbours: a piece inside a segment keeps
+    its merged length; the first and last ones may still merge with the
+    adjacent segment and are counted only when they cannot touch it."""
+    best = None
+    for lo, ro in zip(local_layouts, remote_layouts):
+        if not (lo.heads and ro.heads):
+            return None     # head_read_ops raises; let it report the reason
+        merged: list = []
+        for lo_off, ro_off, ln in _head_pieces(lo, ro, local_head0, remote_head0, nheads):
+            _append_merged(merged, lo_off, ro_off, ln)
+        for i, (lo_off, ro_off, ln) in enumerate(merged):
+            grows_back = i == 0 and lo_off == 0 and ro_off == 0
+            grows_fwd = i == len(merged) - 1 and lo_off + ln == lo.seg_bytes \
+                and ro_off + ln == ro.seg_bytes
+            if not (grows_back or grows_fwd):
+                best = ln if best is None else min(best, ln)
+    return best
 
 
 def _append_merged(ops: list, dst: int, src: int, n: int) -> None:

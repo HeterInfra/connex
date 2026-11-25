@@ -344,7 +344,7 @@ class VLLMEPEngine:
     Talks to ``/collective_rpc`` (``VLLM_SERVER_DEV_MODE=1``)."""
 
     def __init__(self, base_url, transport="connex-rs", group=0, timeout=120.0,
-                 async_moves=True, poll_s=0.005):
+                 async_moves=True, poll_s=0.005, poll_max_s=0.1):
         import urllib.request
         self.base = base_url.rstrip("/")
         # stdlib HTTP, proxies ignored (the server is on the cluster network)
@@ -353,6 +353,7 @@ class VLLMEPEngine:
         self.timeout = timeout
         self.async_moves = async_moves
         self.poll_s = poll_s
+        self.poll_max_s = max(poll_s, poll_max_s)
         self.last = {}
 
     def _post(self, path, method, args):
@@ -415,11 +416,15 @@ class VLLMEPEngine:
         if self.async_moves:
             self.rpc("connex_ep_move_start", req)
             t_end = time.time() + self.timeout
+            # every poll is a collective RPC through the engine: start fast
+            # for short moves, back off for long ones
+            wait = self.poll_s
             while True:
                 res = self.rpc("connex_ep_move_poll")
                 if all(r["done"] for r in res) or time.time() > t_end:
                     break
-                time.sleep(self.poll_s)
+                time.sleep(wait)
+                wait = min(wait * 2, self.poll_max_s)
             self.last["move"] = [{"rank": r["rank"], "seconds": r["seconds"]} for r in res]
             errs = [r["error"] for r in res if r.get("error")]
             if errs:

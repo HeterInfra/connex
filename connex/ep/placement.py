@@ -263,9 +263,14 @@ class PlacementTable:
         for layer in range(self.num_layers):
             row = self.slot_map[layer]
             reserved = set()
-            # replicas on up ranks (draining ranks are leaving)
-            up_reps = {e: [p for p, x in enumerate(row) if x == e and (layer, p) not in self.staging
-                           and self.rank_state[self.rank_of(p)] == UP] for e in range(self.num_experts)}
+            # replicas on up ranks (draining ranks are leaving); one pass over
+            # the row instead of one per expert
+            up_reps = {e: [] for e in range(self.num_experts)}
+            for p, x in enumerate(row):
+                reps = up_reps.get(x)
+                if reps is not None and (layer, p) not in self.staging \
+                        and self.rank_state[self.rank_of(p)] == UP:
+                    reps.append(p)
             need = sorted((e for e in range(self.num_experts) if len(up_reps[e]) < min_replicas),
                           key=lambda e: len(up_reps[e]))
             for e in need:

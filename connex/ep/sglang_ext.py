@@ -466,9 +466,12 @@ class SGLangEPWorker(ConnexEPWorker):
             fwd = getattr(self.sched, "forward_stream", None)
             if fwd is not None and fwd != st:
                 st.wait_stream(fwd)
-            src = [x.pin_memory() for x in (l2p_t, cnt_t) + tuple(
-                x for x in (rows_t, rank_map) if x is not None)]
-            self._write_maps(md, dev, rows, rows_t, l2p_t, w, width, cnt_t, rank_map)
+            # pinned sources make the host-to-device copies truly async;
+            # ``src`` keeps them alive until the event below has passed
+            l2p_p, cnt_p, rows_p, rank_p = (None if x is None else x.pin_memory()
+                                            for x in (l2p_t, cnt_t, rows_t, rank_map))
+            src = [x for x in (l2p_p, cnt_p, rows_p, rank_p) if x is not None]
+            self._write_maps(md, dev, rows, rows_p, l2p_p, w, width, cnt_p, rank_p)
             ev = torch.cuda.Event()
             ev.record(st)
             # moves into slots this epoch staged out must not start before
