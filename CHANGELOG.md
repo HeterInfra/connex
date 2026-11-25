@@ -36,6 +36,33 @@ ucx-py. Use connex-rs (`connex-ai[rs]`) or ConnexTE (Mooncake) instead.
 
 ### Fixes
 
+- PD: a release that arrived while `KVProducer.hold` was staging no longer
+  leaves the blocks pinned for `retain_s`; direct GPUDirect KV reads wait for
+  engine work queued before the pull (async scheduling could write the
+  blocks after the pulled KV landed); heterogeneous-TP pulls on connex-rs
+  refuse small head pieces before building the op list. (#38)
+- EP/RL: SGLang map writes use their pinned copies; vLLM async-move polling
+  backs off to 100 ms; `plan_repair` is linear per layer (177 -> 8 ms on a
+  58x256x288 table); the CPU RL publisher arena is pinned and host arenas
+  are synchronised before readers see a version. (#38)
+- vLLM PP adapter: an ABORT between `take()` and the post no longer hangs
+  the receiver (blocking waits also give up after
+  `CONNEX_PP_RECV_TIMEOUT_S`, default 300 s); receive channels of departed
+  upstream peers are retired; sampled tokens on the slow path use pinned
+  non-blocking copies; `_SampledFiller` gives up after
+  `CONNEX_PP_SAMPLED_TIMEOUT_S`. (#38)
+- Front router: route changes and their events are ordered under one lock,
+  so a late UNHEALTHY/DEREGISTERED can no longer follow a recovery; stuck
+  MIGRATING/DRAINING routes expire and stale migrations are reaped;
+  re-registration backs off with jitter. (#38)
+- Serving: the proxy cancels requests whose client disconnected, the
+  last-resort replica no longer fails instantly, non-streaming `n>1` keeps
+  every choice, and endpoints are probed independently; the PD router
+  reacts to `endpoint_unhealthy`; `DirectoryClient.lookup` keeps its cache
+  across unrelated events; `elastic.ZmqTransport` locks per endpoint. (#38)
+- **Behaviour change:** `/sessions/{sid}/migrate` and `/sessions/drain` now
+  need loopback or the admin token (`CONNEX_SESSION_ADMIN_TOKEN` /
+  `--admin-token`), like the PD router's admin routes. (#38)
 - PP (GPUDirect, K=1): the send path no longer reads the stage's ROUTER
   socket to collect ring acks. Callers that send and receive on different
   threads (the vLLM fork's stage 0 with its default asynchronous send) had
