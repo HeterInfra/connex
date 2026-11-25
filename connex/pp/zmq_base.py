@@ -249,14 +249,28 @@ class ZmqStageBase:
     # ---- ZeroMQ-only data path ------------------------------------------------
     def send_tensor_dict(self, tensor_dict: dict[str, torch.Tensor | Any],
                          dst: int | None = None) -> None:
+        self._send_frames(self._encode_frames(tensor_dict))
+
+    def _send_frames(self, frames: list) -> None:
+        """Send one encoded step (see _encode_frames) to the next stage, or back
+        to stage 0 from the last stage."""
+        socket = self._get_return_socket() if self.is_last else self._get_forward_socket()
+        enqueue_start = time.time()
+        socket.send_multipart(frames)
+        m = self.metrics
+        if m.enabled:
+            direction = "return" if self.is_last else "forward"
+            m.inc("bytes_sent", sum(len(f) for f in frames), direction=direction)
+            m.inc("messages_sent", direction=direction)
+            m.observe("enqueue_latency", time.time() - enqueue_start, direction=direction)
+
+    def _encode_frames(self, tensor_dict: dict[str, torch.Tensor | Any]) -> list:
+        """The frames of one step (module docstring). They are plain bytes, so
+        a duplicate request can be answered by re-sending them even after the
+        engine reused the tensors."""
         send_start = time.time()
         m = self.metrics
-        if self.is_last:
-            socket = self._get_return_socket()
-            direction = "return"
-        else:
-            socket = self._get_forward_socket()
-            direction = "forward"
+        direction = "return" if self.is_last else "forward"
 
         metadata_list, tensor_list = self.codec.split(tensor_dict)
         if m.enabled:
@@ -281,24 +295,16 @@ class ZmqStageBase:
             meta["tensor_format"] = "raw"
         metadata_bytes = pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL)
 
-        enqueue_start = time.time()
         # One multipart message per step: ZeroMQ delivers it atomically, so steps
         # from several upstream peers (e.g. stage-0 replicas sharing this stage)
         # cannot interleave their frames at the receiving ROUTER.
         frames = [len(metadata_bytes).to_bytes(8, "big"), metadata_bytes,
                   len(tensor_bytes_list).to_bytes(8, "big")]
         for tensor_bytes in tensor_bytes_list:
-            frames += [len(tensor_bytes).to_bytes(8, "big"), tensor_bytes]
-        socket.send_multipart(frames)
-        enqueue_time = time.time() - enqueue_start
-
-        total_send_time = time.time() - send_start
-        total_bytes = len(metadata_bytes) + total_tensor_bytes + (len(tensor_bytes_list) + 1) * 8
+            frames += [len(tensor_bytes).to_bytes(8, "big"), bytes(tensor_bytes)]
         if m.enabled:
-            m.inc("bytes_sent", total_bytes, direction=direction)
-            m.inc("messages_sent", direction=direction)
-            m.observe("send_latency", total_send_time, direction=direction)
-            m.observe("enqueue_latency", enqueue_time, direction=direction)
+            m.observe("send_latency", time.time() - send_start, direction=direction)
+        return frames
 
     def recv_tensor_dict(self, src: int | None = None) -> dict[str, torch.Tensor | Any] | None:
         recv_start = time.time()

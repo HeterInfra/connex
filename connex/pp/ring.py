@@ -11,6 +11,7 @@ duplicate request are pinned until they leave the reply cache.
 from __future__ import annotations
 
 import os
+import threading
 
 
 class Lease:
@@ -43,6 +44,8 @@ class RegionTable:
         self.base = (int.from_bytes(os.urandom(4), "big") << 32
                      if token_base is None else token_base)
         self.expired_unacked = 0
+        # acks arrive on the receiving thread, allocations on the sending one
+        self._lock = threading.RLock()
 
     def _token(self) -> int:
         self._seq = (self._seq + 1) & 0xFFFFFFFF or 1
@@ -54,53 +57,60 @@ class RegionTable:
 
     def alloc(self, n: int, now: float, hold_s: float, want_ack: bool):
         """Return (offset, token) or None if the ring cannot fit n bytes now."""
-        if n > self.size:
-            return None
-        start = self.head if self.head + n <= self.size else 0
-        end = start + n
-        for lease in self.leases.values():
-            if (lease.obj is None and self._live(lease, now)
-                    and not (end <= lease.start or start >= lease.end)):
+        with self._lock:
+            if n > self.size:
                 return None
-        tok = self._token()
-        self.leases[tok] = Lease(start, end, now + hold_s, want_ack)
-        self.head = end
-        return start, tok
+            start = self.head if self.head + n <= self.size else 0
+            end = start + n
+            for lease in self.leases.values():
+                if (lease.obj is None and self._live(lease, now)
+                        and not (end <= lease.start or start >= lease.end)):
+                    return None
+            tok = self._token()
+            self.leases[tok] = Lease(start, end, now + hold_s, want_ack)
+            self.head = end
+            return start, tok
 
     def add_temp(self, obj, now: float, hold_s: float, want_ack: bool) -> int:
-        tok = self._token()
-        self.leases[tok] = Lease(0, 0, now + hold_s, want_ack, obj)
-        return tok
+        with self._lock:
+            tok = self._token()
+            self.leases[tok] = Lease(0, 0, now + hold_s, want_ack, obj)
+            return tok
 
     def ack(self, tok: int) -> bool:
-        lease = self.leases.get(tok)
-        if lease is None:
-            return False
-        lease.acked = True
-        return True
+        with self._lock:
+            lease = self.leases.get(tok)
+            if lease is None:
+                return False
+            lease.acked = True
+            return True
 
     def pin(self, tok: int) -> None:
-        lease = self.leases.get(tok)
-        if lease is not None:
-            lease.pinned = True
+        with self._lock:
+            lease = self.leases.get(tok)
+            if lease is not None:
+                lease.pinned = True
 
     def unpin(self, tok: int) -> None:
-        lease = self.leases.get(tok)
-        if lease is not None:
-            lease.pinned = False
+        with self._lock:
+            lease = self.leases.get(tok)
+            if lease is not None:
+                lease.pinned = False
 
     def awaiting_ack(self) -> bool:
-        return any(l.want_ack and not l.acked for l in self.leases.values())
+        with self._lock:
+            return any(l.want_ack and not l.acked for l in self.leases.values())
 
     def collect(self, now: float) -> list:
         """Drop free leases; return the temp buffers that may be released."""
-        freed = []
-        for tok, lease in list(self.leases.items()):
-            if self._live(lease, now):
-                continue
-            if lease.want_ack and not lease.acked:
-                self.expired_unacked += 1
-            del self.leases[tok]
-            if lease.obj is not None:
-                freed.append(lease.obj)
-        return freed
+        with self._lock:
+            freed = []
+            for tok, lease in list(self.leases.items()):
+                if self._live(lease, now):
+                    continue
+                if lease.want_ack and not lease.acked:
+                    self.expired_unacked += 1
+                del self.leases[tok]
+                if lease.obj is not None:
+                    freed.append(lease.obj)
+            return freed

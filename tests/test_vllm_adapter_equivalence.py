@@ -278,7 +278,12 @@ def test_last_stage_reply_cache_identical():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 @pytest.mark.parametrize("stage", [0, 2])
-def test_gdr_send_identical(stage):
+def test_gdr_send_identical(stage, monkeypatch):
+    # the integrity stamp (issue #31) is new on the wire; without it the bytes
+    # must still match the fork's
+    import connex.pp.endpoint as core
+
+    monkeypatch.setattr(core, "_GDR_STAMP", False)
     res = []
     for mod in (OLD, NEW):
         c, sent = _mk(mod, stage=stage)

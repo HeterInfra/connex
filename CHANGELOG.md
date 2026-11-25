@@ -36,6 +36,24 @@ ucx-py. Use connex-rs (`connex-ai[rs]`) or ConnexTE (Mooncake) instead.
 
 ### Fixes
 
+- PP (GPUDirect, K=1): the send path no longer reads the stage's ROUTER
+  socket to collect ring acks. Callers that send and receive on different
+  threads (the vLLM fork's stage 0 with its default asynchronous send) had
+  two threads inside one ZeroMQ socket, which aborts libzmq
+  (`router.cpp:344`) or loses frames. Acks are now read only by the receiving
+  thread; the ring bookkeeping is locked. (#30)
+- PP (GPUDirect): each payload carries a 16-byte stamp (token, step id), and
+  the receiver checks it after the read. A send region reused before the
+  receiver read it (no ack within `CONNEXTE_GDR_ACK_TIMEOUT_S`) used to hand
+  back the later step's bytes with this step's shape and no error; now the
+  step is dropped with an error log and recovered by the normal retry. The
+  stamp is flagged after the G2 fields, so older receivers ignore it;
+  `CONNEXTE_GDR_STAMP=0` turns it off. Reused regions are logged. (#31)
+- PP ZeroMQ fallback: steps carry their correlation id, and the receiver
+  applies the same rules as the signal path (late, abandoned and stale steps
+  dropped; a retried step answered from the reply cache). Before, one
+  timed-out step made every later reply the previous step's (#33), and
+  `CONNEX_PP_INFLIGHT>1` never completed a step (#34).
 - PP: `recv_step(corr, timeout_s)` honours `timeout_s` at
   `CONNEX_PP_INFLIGHT=1`, so `Stage0Link(recv_timeout_s=...)` retries when
   asked; before, K=1 always waited the endpoint default (8 s). (#35)

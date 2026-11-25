@@ -461,3 +461,92 @@ def test_gpu_recv_slots_return_views(monkeypatch):
         outs.append(rx.recv_tensor_dict()["h"])
     assert outs[0].data_ptr() == outs[2].data_ptr() != outs[1].data_ptr()  # rotated views
     assert float(outs[1][0]) == 1.0 and float(outs[2][0]) == 2.0
+
+
+# ---- issue #30: the send path never reads the ROUTER socket --------------------------
+
+def test_send_path_does_not_read_router(monkeypatch):
+    import torch
+
+    import connex.pp.endpoint as core
+
+    c = core.ConnexTEEndpoint.__new__(core.ConnexTEEndpoint)
+    c._inflight = 1
+    c._gdr = cx._RegionTable(1 << 16)
+    c._gdr_buf = torch.zeros(1 << 16, dtype=torch.uint8)
+    c._gdr_kw = dict(device="cpu")
+
+    class Eng:
+        def register_memory(self, p, n):
+            return 0
+
+        def unregister_memory(self, p):
+            return 0
+
+    c._mooncake_engine = Eng()
+
+    def boom():
+        raise AssertionError("send path read the ROUTER socket")
+
+    c._drain_acks = boom
+    c.router_socket = None
+    region, tok = c._gdr_region(1024, True)   # leaves a lease awaiting its ack
+    assert c._gdr.awaiting_ack()
+    for _ in range(4):
+        c._gdr_region(1024, True)            # used to call _drain_acks here
+    c._gdr.ack(tok)                          # acks come from the receiving thread
+    assert c._gdr.leases[tok].acked
+
+
+# ---- issue #31: a reused send region is detected, not read as this step ---------------
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs CUDA")
+def test_gpu_reused_region_is_dropped_not_returned(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(cx, "METRICS_ENABLED", False)
+    eng = FakeEngine()
+    tx, sent, _ = _gpu_comm(1, eng)
+    rx, _, acks = _gpu_comm(2, eng)
+    n = 600 * 1024  # more than half the 1 MiB ring: the next send wraps onto it
+    tx._corr_in = (3 << 32) + 1
+    tx._send_gdr({"x": torch.full((n,), 1, dtype=torch.uint8, device="cuda")}, 2, 0.0)
+    sig_a = sent[-1]
+    tok_a = tx._last_token
+    tx._gdr.unpin(tok_a)
+    tx._gdr.leases[tok_a].deadline = 0.0      # ack timeout passed, never acked
+    tx._corr_in += 1
+    tx._send_gdr({"x": torch.full((n,), 2, dtype=torch.uint8, device="cuda")}, 2, 0.0)
+    assert tx._gdr.expired_unacked == 1       # step B took step A's bytes
+    rx.router_socket = FakeRouter([sig_a])
+    assert rx.recv_tensor_dict() is None      # A is dropped, not returned as 2s
+    assert not acks
+    rx.router_socket = FakeRouter([sent[-1]])
+    out = rx.recv_tensor_dict()
+    assert int(out["x"][0]) == 2 and int(out["x"][-1]) == 2
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs CUDA")
+def test_gpu_stamp_off_and_old_receiver_compatible(monkeypatch):
+    import torch
+
+    monkeypatch.setattr(cx, "METRICS_ENABLED", False)
+    eng = FakeEngine()
+    tx, sent, _ = _gpu_comm(1, eng)
+    rx, _, _ = _gpu_comm(2, eng)
+    tx._corr_in = (4 << 32) + 1
+    tx._send_gdr({"h": torch.arange(5.0, device="cuda")}, 2, 0.0)
+    import connex.pp.endpoint as core
+
+    assert core._STAMP_FLAG in sent[-1]
+    # a receiver that ignores the stamp (older Connex) still decodes the step
+    token, layout_b, ack_ep, origin, nt_b = cx._decode_g2(sent[-1].split(b"G2", 1)[1])
+    assert layout_b and ack_ep
+    rx.router_socket = FakeRouter([sent[-1]])
+    assert torch.equal(rx.recv_tensor_dict()["h"], torch.arange(5.0, device="cuda"))
+    monkeypatch.setattr(core, "_GDR_STAMP", False)
+    tx._corr_in += 1
+    tx._send_gdr({"h": torch.arange(3.0, device="cuda")}, 2, 0.0)
+    assert core._STAMP_FLAG not in sent[-1].split(b"G2", 1)[1][-20:]
+    rx.router_socket = FakeRouter([sent[-1]])
+    assert torch.equal(rx.recv_tensor_dict()["h"], torch.arange(3.0, device="cuda"))

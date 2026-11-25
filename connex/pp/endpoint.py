@@ -271,6 +271,26 @@ def _derive_front_router_events(api_addr: str) -> str:
     return f"tcp://{join_host_port(host, 15560)}"
 
 
+# Correlation id of a step on the ZeroMQ fallback (a reserved non-tensor key,
+# removed again by the receiver).
+_FALLBACK_CORR = "__cx_corr__"
+
+
+class _StaleRegion(Exception):
+    """The payload region no longer holds the signalled step (sender reused it)."""
+
+    def __init__(self, corr: int):
+        super().__init__(f"stale region for step {corr:x}")
+        self.corr = corr
+
+
+# Integrity stamp after a G2 payload: (token, corr). Signalled by _STAMP_FLAG
+# after the G2 fields, which older receivers do not read.
+_STAMP = struct.Struct("!QQ")
+_STAMP_FLAG = b"ST"
+_GDR_STAMP = os.getenv("CONNEXTE_GDR_STAMP", "1") == "1"
+
+
 class _ChainFailed(Exception):
     """Stage 0 recv: the step being waited for was lost to a failover."""
 
@@ -1272,13 +1292,23 @@ class ConnexTEEndpoint(ZmqStageBase):
         registered buffer when every candidate ring slice is still unacked."""
         table = self._gdr
         hold = _GDR_ACK_TIMEOUT_S if want_ack else _GDR_HOLD_S
-        if table.awaiting_ack() and self._inflight == 1:
-            # K>1: a separate thread owns the ROUTER (recv/prefetch); acks
-            # are consumed there by recv_tensor_dict instead.
-            self._drain_acks()
+        # Acks are consumed only by whoever receives (recv_tensor_dict handles
+        # ACK frames). The send path must not read the ROUTER: callers such as
+        # the vLLM fork's stage 0 send and receive on different threads, and
+        # two threads inside one ZeroMQ socket abort libzmq (issue #30). A
+        # region whose ack has not been read yet just makes alloc() pick
+        # another one, or a temporary buffer.
         now = time.monotonic()
+        seen = table.expired_unacked
         for buf in table.collect(now):
             self._mooncake_engine.unregister_memory(buf.data_ptr())
+        if table.expired_unacked > seen:
+            # the receiver has not read (or acked) a message for the whole ack
+            # timeout; its region is reused now, and the stamp makes a late
+            # read fail loudly instead of returning these new bytes
+            self.log.warning("Stage %s: %d send region(s) reused without an ack after "
+                             "%.0f s (total %d)", self.stage_idx, table.expired_unacked - seen,
+                             _GDR_ACK_TIMEOUT_S, table.expired_unacked)
         got = table.alloc(total, now, hold, want_ack)
         if got is not None:
             off, tok = got
@@ -1315,14 +1345,22 @@ class ConnexTEEndpoint(ZmqStageBase):
             key, [t.numel() * t.element_size() for _, t in tensors])
         v2 = _GDR_WIRE >= 2 and layout_b is not None
         want_ack = v2 and self._gdr_ack_on
+        stamp = v2 and bool(total) and _GDR_STAMP
+        corr = self._corr_for_send()
         ptr, tok = 0, 0
         if total:
-            region, tok = self._gdr_region(total, want_ack)
+            region, tok = self._gdr_region(total + (_STAMP.size if stamp else 0), want_ack)
             ptr = region.data_ptr()
             for (k, t), (_, _, _, o, nb) in zip(tensors, layout):
                 if t.device.type != "cuda" and not self._gdr_host:
                     t = t.to("cuda", non_blocking=True)
                 region[o:o + nb].copy_(t.contiguous().view(-1).view(torch.uint8), non_blocking=True)
+            if stamp:
+                # (token, corr) right after the payload, on the same stream, so
+                # a receiver can tell whether the region still holds this step
+                # (issue #31: an unacked region is reused after the ack timeout)
+                st = torch.frombuffer(bytearray(_STAMP.pack(tok, corr)), dtype=torch.uint8)
+                region[total:total + _STAMP.size].copy_(st)
             # Wait for the copies only (an event right behind them), not for
             # anything queued on the stream later.
             if defer:
@@ -1334,7 +1372,6 @@ class ConnexTEEndpoint(ZmqStageBase):
         p1 = time.perf_counter()
 
         url = self._local_url.encode("utf-8")
-        corr = self._corr_for_send()
         if _TRACE:
             _tr(self.stage_idx, "send_called" if defer else "send_sync", corr)
         if v2:
@@ -1344,6 +1381,9 @@ class ConnexTEEndpoint(ZmqStageBase):
             ack_ep = self.router_endpoint.encode("utf-8") if want_ack and tok else b""
             tail = _encode_g2(tok if ack_ep else 0, layout_b, ack_ep,
                               (origin or "").encode("utf-8"), nt_b)
+            if stamp:
+                # receivers that predate the stamp stop reading after nt_b
+                tail += _STAMP_FLAG + _STAMP.pack(tok, corr)
         else:
             import pickle
 
@@ -1403,21 +1443,27 @@ class ConnexTEEndpoint(ZmqStageBase):
         return self._gdr_recv[base:base + self._gdr_slot_size], True
 
     def _recv_gdr_payload(self, layout: list, nt: dict, remote_url: str, src_ptr: int,
-                          total: int, ack: tuple[str, int] | None = None) -> dict:
+                          total: int, ack: tuple[str, int] | None = None,
+                          stamp: bytes | None = None) -> dict:
         result: dict[str, Any] = {}
         if total:
             temp = None
-            if total <= self._gdr_slot_size:
-                dst, views = self._gdr_dst(total)
+            n = total + (len(stamp) if stamp else 0)
+            if n <= self._gdr_slot_size:
+                dst, views = self._gdr_dst(n)
                 views = views and not self._gdr_host
             else:
-                dst = temp = torch.empty(total, dtype=torch.uint8, **self._gdr_kw)
+                dst = temp = torch.empty(n, dtype=torch.uint8, **self._gdr_kw)
                 views = False
-                rc = self._mooncake_engine.register_memory(temp.data_ptr(), total)
+                rc = self._mooncake_engine.register_memory(temp.data_ptr(), n)
                 if rc != 0:
-                    raise RuntimeError(f"register_memory failed ({rc}) for {total} B recv buffer")
+                    raise RuntimeError(f"register_memory failed ({rc}) for {n} B recv buffer")
             try:
-                self._transfer_sync(remote_url, dst.data_ptr(), src_ptr, total)
+                self._transfer_sync(remote_url, dst.data_ptr(), src_ptr, n)
+                if stamp and bytes(dst[total:n].cpu().numpy()) != stamp:
+                    # the sender reused the region for a later message before
+                    # we read it: these bytes are not this step's (issue #31)
+                    raise _StaleRegion(_STAMP.unpack(stamp)[1])
                 if ack is not None and ack[1]:
                     self._send_ack(*ack)  # read done: sender may reuse the region
                 for k, dtype, shape, o, nb in layout:
@@ -1452,6 +1498,11 @@ class ConnexTEEndpoint(ZmqStageBase):
 
     def _recv_gdr2(self, body: bytes, remote_url: str, src_ptr: int, total: int) -> dict:
         token, layout_b, ack_ep, origin, nt_b = _decode_g2(body)
+        g = _G2.unpack_from(body, 0)
+        end = _G2.size + g[1] + g[2] + g[3] + g[4]
+        stamp = None
+        if body[end:end + len(_STAMP_FLAG)] == _STAMP_FLAG:
+            stamp = body[end + len(_STAMP_FLAG):end + len(_STAMP_FLAG) + _STAMP.size]
         if nt_b:
             import pickle
 
@@ -1462,7 +1513,51 @@ class ConnexTEEndpoint(ZmqStageBase):
             nt["__stage0_endpoint__"] = origin
         layout = self._layouts.parse(layout_b) if layout_b else []
         return self._recv_gdr_payload(layout, nt, remote_url, src_ptr, total,
-                                      (ack_ep, token) if ack_ep else None)
+                                      (ack_ep, token) if ack_ep else None, stamp)
+
+    def _drop_by_corr(self, corr: int | None) -> bool:
+        """Correlation-id rules for an arriving message, shared by the signal
+        path and the ZeroMQ fallback. True: the message was handled here (a
+        late, abandoned or stale one dropped, or a duplicate answered from the
+        reply cache) and must not be returned."""
+        if corr is not None and self.is_first and self._mb_outstanding:
+            # K>1 per-step API in use: accept any outstanding step.
+            if corr not in self._mb_outstanding:
+                self.log.warning("Stage %s: dropping reply for abandoned step %x",
+                               self.stage_idx, corr)
+                return True
+        elif corr is not None and self.is_first and self._inflight == 1 \
+                and self._last_reply_corr is not None \
+                and (corr >> 32) == (self._last_reply_corr >> 32) \
+                and corr <= self._last_reply_corr:
+            # K=1: a late duplicate of a step already answered (the
+            # step was re-sent). Never take it for the current step,
+            # even before the send thread has set _pending_corr.
+            self.log.warning("Stage %s: dropping duplicate reply for answered step %x",
+                           self.stage_idx, corr)
+            return True
+        elif corr is not None and self.is_first and self._pending_corr is not None \
+                and corr != self._pending_corr:
+            self.log.warning("Stage %s: dropping reply for abandoned step %x (waiting for %x)",
+                           self.stage_idx, corr, self._pending_corr)
+            return True
+        if corr is not None and not self.is_first and self._inflight > 1 \
+                and corr in self._done_ring:
+            self.log.warning("Stage %s: duplicate step %x (sender retry); re-sending cached reply",
+                           self.stage_idx, corr)
+            self._resend_done(corr)
+            return True
+        if corr is not None and not self.is_first and self._last_done is not None \
+                and corr == self._last_done[0]:
+            self.log.warning("Stage %s: duplicate step %x (sender retry); re-sending cached reply",
+                           self.stage_idx, corr)
+            self._resend_last()
+            return True
+        if _STALE_DROP and not self.is_first and not self._corr_filter.accept(corr):
+            self.log.warning("Stage %s: dropping stale step %x (newer step already seen)",
+                           self.stage_idx, corr)
+            return True
+        return False
 
     def _corr_for_send(self) -> int:
         if self._inflight > 1:
@@ -1479,6 +1574,9 @@ class ConnexTEEndpoint(ZmqStageBase):
     def _resend_last(self) -> None:
         """Answer a duplicate step with the reply we already produced."""
         corr, data, dst = self._last_done
+        if isinstance(data, tuple) and data[0] == "zmq":
+            self._send_frames(data[1])  # ZeroMQ fallback: the encoded reply
+            return
         if isinstance(data, tuple) and data[0] == "sig":
             # GPUDirect: the region is pinned until the next reply, so the
             # original signal still points at intact bytes.
@@ -2081,6 +2179,52 @@ class ConnexTEEndpoint(ZmqStageBase):
                 self.forward_socket = self._connect_dealer(endpoint, routing_key)
         return self.forward_socket
 
+    def _send_fallback(self, tensor_dict: dict, dst: int | None) -> None:
+        """ZeroMQ-only send. The step's correlation id travels in the metadata
+        (_FALLBACK_CORR) so the receiver applies the same duplicate, stale and
+        abandoned-step rules as on the signal path (issues #33, #34)."""
+        td = dict(self._with_origin(tensor_dict))
+        corr = self._corr_for_send()
+        td[_FALLBACK_CORR] = corr
+        frames = self._encode_frames(td)
+        self._send_frames(frames)
+        if not self.is_first:
+            # keep the encoded reply: a retry of this step is answered from it
+            if self._inflight > 1:
+                self._remember_done(corr, ("zmq", frames), dst, None)
+            else:
+                self._last_done = (corr, ("zmq", frames), dst)
+
+    def _recv_fallback(self, src: int | None) -> dict | None:
+        """ZeroMQ-only receive: None after the recv timeout (the ZeroMQ base is
+        built with timeout_ms=-1), and correlation-id rules as on the signal
+        path."""
+        deadline = time.monotonic() + self._recv_timeout_ms() / 1000.0
+        while True:
+            remaining = int((deadline - time.monotonic()) * 1000)
+            if remaining <= 0:
+                return None
+            if self.router_socket is not None and not self.router_socket.poll(
+                    remaining, zmq.POLLIN):
+                return None
+            td = ZmqStageBase.recv_tensor_dict(self, src)
+            if not isinstance(td, dict):
+                return td
+            corr = td.pop(_FALLBACK_CORR, None)
+            if corr is not None and self._drop_by_corr(corr):
+                continue
+            if corr is not None:
+                if self.is_first:
+                    self._pending_corr = None
+                    self._last_reply_corr = corr
+                else:
+                    self._corr_in = corr
+                if self._inflight > 1:
+                    self._tls.rx_corr = corr
+            if td.get("__stage0_endpoint__"):
+                self._current_originator_endpoint = td["__stage0_endpoint__"]
+            return td
+
     def _with_origin(self, tensor_dict):
         """ZeroMQ fallback: stamp the originating stage 0 like the GPUDirect path.
 
@@ -2153,7 +2297,7 @@ class ConnexTEEndpoint(ZmqStageBase):
         if self.is_first and self._inflight == 1:
             self._mark_sent()
         if not self._mooncake_available:
-            return super().send_tensor_dict(self._with_origin(tensor_dict), dst)
+            return self._send_fallback(tensor_dict, dst)
 
         import pickle
 
@@ -2260,13 +2404,7 @@ class ConnexTEEndpoint(ZmqStageBase):
             # same contract as the transfer-engine path: None after the recv
             # timeout, so a stage worker can retry or stop instead of blocking
             # forever (the ZeroMQ base is built with timeout_ms=-1)
-            if self.router_socket is not None and not self.router_socket.poll(
-                    self._recv_timeout_ms(), zmq.POLLIN):
-                return None
-            td = super().recv_tensor_dict(src)
-            if isinstance(td, dict) and td.get("__stage0_endpoint__"):
-                self._current_originator_endpoint = td["__stage0_endpoint__"]
-            return td
+            return self._recv_fallback(src)
 
         import pickle
 
@@ -2333,42 +2471,7 @@ class ConnexTEEndpoint(ZmqStageBase):
                 remote_url = metadata[20 : 20 + sender_url_len].decode("utf-8")
                 tail = metadata[20 + sender_url_len :]
                 corr = struct.unpack("!Q", tail[:8])[0] if len(tail) >= 8 else None
-                if corr is not None and self.is_first and self._mb_outstanding:
-                    # K>1 per-step API in use: accept any outstanding step.
-                    if corr not in self._mb_outstanding:
-                        self.log.warning("Stage %s: dropping reply for abandoned step %x",
-                                       self.stage_idx, corr)
-                        continue
-                elif corr is not None and self.is_first and self._inflight == 1 \
-                        and self._last_reply_corr is not None \
-                        and (corr >> 32) == (self._last_reply_corr >> 32) \
-                        and corr <= self._last_reply_corr:
-                    # K=1: a late duplicate of a step already answered (the
-                    # step was re-sent). Never take it for the current step,
-                    # even before the send thread has set _pending_corr.
-                    self.log.warning("Stage %s: dropping duplicate reply for answered step %x",
-                                   self.stage_idx, corr)
-                    continue
-                elif corr is not None and self.is_first and self._pending_corr is not None \
-                        and corr != self._pending_corr:
-                    self.log.warning("Stage %s: dropping reply for abandoned step %x (waiting for %x)",
-                                   self.stage_idx, corr, self._pending_corr)
-                    continue
-                if corr is not None and not self.is_first and self._inflight > 1 \
-                        and corr in self._done_ring:
-                    self.log.warning("Stage %s: duplicate step %x (sender retry); re-sending cached reply",
-                                   self.stage_idx, corr)
-                    self._resend_done(corr)
-                    continue
-                if corr is not None and not self.is_first and self._last_done is not None \
-                        and corr == self._last_done[0]:
-                    self.log.warning("Stage %s: duplicate step %x (sender retry); re-sending cached reply",
-                                   self.stage_idx, corr)
-                    self._resend_last()
-                    continue
-                if _STALE_DROP and not self.is_first and not self._corr_filter.accept(corr):
-                    self.log.warning("Stage %s: dropping stale step %x (newer step already seen)",
-                                   self.stage_idx, corr)
+                if self._drop_by_corr(corr):
                     continue
                 break
 
@@ -2478,6 +2581,17 @@ class ConnexTEEndpoint(ZmqStageBase):
                         m.observe("delivery_latency", dl, direction=direction)
 
             return result
+
+        except _StaleRegion as exc:
+            # Drop the step rather than hand back another step's bytes: the
+            # sender retries it (stage 0) or answers the retry from its reply
+            # cache (later stages, whose reply region stays pinned).
+            self.log.error("Stage %s: payload of step %x was overwritten before it was "
+                           "read (sender ring reused after CONNEXTE_GDR_ACK_TIMEOUT_S); "
+                           "dropping it", self.stage_idx, exc.corr)
+            if self.metrics.enabled:
+                self.metrics.inc("errors", error_type="stale_region")
+            return None
 
         except _ChainFailed:
             # The chain failed over while we waited: the step is lost, the
