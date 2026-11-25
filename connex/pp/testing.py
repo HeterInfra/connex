@@ -41,7 +41,8 @@ class LoopbackTransferEngine:
         return p
 
     def _find(self, ptr: int):
-        for base, buf in self.mem.items():
+        # snapshot: a peer thread reads while this engine allocates or frees (#36)
+        for base, buf in list(self.mem.items()):
             if base <= ptr < base + max(1, len(buf)):
                 return base, buf
         raise KeyError(hex(ptr))

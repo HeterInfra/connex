@@ -16,8 +16,32 @@ the lazy `connex.<Name>` exports: `epc_v3`, `epc_v31`, `epc_api`,
 ucx-py. Use connex-rs (`connex-ai[rs]`) or ConnexTE (Mooncake) instead.
 `connex.protocol` keeps only `LogicalEndpointID` and `PDRole`. (#24, #25)
 
+### Performance
+
+- PP host-buffer path (transfer engine without GPUDirect): send buffers are
+  now freed as soon as their 1 s RDMA-read hold expires, from a deadline
+  queue drained on every send and at close. Before, one worker freed one
+  buffer per second, so live buffers grew with every step (2985 after 1000
+  steps on a 3-stage chain) and steps slowed down; now they level off at
+  about one second's worth. `CONNEXTE_HOST_FREE_HOLD_S` sets the hold. (#32)
+- PP ZeroMQ fallback: tensors travel as raw bytes (dtype and shape come from
+  the tensor metadata) instead of `torch.save`/`torch.load`, and the metadata
+  is pickled once per step. A 3-stage CPU chain went from 5.4 to 0.63 ms per
+  step with small tensors and from 43 to 19 ms with 4 MiB tensors. Receivers
+  still read `torch.save` frames; `CONNEX_PP_ZMQ_RAW=0` makes a sender emit
+  them for older receivers. (#37)
+- PD: the check that every KV read lands in registered memory bisects the
+  registered spans instead of scanning all of them for every op (it cost
+  about 68 ms per pull at 1024 fragmented blocks). (#38)
+
 ### Fixes
 
+- PP: `recv_step(corr, timeout_s)` honours `timeout_s` at
+  `CONNEX_PP_INFLIGHT=1`, so `Stage0Link(recv_timeout_s=...)` retries when
+  asked; before, K=1 always waited the endpoint default (8 s). (#35)
+- `connex.pp.testing.LoopbackTransferEngine` no longer fails with
+  "dictionary changed size during iteration" when a peer reads while this
+  engine allocates or frees. (#36)
 - RL weight sync and the SGLang PD backend now set `UCX_TLS=^cuda_ipc` like
   PD and PP, so a reader on the same host no longer keeps a dead peer's GPU
   memory mapped; RL also honours `CONNEX_RS_NET_DEVICES`. All four call

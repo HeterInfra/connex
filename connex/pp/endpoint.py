@@ -24,7 +24,7 @@ import struct
 import sys
 import threading
 import time
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -144,7 +144,9 @@ _GDR = os.getenv("CONNEXTE_GDR", "1") == "1"
 _GDR_HOST = os.getenv("CONNEXTE_GDR_HOST", "0")
 _GDR_SEND_MB = int(os.getenv("CONNEXTE_GDR_SEND_MB", "512"))
 _GDR_RECV_MB = int(os.getenv("CONNEXTE_GDR_RECV_MB", "256"))
-_GDR_HOLD_S = float(os.getenv("CONNEXTE_GDR_HOLD_S", "1.0"))  # time-based hold (legacy / no-ack mode)
+_GDR_HOLD_S = float(os.getenv("CONNEXTE_GDR_HOLD_S", "1.0"))
+# Host path: hold before freeing a send buffer the receiver may still read
+_HOST_FREE_HOLD_S = float(os.getenv("CONNEXTE_HOST_FREE_HOLD_S", "1.0"))  # time-based hold (legacy / no-ack mode)
 # Ack-based ring reuse (CONNEXTE_GDR_ACK=1): the receiver sends a tiny
 # b"CXACK"+token message to the sender's ROUTER once its RDMA read completed;
 # the sender frees the ring region only then (or after the long safety
@@ -371,6 +373,9 @@ class ConnexTEEndpoint(ZmqStageBase):
         self._local_url: str | None = None
         self._remote_urls: dict[int, str] = {}
         self._buffer_cleaner: ThreadPoolExecutor | None = None
+        # Host-path send buffers waiting out the RDMA-read hold (see _defer_free)
+        self._deferred_frees: deque = deque()
+        self._deferred_lock = threading.Lock()
 
         # Multi-replica routing: track originator (stage 0) endpoint for return path
         self._current_originator_endpoint: str | None = None
@@ -397,6 +402,7 @@ class ConnexTEEndpoint(ZmqStageBase):
         self._recent_step_s: list[float] = []
         self._corr_filter = _CorrFilter()
         self._last_token: int | None = None  # ring lease pinned for _resend_last
+        self._tls = threading.local()  # per-thread overrides (recv timeout; K>1 step context)
         k = _PP_INFLIGHT if inflight is None else max(1, int(inflight))
         if k > 1:
             self._init_inflight(k)
@@ -1483,8 +1489,7 @@ class ConnexTEEndpoint(ZmqStageBase):
         url = self._local_url.encode("utf-8")
         meta = struct.pack("!QQI", src_ptr, len(data), len(url)) + url + struct.pack("!Q", corr)
         self._send_via_zeromq(b"CONNEXTE" + meta, dst)
-        if self._buffer_cleaner is not None:
-            self._buffer_cleaner.submit(self._wait_for_ack_and_free, src_ptr, len(data))
+        self._defer_free(src_ptr, len(data))
 
     # ---- pipelining: K steps in flight (CONNEX_PP_INFLIGHT=K > 1) ----------
     #
@@ -1649,7 +1654,15 @@ class ConnexTEEndpoint(ZmqStageBase):
         of abandoned steps are dropped. Returns None on timeout (the caller
         re-sends this step with send_step and calls recv_step again)."""
         if self._inflight == 1:
-            return self.recv_tensor_dict()
+            if timeout_s is None:
+                return self.recv_tensor_dict()
+            # the caller's timeout, not the endpoint default (issue #35)
+            tls = self.__dict__.setdefault("_tls", threading.local())
+            tls.timeout_ms = max(1, int(timeout_s * 1000))
+            try:
+                return self.recv_tensor_dict()
+            finally:
+                tls.timeout_ms = None
         if timeout_s is None:
             timeout_s = self._recv_timeout_ms() / 1000.0
         deadline = time.monotonic() + timeout_s
@@ -1776,23 +1789,43 @@ class ConnexTEEndpoint(ZmqStageBase):
         """Base timeout, stretched to 3x the slowest recent step so that a
         slow-but-healthy step (cold prefill, long batch) is not taken for a
         dead peer."""
-        if self._inflight > 1:
-            t = getattr(self._tls, "timeout_ms", None)
-            if t is not None:
-                return t
+        t = getattr(getattr(self, "_tls", None), "timeout_ms", None)  # recv_step's caller timeout
+        if t is not None:
+            return t
         base = _CONNEXTE_RECV_TIMEOUT_MS if _CONNEXTE_RECV_TIMEOUT_MS > 0 else 8000
         if self.is_first and self._recent_step_s:
             return int(max(base, 3000 * max(self._recent_step_s)))
         return base
 
-    def _wait_for_ack_and_free(self, src_ptr: int, length: int) -> None:
-        """Wait for receiver to complete RDMA transfer, then free buffer.
+    def _defer_free(self, src_ptr: int, length: int) -> None:
+        """Free a host-path send buffer once the receiver can no longer be
+        RDMA-reading it (a _HOST_FREE_HOLD_S hold, as Mooncake does).
 
-        Uses the same approach as mooncake: a conservative sleep to ensure
-        the receiver has completed the RDMA READ before we free the buffer.
-        """
-        time.sleep(1.0)  # 1 second - same as mooncake, safe for RDMA
-        self._free_buffer(src_ptr, length)
+        Buffers wait in a deadline queue that each send drains, so they are
+        released as fast as they expire. A single worker sleeping 1 s per
+        buffer released one per second whatever the step rate (issue #32)."""
+        now = time.monotonic()
+        if "_deferred_lock" not in self.__dict__:  # built without __init__ (tests, shims)
+            self._deferred_lock = threading.Lock()
+            self._deferred_frees = deque()
+        with self._deferred_lock:
+            self._deferred_frees.append((now + _HOST_FREE_HOLD_S, src_ptr, length))
+        self._reap_frees(now)
+
+    def _reap_frees(self, now: float | None = None, force: bool = False) -> None:
+        """Free the queued host-path buffers whose hold has expired (all of
+        them with force=True, at close)."""
+        if now is None:
+            now = time.monotonic()
+        if "_deferred_lock" not in self.__dict__:
+            return
+        due = []
+        with self._deferred_lock:
+            q = self._deferred_frees
+            while q and (force or q[0][0] <= now):
+                due.append(q.popleft())
+        for _, ptr, length in due:
+            self._free_buffer(ptr, length)
 
     def _get_peer_endpoint(self, target_stage_idx: int, exclude_replica: Optional[int] = None) -> Optional[str]:
         """Get peer endpoint from EPCV2Client route table.
@@ -2197,10 +2230,7 @@ class ConnexTEEndpoint(ZmqStageBase):
             if prof is not None:
                 prof.add("s_signal", time.perf_counter() - p4)
 
-            if self._buffer_cleaner is not None:
-                self._buffer_cleaner.submit(
-                    self._wait_for_ack_and_free, src_ptr, total_length
-                )
+            self._defer_free(src_ptr, total_length)
             if not self.is_first and self._inflight > 1:
                 self._remember_done(corr, combined_data, dst, None)
             elif not self.is_first:
@@ -2535,6 +2565,7 @@ class ConnexTEEndpoint(ZmqStageBase):
         if self._buffer_cleaner is not None:
             self._buffer_cleaner.shutdown(wait=False)
             self._buffer_cleaner = None
+        self._reap_frees(force=True)
         if crs is not None:
             try:
                 crs[0].close()

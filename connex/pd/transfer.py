@@ -26,6 +26,7 @@ engine recomputes or fails the request; the PD router then retries.
 """
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import threading
@@ -480,9 +481,16 @@ class KVConsumer:
     def _outside(self, ops) -> Optional[tuple]:
         """First op whose destination is not inside registered local memory (a
         DMA there would corrupt or crash the process), else None."""
-        spans = self._spans
+        idx = getattr(self, "_span_idx", None)
+        if idx is None or idx[0] is not self._spans:
+            spans = sorted(self._spans)
+            idx = self._span_idx = (self._spans, [s for s, _ in spans], spans)
+        _, starts, spans = idx
+        # bisect on span starts: O(ops x log spans) instead of ops x spans,
+        # which cost ~68 ms per pull at 1024 fragmented blocks (issue #38)
         for dst, src, n in ops:
-            if not any(s <= dst and dst + n <= s + ln for s, ln in spans):
+            i = bisect.bisect_right(starts, dst) - 1
+            if i < 0 or dst + n > spans[i][0] + spans[i][1]:
                 return (hex(dst), n)
         return None
 

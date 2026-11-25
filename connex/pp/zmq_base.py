@@ -8,10 +8,16 @@ and returns), DEALERs to peers, and an optional control socket to a legacy
 "Front ROUTER" (REGISTER / ASSIGN json).
 
 ZeroMQ-only fallback wire format (used when no transfer engine is available),
-one multi-frame message per dict plus one per tensor::
+one multi-frame message per step (ZeroMQ delivers it atomically)::
 
-    [!Q8 len(meta), meta=pickle({"metadata_list", "send_timestamp"}), !Q8 n]
-    n x [!Q8 len(t), torch.save(t.cpu())]
+    [!Q8 len(meta), meta=pickle({"metadata_list", "send_timestamp", "tensor_format"}),
+     !Q8 n] + n x [!Q8 len(t), bytes(t)]
+
+``tensor_format`` "raw": ``bytes(t)`` is the tensor's contiguous memory; dtype
+and shape come from its ``TensorMetadata``. Without it (older senders, or
+``CONNEX_PP_ZMQ_RAW=0``) each tensor is ``torch.save(t.cpu())``, which costs
+~30x more for small tensors (issue #37). Receivers read both; senders older
+than e9182b7 sent each tensor as its own message, which is still read.
 
 ``metadata_list`` is ``[(key, TensorMetadata(device, dtype, size)) | (key,
 value)]``. The TensorMetadata class is pickled by reference, so peers must
@@ -25,6 +31,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import pickle
 import time
 from collections import namedtuple
@@ -38,6 +45,36 @@ from connex.pp.hooks import NULL_METRICS, NetUtils
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
+
+
+# Raw tensor frames on the ZeroMQ fallback (see module docstring); 0 = torch.save.
+_ZMQ_RAW = os.getenv("CONNEX_PP_ZMQ_RAW", "1") != "0"
+
+
+def _torch_save(tensor: torch.Tensor) -> bytes:
+    buffer = io.BytesIO()
+    torch.save(tensor.cpu(), buffer)
+    return buffer.getvalue()
+
+
+def _tensor_to_bytes(tensor: torch.Tensor) -> memoryview:
+    """The tensor's bytes, contiguous, on the host (one device-to-host copy for
+    CUDA tensors, none for contiguous CPU tensors)."""
+    t = tensor.detach()
+    if t.device.type != "cpu":
+        t = t.cpu()
+    t = t.contiguous()
+    if t.numel() == 0:
+        return memoryview(b"")
+    return memoryview(t.reshape(-1).view(torch.uint8).numpy())
+
+
+def _bytes_to_tensor(buf, dtype: torch.dtype, size) -> torch.Tensor:
+    shape = tuple(size)
+    if len(buf) == 0:
+        return torch.empty(shape, dtype=dtype)
+    # bytearray: one copy into memory the tensor owns (ZeroMQ frames are read-only)
+    return torch.frombuffer(bytearray(buf), dtype=dtype).reshape(shape)
 
 class TensorDictCodec:
     """Split a tensor dict into (metadata_list, tensors) and recognise tensor
@@ -225,15 +262,11 @@ class ZmqStageBase:
         if m.enabled:
             m.observe("tensor_count", len(tensor_list), direction=direction)
 
-        metadata_with_timestamp = {"metadata_list": metadata_list, "send_timestamp": None}
-        metadata_bytes = pickle.dumps(metadata_with_timestamp)
-
+        raw = _ZMQ_RAW
         tensor_bytes_list = []
         total_tensor_bytes = 0
         for tensor in tensor_list:
-            buffer = io.BytesIO()
-            torch.save(tensor.cpu(), buffer)
-            tensor_bytes = buffer.getvalue()
+            tensor_bytes = _tensor_to_bytes(tensor) if raw else _torch_save(tensor)
             tensor_bytes_list.append(tensor_bytes)
             total_tensor_bytes += len(tensor_bytes)
             if m.enabled:
@@ -242,9 +275,11 @@ class ZmqStageBase:
         if m.enabled:
             m.observe("serialization_latency", time.time() - send_start)
 
-        # send_timestamp just before the network send (after serialization)
-        metadata_with_timestamp["send_timestamp"] = time.time()
-        metadata_bytes = pickle.dumps(metadata_with_timestamp)
+        # pickled once, with send_timestamp taken after serialization
+        meta = {"metadata_list": metadata_list, "send_timestamp": time.time()}
+        if raw:
+            meta["tensor_format"] = "raw"
+        metadata_bytes = pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL)
 
         enqueue_start = time.time()
         # One multipart message per step: ZeroMQ delivers it atomically, so steps
@@ -284,9 +319,11 @@ class ZmqStageBase:
                     f"Metadata size mismatch: expected {metadata_size}, got {len(metadata_bytes)}")
             try:
                 metadata_payload = pickle.loads(metadata_bytes)
+                raw = False
                 if isinstance(metadata_payload, dict) and "metadata_list" in metadata_payload:
                     metadata_list = metadata_payload["metadata_list"]
                     send_timestamp = metadata_payload.get("send_timestamp")
+                    raw = metadata_payload.get("tensor_format") == "raw"
                 else:
                     metadata_list = metadata_payload
                     send_timestamp = None
@@ -320,7 +357,18 @@ class ZmqStageBase:
             data_received_time = time.time()
             deserialization_start = time.time()
             tensor_list = []
+            if raw:
+                metas = [v for _, v in metadata_list if self.codec.is_tensor_meta(v)]
+                if len(metas) != len(tensor_bytes_list):
+                    raise RuntimeError(
+                        f"Stage {self.stage_idx}: {len(tensor_bytes_list)} tensor frames for "
+                        f"{len(metas)} tensor entries")
+                tensor_bytes_list = [_bytes_to_tensor(b, meta.dtype, meta.size)
+                                     for b, meta in zip(tensor_bytes_list, metas)]
             for tensor_bytes in tensor_bytes_list:
+                if raw:
+                    tensor_list.append(tensor_bytes)
+                    continue
                 buffer = io.BytesIO(tensor_bytes)
                 try:
                     loaded_obj = torch.load(buffer, map_location="cpu", weights_only=True)
