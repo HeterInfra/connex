@@ -19,6 +19,7 @@ managed by the Front Router service.
 import json
 import logging
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -725,7 +726,8 @@ class EPCV2Client:
         
         return response
     
-    def _register(self, channel: Optional[_ReqChannel] = None) -> bool:
+    def _register(self, channel: Optional[_ReqChannel] = None,
+                  timeout_ms: Optional[int] = None) -> bool:
         """Register with Front Router."""
         try:
             params = {
@@ -735,7 +737,8 @@ class EPCV2Client:
             }
             if self.config.group_size > 1:
                 params["group_size"] = int(self.config.group_size)
-            response = self._call_api("register", params, channel=channel)
+            response = self._call_api("register", params, channel=channel,
+                                      timeout_ms=timeout_ms)
             
             if response.get("success"):
                 self._local_epoch = response.get("epoch", 0)
@@ -791,9 +794,9 @@ class EPCV2Client:
                 # The router no longer knows us (e.g. router restart with
                 # in-memory state, or our route was garbage-collected):
                 # re-register so peers can find us again.
-                logger.warning("Heartbeat rejected (unknown endpoint); re-registering")
-                if self._register(channel=self._hb):
-                    return True
+                return self._reregister()
+            if ok:
+                self._rereg_delay = 0.0
             return ok
             
         except Exception as e:
@@ -801,6 +804,34 @@ class EPCV2Client:
             logger.warning("Heartbeat failed: %s", e)
             return False
     
+    # Re-registration backoff: after a router restart every endpoint
+    # re-registers at once, and each reply carries its model's route table
+    # (milliseconds of router time per call at thousands of endpoints). A
+    # failed attempt is retried after a jittered, doubling delay instead of
+    # on every heartbeat, and with the API timeout instead of the short
+    # heartbeat one, so the storm does not feed itself with timed-out calls
+    # the router still has to serve.
+    REREG_BACKOFF_MAX_S = 30.0
+    _rereg_delay = 0.0
+    _rereg_next = 0.0
+
+    def _reregister(self) -> bool:
+        now = time.monotonic()
+        if now < self._rereg_next:
+            return False
+        logger.warning("Heartbeat rejected (unknown endpoint); re-registering")
+        timeout = int(self.config.api_timeout_ms)
+        ok = self._register(channel=self._hb, timeout_ms=timeout)
+        if ok:
+            self._rereg_delay = 0.0
+            self._rereg_next = 0.0
+            return True
+        base = max(0.5, float(self.config.heartbeat_interval_s))
+        self._rereg_delay = min(self.REREG_BACKOFF_MAX_S,
+                                max(base, self._rereg_delay * 2))
+        self._rereg_next = time.monotonic() + self._rereg_delay * random.uniform(0.5, 1.5)
+        return False
+
     def _check_seq_from_heartbeat(self, server_seq: Optional[int]):
         """Detect silently missed events (e.g. PUB/SUB slow joiner).
 

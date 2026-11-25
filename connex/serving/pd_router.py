@@ -254,18 +254,26 @@ class PDRouter(Proxy):
         sub = ctx.socket(zmq.SUB)
         sub.setsockopt(zmq.LINGER, 0)
         sub.setsockopt(zmq.SUBSCRIBE, b"connex.endpoint_deregistered")
+        # A missed heartbeat lease (hung engine or host) is announced as
+        # unhealthy; the route is only deregistered after a grace period,
+        # and fetch_pools drops it from the pool right away, so without this
+        # nothing would cut the requests already waiting on it.
+        sub.setsockopt(zmq.SUBSCRIBE, b"connex.endpoint_unhealthy")
         sub.connect(self.front_router_events)
         try:
             while True:
                 try:
-                    _, data = await sub.recv_multipart()
+                    topic, data = await sub.recv_multipart()
                     ev = json.loads(data)
                 except (ValueError, zmq.ZMQError):
                     continue
                 payload = ev.get("payload") or {}
-                reason = payload.get("reason")
-                if not reason or reason in ("group_left", "expired"):
-                    continue
+                if topic == b"connex.endpoint_unhealthy":
+                    reason = "unhealthy"
+                else:
+                    reason = payload.get("reason")
+                    if not reason or reason in ("group_left", "expired"):
+                        continue
                 lid = payload.get("lid") or {}
                 role = STAGE_ROLE.get(lid.get("stage_idx"))
                 url = self._members.get((role, lid.get("replica_idx")))
@@ -279,12 +287,19 @@ class PDRouter(Proxy):
         finally:
             sub.close(0)
 
-    async def _probe_loop(self):
-        while True:
-            eps = [e for p in (self.pool, self.prefill_pool)
-                   for e in list(p.eps.values()) if e.url in p.order]
-            await asyncio.gather(*(self._probe_any(e) for e in eps), return_exceptions=True)
-            await asyncio.sleep(self.probe_interval)
+    probe_first = True
+
+    def _probe_targets(self):
+        # Members still serving requests are probed even after they left the
+        # pool (deregistered, unhealthy at the front-router, drained, removed
+        # from a file): their in-flight prefills and pre-first-token waits end
+        # only when the instance is seen dead, so an unprobed one that hangs
+        # would hold them forever.
+        return [e for p in (self.pool, self.prefill_pool)
+                for e in list(p.eps.values()) if e.url in p.order or e.inflight > 0]
+
+    async def _probe_one(self, ep):
+        await self._probe_any(ep)
 
     async def _probe_any(self, ep):
         pool = self.prefill_pool if ep.url in self.prefill_pool.eps else self.pool
@@ -461,21 +476,6 @@ class PDRouter(Proxy):
                                          for u in p.drained if u in p.eps]
 
         return web.json_response({"prefill": desc(self.prefill_pool), "decode": desc(self.pool)})
-
-    def _admin_allowed(self, request) -> bool:
-        """Pool changes are admin operations: allowed from loopback, or with
-        ``Authorization: Bearer <token>`` when ``CONNEX_PD_ADMIN_TOKEN`` (or
-        ``--admin-token``) is set. Without that a router bound to 0.0.0.0
-        would let any client drain every instance."""
-        import hmac
-
-        tok = self.admin_token
-        if tok:
-            got = request.headers.get("Authorization", "")
-            if hmac.compare_digest(got.encode(), f"Bearer {tok}".encode()):
-                return True
-        remote = (request.remote or "").split("%", 1)[0]
-        return remote in ("127.0.0.1", "::1", "localhost") or remote.startswith("::ffff:127.")
 
     async def _drain_target(self, request):
         if not self._admin_allowed(request):

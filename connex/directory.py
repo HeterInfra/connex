@@ -153,6 +153,13 @@ class DirectoryClient:
         
         # Local endpoint cache: LID -> EndpointInfo
         self._endpoint_cache: dict[tuple, EndpointInfo] = {}
+        # Directory epoch at which each cached entry was fetched. An entry's
+        # own ``epoch`` is the epoch it registered at, which falls behind the
+        # directory epoch after any membership change anywhere.
+        self._cache_epoch: dict[tuple, int] = {}
+        # Epoch of the last event seen per LID: an entry fetched before that
+        # (a lookup racing the event) is not trusted.
+        self._lid_event_epoch: dict[tuple, int] = {}
         self._cache_lock = threading.RLock()
         
         # Event subscribers
@@ -275,8 +282,14 @@ class DirectoryClient:
         with self._cache_lock:
             if target_lid in self._endpoint_cache:
                 cached = self._endpoint_cache[target_lid]
-                # Check if cache is still valid (same epoch)
-                if cached.epoch >= self._epoch:
+                # Valid while events keep it current (a JOIN/MIGRATE/LEAVE of
+                # this LID drops it), or, without an event listener, until the
+                # directory epoch moves past the one it was fetched at.
+                fetched = max(cached.epoch, self._cache_epoch.get(target_lid, 0))
+                if self._event_thread is not None:
+                    if fetched >= self._lid_event_epoch.get(target_lid, 0):
+                        return cached
+                elif fetched >= self._epoch:
                     return cached
                     
         # Query directory service
@@ -295,6 +308,7 @@ class DirectoryClient:
                 # Update cache
                 with self._cache_lock:
                     self._endpoint_cache[target_lid] = endpoint
+                    self._cache_epoch[target_lid] = int(response.get("epoch") or 0)
                     
                 return endpoint
             else:
@@ -560,8 +574,12 @@ class DirectoryClient:
             if epoch is not None:
                 with self._epoch_lock:
                     self._epoch = max(self._epoch, epoch)
-            if event == MembershipEvent.LEAVE:
-                self.invalidate_cache(info.lid)
+                with self._cache_lock:
+                    self._lid_event_epoch[info.lid] = max(
+                        epoch, self._lid_event_epoch.get(info.lid, 0))
+            # any change of this LID (leave, rejoin at a new address,
+            # migration) makes its cached entry stale
+            self.invalidate_cache(info.lid)
             for handler in list(self._event_handlers):
                 try:
                     handler(event, info)
@@ -599,8 +617,10 @@ class DirectoryClient:
         with self._cache_lock:
             if target_lid:
                 self._endpoint_cache.pop(target_lid, None)
+                self._cache_epoch.pop(target_lid, None)
             else:
                 self._endpoint_cache.clear()
+                self._cache_epoch.clear()
                 
     def _control_call(self, message: dict[str, Any],
                       timeout_ms: int = 5000) -> Optional[dict[str, Any]]:

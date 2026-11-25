@@ -133,7 +133,14 @@ class Pool:
             if e.bad_until:   # blacklist expired without a probe: re-arm its dead event
                 self.mark_good(e)
         if not healthy:   # last resort: the one whose blacklist expires first
-            return min(cands, key=lambda e: e.bad_until)
+            e = min(cands, key=lambda e: e.bad_until)
+            if e.dead.is_set():
+                # Give this attempt a fresh event: the set one would end its
+                # wait for the first token at once, turning every request into
+                # a 502 while all replicas are blacklisted. bad_until is kept,
+                # so a new failure (mark_bad) still wakes the attempt.
+                e.dead = asyncio.Event()
+            return e
         self.rr += 1
         n = len(healthy)
         return min((healthy[(self.rr + i) % n] for i in range(n)), key=lambda e: e.inflight)
@@ -358,11 +365,47 @@ class Proxy:
             await asyncio.sleep(self.reload_interval)
             self.pool.reload()
 
+    def _probe_targets(self):
+        """Endpoints the prober watches (subclasses add their other pools)."""
+        return [e for e in list(self.pool.eps.values()) if e.url in self.pool.order]
+
+    async def _probe_one(self, ep):
+        await self._probe(ep)
+
     async def _probe_loop(self):
+        """One probe task per endpoint. A single round over all endpoints
+        would wait for the slowest one: a blackholed replica (two 2 s
+        timeouts) would delay the detection of every other replica's death
+        by ~4 s per round."""
+        tasks = {}
+        try:
+            while True:
+                want = {id(e): e for e in self._probe_targets()}
+                for k in list(tasks):
+                    if k not in want or tasks[k][0] is not want[k] or tasks[k][1].done():
+                        tasks.pop(k)[1].cancel()
+                for k, e in want.items():
+                    if k not in tasks:
+                        tasks[k] = (e, asyncio.ensure_future(self._probe_ep_loop(e)))
+                await asyncio.sleep(self.probe_interval)
+        finally:
+            for _, t in tasks.values():
+                t.cancel()
+
+    probe_first = False   # probe a newly watched endpoint at once (PD: new members)
+
+    async def _probe_ep_loop(self, ep):
+        first = self.probe_first
         while True:
-            await asyncio.sleep(self.probe_interval)
-            await asyncio.gather(*(self._probe(e) for e in list(self.pool.eps.values())
-                                   if e.url in self.pool.order), return_exceptions=True)
+            if not first:
+                await asyncio.sleep(self.probe_interval)
+            first = False
+            try:
+                await self._probe_one(ep)
+            except asyncio.CancelledError:
+                raise
+            except Exception:   # a probe bug must not end this endpoint's probing
+                log.exception("probe of %s failed", ep.url)
 
     async def _alive(self, ep, timeout=2.0):
         try:
@@ -598,11 +641,34 @@ class Proxy:
         return await self._handle(request, "chat")
 
     async def _handle(self, request, kind):
-        body = await request.json()
+        return await self._serve(request, kind, await request.json())
+
+    async def _serve(self, request, kind, body):
         gen = self.generate(kind, body)
-        if body.get("stream"):
-            return await self._stream(request, gen)
-        return await self._aggregate(gen, kind, body)
+        # aiohttp (< 3.10 by default) keeps running a handler whose client
+        # went away; a non-streaming request, or a stream still waiting for
+        # its first token, would then generate to the end on the backend.
+        # Watch the client connection and cancel this handler when it drops:
+        # the backend stream is closed and the engine aborts the request.
+        watch = asyncio.ensure_future(self._cancel_on_disconnect(request, asyncio.current_task()))
+        try:
+            if body.get("stream"):
+                return await self._stream(request, gen)
+            return await self._aggregate(gen, kind, body)
+        finally:
+            watch.cancel()
+            await gen.aclose()
+
+    disconnect_poll_s = 0.5
+
+    async def _cancel_on_disconnect(self, request, task):
+        while True:
+            await asyncio.sleep(self.disconnect_poll_s)
+            tr = request.transport
+            if tr is None or tr.is_closing():
+                self.stats["client_disconnects"] = self.stats.get("client_disconnects", 0) + 1
+                task.cancel()
+                return
 
     async def _stream(self, request, gen):
         resp = None
@@ -639,33 +705,63 @@ class Proxy:
         return resp
 
     async def _aggregate(self, gen, kind, body):
-        text, lps, st = [], [], None
+        # per choice index: with n > 1 (or best_of) the backend streams the
+        # choices interleaved, each chunk tagged with its index
+        text, lps, fins, st = {}, {}, {}, None
         try:
             async for c in gen:
                 if isinstance(c, Resumer):
                     st = c
                     break
-                ch = c["choices"][0]
-                text.append((ch.get("delta") or {}).get("content") or "" if kind == "chat"
-                            else ch.get("text") or "")
-                if ch.get("logprobs"):
-                    lps.append(ch["logprobs"])
+                for ch in c.get("choices") or ():
+                    i = ch.get("index", 0)
+                    text.setdefault(i, []).append(
+                        (ch.get("delta") or {}).get("content") or "" if kind == "chat"
+                        else ch.get("text") or "")
+                    if ch.get("logprobs"):
+                        lps.setdefault(i, []).append(ch["logprobs"])
+                    if ch.get("finish_reason") is not None:
+                        fins[i] = (ch["finish_reason"], ch.get("stop_reason"))
         except HTTPPassthrough as e:
             return web.Response(status=e.status, body=e.payload, content_type=e.ctype)
         except UpstreamFailed as e:
             return web.json_response({"error": {"message": f"all replicas failed: {e}",
                                                 "type": "upstream_failed"}}, status=502)
-        content = "".join(text)
-        if kind == "chat":
-            choice = {"index": 0, "message": {"role": "assistant", "content": content},
-                      "logprobs": _merge_lp(lps, True), "finish_reason": st.finish,
-                      "stop_reason": st.stop_reason}
-        else:
-            choice = {"index": 0, "text": content, "logprobs": _merge_lp(lps, False),
-                      "finish_reason": st.finish, "stop_reason": st.stop_reason}
+        choices = []
+        for i in sorted(text) or [0]:
+            content = "".join(text.get(i, ()))
+            # index 0 of a single-choice request: the resumer's view also
+            # covers a stream that broke after its last token
+            fin, stop = ((st.finish, st.stop_reason) if i == 0 and len(text) <= 1
+                         else fins.get(i, (None, None)))
+            if kind == "chat":
+                choices.append({"index": i, "message": {"role": "assistant", "content": content},
+                                "logprobs": _merge_lp(lps.get(i), True), "finish_reason": fin,
+                                "stop_reason": stop})
+            else:
+                choices.append({"index": i, "text": content,
+                                "logprobs": _merge_lp(lps.get(i), False), "finish_reason": fin,
+                                "stop_reason": stop})
         return web.json_response({"id": st.rid, "object": "chat.completion" if kind == "chat"
                                   else "text_completion", "created": st.created, "model": st.model,
-                                  "choices": [choice], "usage": st.usage()})
+                                  "choices": choices, "usage": st.usage()})
+
+    admin_token = None   # bearer token for admin endpoints from non-loopback clients
+
+    def _admin_allowed(self, request) -> bool:
+        """Admin operations (pool changes, session moves) are allowed from
+        loopback, or with ``Authorization: Bearer <token>`` when
+        ``admin_token`` is set. Without that a proxy bound to 0.0.0.0 would
+        let any client drain or move every instance's traffic."""
+        import hmac
+
+        tok = self.admin_token
+        if tok:
+            got = request.headers.get("Authorization", "")
+            if hmac.compare_digest(got.encode(), f"Bearer {tok}".encode()):
+                return True
+        remote = (request.remote or "").split("%", 1)[0]
+        return remote in ("127.0.0.1", "::1", "localhost") or remote.startswith("::ffff:127.")
 
     async def handle_models(self, request):
         for _ in range(len(self.pool.order) or 1):

@@ -278,8 +278,12 @@ class ZmqTransport:
 
         self._zmq = zmq
         self._ctx = zmq.Context.instance()
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()          # guards _eps / _ep_locks
         self._eps: dict[tuple[str, int], Any] = {}
+        # One lock per endpoint socket (ZMQ sockets are not thread-safe). A
+        # send to a dead peer blocks for up to SNDTIMEO once its queue is
+        # full; under a shared lock that stalled sends to every other peer.
+        self._ep_locks: dict[int, threading.Lock] = {}
         self._rx = self._ctx.socket(zmq.PULL)
         self._rx.setsockopt(zmq.LINGER, 0)
         if port:
@@ -300,10 +304,18 @@ class ZmqTransport:
                 ep.setsockopt(self._zmq.SNDTIMEO, 2000)
                 ep.connect(f"tcp://{host}:{port}")
                 self._eps[(host, port)] = ep
+                self._ep_locks[id(ep)] = threading.Lock()
             return ep
 
-    def send_sync(self, ep: Any, data: bytes, tag: int = 0) -> None:
+    def _ep_lock(self, ep: Any) -> threading.Lock:
         with self._lock:
+            lk = self._ep_locks.get(id(ep))
+            if lk is None:
+                lk = self._ep_locks[id(ep)] = threading.Lock()
+            return lk
+
+    def send_sync(self, ep: Any, data: bytes, tag: int = 0) -> None:
+        with self._ep_lock(ep):
             ep.send(data)
 
     def recv_sync(self, timeout_ms: int = 1000) -> Optional[bytes]:
@@ -316,12 +328,19 @@ class ZmqTransport:
             for k, v in list(self._eps.items()):
                 if v is ep:
                     del self._eps[k]
-        ep.close(0)
+        with self._ep_lock(ep):        # not while a send is using it
+            ep.close(0)
+        with self._lock:
+            self._ep_locks.pop(id(ep), None)
         return True
 
     def stop_sync(self) -> None:
         with self._lock:
-            for ep in self._eps.values():
-                ep.close(0)
+            eps = list(self._eps.values())
             self._eps.clear()
+        for ep in eps:
+            with self._ep_lock(ep):
+                ep.close(0)
+        with self._lock:
+            self._ep_locks.clear()
         self._rx.close(0)

@@ -2,8 +2,10 @@
 """Session-aware routing and live session migration (see package doc)."""
 import argparse
 import logging
+import os
 import time
 
+import aiohttp
 from aiohttp import web
 
 from ..serving.proxy import Pool, Proxy
@@ -56,6 +58,11 @@ class ReprefillMover(KVMover):
 
     name = "reprefill"
 
+    def __init__(self, timeout_s=120.0):
+        # bounds the re-prefill request: a hung target must not hold the
+        # migration (and the admin call waiting on it) forever
+        self.timeout_s = timeout_s
+
     async def move(self, proxy, session, src, dst):
         live = [st for st in session.inflight if st.k > 0 and st.can_resume()]
         if live:     # warm what the cut-over request will resend: prompt + output so far
@@ -71,7 +78,8 @@ class ReprefillMover(KVMover):
         for k in ("stream_options", "logprobs", "return_tokens_as_token_ids", "min_tokens"):
             body.pop(k, None)
         path = "/v1/chat/completions" if session.kind == "chat" else "/v1/completions"
-        async with proxy.session.post(dst.rstrip("/") + path, json=body) as r:
+        async with proxy.session.post(dst.rstrip("/") + path, json=body,
+                                      timeout=aiohttp.ClientTimeout(total=self.timeout_s)) as r:
             if r.status != 200:
                 raise RuntimeError(f"re-prefill on {dst}: HTTP {r.status}")
             out = await r.json()
@@ -86,6 +94,7 @@ class SessionProxy(Proxy):
         self.ttl = session_ttl_s
         self._next_sweep = time.monotonic() + (session_ttl_s or 0)
         self.stats.update(sessions=0, migrations=0, failovers=0)
+        self.admin_token = os.getenv("CONNEX_SESSION_ADMIN_TOKEN") or None
 
     # -- routing ----------------------------------------------------------------
     def app(self):
@@ -100,10 +109,7 @@ class SessionProxy(Proxy):
         sid = body.pop("session_id", None) or request.headers.get(HEADER)
         if sid is not None:
             body["_connex_session"] = str(sid)
-        gen = self.generate(kind, body)
-        if body.get("stream"):
-            return await self._stream(request, gen)
-        return await self._aggregate(gen, kind, body)
+        return await self._serve(request, kind, body)
 
     def get_session(self, sid):
         s = self.sessions.get(sid)
@@ -228,7 +234,13 @@ class SessionProxy(Proxy):
     async def handle_sessions(self, request):
         return web.json_response({sid: s.info() for sid, s in self.sessions.items()})
 
+    def _check_admin(self, request):
+        if not self._admin_allowed(request):
+            raise web.HTTPForbidden(
+                text="session admin needs loopback or CONNEX_SESSION_ADMIN_TOKEN")
+
     async def handle_migrate(self, request):
+        self._check_admin(request)
         b = await request.json()
         try:
             rec = await self.migrate(request.match_info["sid"], b["target"], b.get("mode", "auto"))
@@ -237,6 +249,7 @@ class SessionProxy(Proxy):
         return web.json_response(rec)
 
     async def handle_drain(self, request):
+        self._check_admin(request)
         b = await request.json()
         return web.json_response(await self.drain(b["url"], mode=b.get("mode", "auto")))
 
@@ -251,12 +264,18 @@ def main():
     ap.add_argument("--probe-interval", type=float, default=1.0)
     ap.add_argument("--no-token-ids", action="store_true",
                     help="resume from text (engines without token-id logprobs, e.g. SGLang)")
+    ap.add_argument("--admin-token", default=None,
+                    help="bearer token for POST /sessions/{sid}/migrate and /sessions/drain "
+                         "from non-loopback clients (default: CONNEX_SESSION_ADMIN_TOKEN; "
+                         "unset = loopback only)")
     ap.add_argument("--log-level", default="INFO")
     a = ap.parse_args()
     logging.basicConfig(level=a.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     pool = Pool([u for u in a.endpoints.split(",") if u], a.endpoints_file)
     proxy = SessionProxy(pool, idle_timeout=a.idle_timeout, probe_interval=a.probe_interval,
                          token_ids=not a.no_token_ids)
+    if a.admin_token:
+        proxy.admin_token = a.admin_token
     web.run_app(proxy.app(), host=a.host, port=a.port, access_log=None)
 
 

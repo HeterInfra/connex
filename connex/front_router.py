@@ -243,6 +243,8 @@ class RouteManager:
 
     * ``_by_stage``: (model_name, stage_idx) -> {key: route}, so stage-scoped
       queries cost O(routes in that stage) instead of O(all routes).
+    * ``_by_model``: model_name -> {key: route}, likewise for model-scoped
+      queries (every register reply carries its model's routes).
     * ``_hb_order``: an OrderedDict key -> last touch time kept in
       heartbeat order (oldest first).  Expiry scans walk it from the front
       and stop at the first non-expired entry, so a health check costs
@@ -252,6 +254,7 @@ class RouteManager:
     def __init__(self, persistence: Optional["PersistenceBackend"] = None):
         self._routes: Dict[str, RouteEntry] = {}
         self._by_stage: Dict[Tuple[str, int], Dict[str, RouteEntry]] = {}
+        self._by_model: Dict[str, Dict[str, RouteEntry]] = {}
         self._hb_order: "OrderedDict[str, float]" = OrderedDict()
         self._lock = threading.RLock()
         self._persistence = persistence
@@ -267,6 +270,7 @@ class RouteManager:
         self._by_stage.setdefault(
             (route.lid.model_name, route.lid.stage_idx), {}
         )[key] = route
+        self._by_model.setdefault(route.lid.model_name, {})[key] = route
         self._touch_locked(key, route.last_heartbeat)
     
     def _index_remove(self, key: str) -> Optional[RouteEntry]:
@@ -279,6 +283,11 @@ class RouteManager:
                 bucket.pop(key, None)
                 if not bucket:
                     del self._by_stage[skey]
+            mbucket = self._by_model.get(route.lid.model_name)
+            if mbucket is not None:
+                mbucket.pop(key, None)
+                if not mbucket:
+                    del self._by_model[route.lid.model_name]
         return route
     
     def _touch_locked(self, key: str, ts: float):
@@ -348,10 +357,8 @@ class RouteManager:
     def get_routes_for_model(self, model_name: str) -> List[RouteEntry]:
         """Get all routes for a model."""
         with self._lock:
-            return [
-                r for r in self._routes.values()
-                if r.lid.model_name == model_name
-            ]
+            bucket = self._by_model.get(model_name)
+            return list(bucket.values()) if bucket else []
     
     def get_routes_for_stage(
         self, model_name: str, stage_idx: int
@@ -478,7 +485,11 @@ class RouteManager:
                     # last_heartbeat was refreshed outside touch(); re-sort.
                     retouch.append((key, route.last_heartbeat))
                     continue
-                if route.state == RouteState.ACTIVE:
+                if route.state in (RouteState.ACTIVE, RouteState.MIGRATING,
+                                   RouteState.DRAINING, RouteState.UNKNOWN):
+                    # A MIGRATING or DRAINING endpoint that stopped
+                    # heartbeating is as dead as an ACTIVE one; without this
+                    # its route would never expire.
                     route.state = RouteState.UNHEALTHY
                     newly_unhealthy.append(route)
                     if self._persistence:
@@ -594,10 +605,12 @@ class MemberManager:
         grace_period_s: Optional[float] = None,
         check_interval_s: Optional[float] = None,
         on_removed: Optional[Callable[[LogicalEndpointID], None]] = None,
+        on_tick: Optional[Callable[[float], None]] = None,
     ):
         self._route_manager = route_manager
         self._on_unhealthy = on_unhealthy
         self._on_removed = on_removed
+        self._on_tick = on_tick
         self._check_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         # Instance attributes shadow the class defaults (still overridable
@@ -672,6 +685,12 @@ class MemberManager:
                 except Exception as e:
                     logger.error("on_removed callback error: %s", e)
 
+        if self._on_tick:
+            try:
+                self._on_tick(now)
+            except Exception as e:
+                logger.error("on_tick callback error: %s", e)
+
 
 # ============================================================================
 # Migration Orchestrator
@@ -682,6 +701,8 @@ class MigrationOrchestrator:
     
     SHADOW_TIMEOUT_S = 30.0
     CUTOVER_TIMEOUT_S = 10.0
+    # finished (complete/failed) migrations are kept this long for lookups
+    FINISHED_TTL_S = 300.0
     
     def __init__(
         self,
@@ -825,9 +846,13 @@ class MigrationOrchestrator:
                 return False
             
             migration.state = "failed"
+            migration.completed_at = time.time()
         
-        # Restore route state
-        self._route_manager.update_route_state(migration.lid, RouteState.ACTIVE)
+        # Restore route state, unless the route has meanwhile expired
+        # (UNHEALTHY) or gone: an abort must not revive a dead endpoint.
+        route = self._route_manager.get_route(migration.lid)
+        if route is not None and route.state == RouteState.MIGRATING:
+            self._route_manager.update_route_state(migration.lid, RouteState.ACTIVE)
         
         # Broadcast MIGRATION_FAILED
         self._event_bus.publish(Event(
@@ -842,6 +867,25 @@ class MigrationOrchestrator:
         
         logger.warning("Migration %s aborted: %s", migration_id, reason)
         return True
+
+    def reap(self, now: Optional[float] = None) -> List[str]:
+        """Abort migrations that were never cut over within
+        SHADOW_TIMEOUT_S + CUTOVER_TIMEOUT_S (their route would otherwise stay
+        MIGRATING forever) and drop finished ones after FINISHED_TTL_S, so
+        ``_pending`` does not grow without bound. Returns the aborted ids."""
+        now = time.time() if now is None else now
+        deadline = self.SHADOW_TIMEOUT_S + self.CUTOVER_TIMEOUT_S
+        with self._lock:
+            stale = [m.migration_id for m in self._pending.values()
+                     if m.state in ("pending", "preparing", "ready")
+                     and now - m.created_at > deadline]
+            for mid in [mid for mid, m in self._pending.items()
+                        if m.state in ("complete", "failed")
+                        and now - (m.completed_at or m.created_at) > self.FINISHED_TTL_S]:
+                del self._pending[mid]
+        for mid in stale:
+            self.abort_migration(mid, "timeout")
+        return stale
 
 
 # ============================================================================
@@ -1013,6 +1057,7 @@ class FrontRouter:
             self.route_manager,
             on_unhealthy=self._on_endpoint_unhealthy,
             on_removed=self._on_endpoint_expired,
+            on_tick=self._on_health_tick,
         )
         
         self.migration_orchestrator = MigrationOrchestrator(
@@ -1140,7 +1185,13 @@ class FrontRouter:
             return {"error": f"Unknown method: {method}"}
         
         try:
-            return handler(params)
+            # Route changes and their events happen on two threads (this API
+            # thread and the health checker). Making each change and its
+            # publish one step under the route lock keeps the event order
+            # (seq) equal to the order the changes were applied in; otherwise
+            # a late UNHEALTHY could follow the REGISTERED of a recovery.
+            with self.route_manager._lock:
+                return handler(params)
         except Exception as e:
             logger.error("Handler error for %s: %s", method, e)
             return {"error": str(e)}
@@ -1643,16 +1694,21 @@ class FrontRouter:
     
     def _on_endpoint_unhealthy(self, lid: LogicalEndpointID):
         """Callback when an endpoint becomes unhealthy."""
-        route = self.route_manager.get_route(lid)
-        if route is not None and route.group_size > 1:
-            # a shard missed its lease: the group cannot serve, fail all of it
-            self.fail_group(lid, "group_member_unhealthy")
-            return
-        self.event_bus.publish(Event(
-            type=EventType.ENDPOINT_UNHEALTHY,
-            epoch=self.epoch_manager.current,
-            payload={"lid": lid.to_dict()},
-        ))
+        with self.route_manager._lock:
+            route = self.route_manager.get_route(lid)
+            if route is None or route.state != RouteState.UNHEALTHY:
+                # recovered (heartbeat), re-registered or removed since the
+                # health check marked it: announcing it now would be stale
+                return
+            if route.group_size > 1:
+                # a shard missed its lease: the group cannot serve, fail all of it
+                self.fail_group(lid, "group_member_unhealthy")
+                return
+            self.event_bus.publish(Event(
+                type=EventType.ENDPOINT_UNHEALTHY,
+                epoch=self.epoch_manager.current,
+                payload={"lid": lid.to_dict()},
+            ))
     
     def _on_endpoint_expired(self, lid: LogicalEndpointID):
         """Callback when an UNHEALTHY route is garbage-collected after grace.
@@ -1660,12 +1716,19 @@ class FrontRouter:
         Previously removal was silent, so event-driven caches kept the dead
         route forever.  Announce it as a deregistration.
         """
-        self.event_bus.publish(Event(
-            type=EventType.ENDPOINT_DEREGISTERED,
-            epoch=self.epoch_manager.current,
-            payload={"lid": lid.to_dict(), "reason": "expired"},
-            source_lid=lid.to_key(),
-        ))
+        with self.route_manager._lock:
+            if self.route_manager.get_route(lid) is not None:
+                return   # registered again since: not gone any more
+            self.event_bus.publish(Event(
+                type=EventType.ENDPOINT_DEREGISTERED,
+                epoch=self.epoch_manager.current,
+                payload={"lid": lid.to_dict(), "reason": "expired"},
+                source_lid=lid.to_key(),
+            ))
+
+    def _on_health_tick(self, now: float):
+        with self.route_manager._lock:
+            self.migration_orchestrator.reap(now)
 
 
 # ============================================================================
