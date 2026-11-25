@@ -111,6 +111,30 @@ def _make_cuda_ctx_current() -> None:
         pass
 
 
+# connex-rs >= 0.1.7 posts a whole batch of reads in one call
+# (Engine.transfer_batch_sync, GIL released while it waits). Per-op
+# get_async costs ~1-2 us to post plus ~0.6 us per handle wait in Python,
+# which is ~150 ms for a fragmented 65k-op KV pull. 0 = always per-op.
+_RS_BATCH = os.getenv("CONNEX_RS_BATCH", "1") != "0"
+
+
+def batch_read(engine, peer_url: str, ops, timeout_ms: int):
+    """Read ``ops`` [(local dst, remote src, len)] from one peer in one call and
+    wait for all of them. Returns 0 or a negative connex-rs code (-2 peer
+    failed, -3 timeout, -4 invalid), or None when the engine has no batch
+    API (connex-rs < 0.1.7) and the caller must post per op. Posting is all
+    or nothing, and every posted read is waited for before returning, so no
+    DMA lands after the caller reuses the buffers."""
+    fn = getattr(engine, "transfer_batch_sync", None) if _RS_BATCH else None
+    if fn is None:
+        return None
+    if not isinstance(ops, list):
+        ops = list(ops)
+    if not ops:
+        return 0
+    return int(fn(peer_url, False, ops, timeout_ms))
+
+
 class ConnexRsPlane:
     name = "connex-rs"
 
@@ -138,6 +162,11 @@ class ConnexRsPlane:
         return self.e.unregister_memory(ptr)
 
     def read(self, peer_url: str, ops) -> int:
+        rc = batch_read(self.e, peer_url, ops, self.timeout_ms)
+        if rc is not None:
+            if rc != 0:
+                log.warning("connex-rs: batched read from %s failed (rc=%d)", peer_url, rc)
+            return PEER_FAILED if rc in (-1, -5) else rc
         handles = []
         try:
             for dst, src, n in ops:

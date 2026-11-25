@@ -161,6 +161,18 @@ class ConnexRsTransport:
         re-reads the whole batch elsewhere: reads are idempotent)."""
         base = dst.data_ptr()
         to = timeout_ms or self.timeout_ms
+        from connex.pd.dataplane import batch_read
+
+        rc = batch_read(self.e, remote_url,
+                        [(base + dst_off, remote_addr, length)
+                         for remote_addr, dst_off, length in ops], to)
+        if rc is not None:
+            if rc != 0:
+                raise TransferError(f"{remote_url}: read failed rc={rc} "
+                                    "(-2 peer failed, -3 timeout, -4 invalid)")
+            self.reads += len(ops)
+            self.bytes += sum(o[2] for o in ops)
+            return
         hs, err = [], None
         try:
             for remote_addr, dst_off, length in ops:
@@ -217,6 +229,18 @@ class ConnexRsTransport:
         """Like ``read_batch`` for several destination tensors: every read of
         every batch is in flight at once, then all are awaited."""
         to = timeout_ms or self.timeout_ms
+        flat = [(dst.data_ptr() + dst_off, remote_addr, length)
+                for dst, ops in batches for remote_addr, dst_off, length in ops]
+        from connex.pd.dataplane import batch_read
+
+        rc = batch_read(self.e, remote_url, flat, to)
+        if rc is not None:
+            if rc != 0:
+                raise TransferError(f"{remote_url}: read failed rc={rc} "
+                                    "(-2 peer failed, -3 timeout, -4 invalid)")
+            self.reads += len(flat)
+            self.bytes += sum(o[2] for o in flat)
+            return
         hs, err, total = [], None, 0
         try:
             for dst, ops in batches:
