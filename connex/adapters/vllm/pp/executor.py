@@ -37,6 +37,12 @@ Configuration (stage 0):
                          least as many tokens), at most this value; a step
                          larger than all of them keeps this value
   CONNEX_PP_REPLACE_TIMEOUT_S how long to wait for a live replica (120)
+  CONNEX_PP_ASYNC_CTRL   1 (default): the steps' EXEC/SAMPLE messages are
+                         queued by the engine thread and sent by one thread
+                         per downstream replica (:mod:`ctltx`); 0: sent
+                         inline on the engine thread (for debugging)
+  CONNEX_PP_CTL_QUEUE    messages queued per replica before the engine
+                         thread waits (64)
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 
 from connex.adapters.vllm.pp.auth import FrameAuth, load_secret
+from connex.adapters.vllm.pp.ctltx import CtlSender
 from connex.adapters.vllm.pp.link import CONTROL, make_engine
 from connex.adapters.vllm.pp.trace import tr
 from connex.adapters.vllm.pp.worker import ROUTE_ATTR
@@ -286,6 +293,14 @@ class ConnexPPExecutor(MultiprocExecutor):
         self.failovers: list[dict] = []
         self.ctl = ControlLink(0, HEAD_SHARD, self.replica_id,
                                on_message=self._on_message, on_failed=self._on_failed)
+        # Not under the control send lock, like _send_abort: connex-rs
+        # send_msg is thread-safe, and a send to one replica must not wait
+        # behind a HELLO to a replica that needs a connection.
+        self.ctl_tx = None
+        if os.getenv("CONNEX_PP_ASYNC_CTRL", "1") != "0":
+            self.ctl_tx = CtlSender(self.ctl.engine.send_msg,
+                                    depth=int(os.getenv("CONNEX_PP_CTL_QUEUE", "64")),
+                                    on_error=self._on_send_failed)
         for lst in self.replicas:
             for r in lst:
                 self._hello(r)
@@ -454,6 +469,22 @@ class ConnexPPExecutor(MultiprocExecutor):
         r = self._find(peer)
         if r is None:
             return
+        self._replica_failed(r, reason, ts)
+
+    def _on_send_failed(self, url, exc) -> None:
+        """A queued EXEC/SAMPLE could not be sent (ctltx): the step cannot
+        complete on that replica. Handled like a failure event about it
+        (inline sends left this to the step timeout), off the sender thread:
+        the check pings and the failover waits."""
+        with self.lock:
+            r = next((x for x in self.route if x is not None and x.ctl_url == url), None)
+        if r is None:
+            return   # already off the route
+        threading.Thread(target=self._replica_failed,
+                         args=(r, f"control send failed: {exc}", None),
+                         name="cx-pp-sendfail", daemon=True).start()
+
+    def _replica_failed(self, r: Replica, reason, ts: float | None) -> None:
         tr("h_failed", self.seq)
         if r.alive and ts is not None and ts < r.alive_since:
             # Queued before the current incarnation answered HELLO: about an
@@ -508,6 +539,13 @@ class ConnexPPExecutor(MultiprocExecutor):
             lost = [p for p in self.pending.values() if not p.event.is_set()]
             self.lost_pending = True
             self.route[r.stage - 1] = None
+            tx = getattr(self, "ctl_tx", None)
+            if tx is not None:
+                # Steps still queued for it are lost; if it restarts under
+                # the same address, its new incarnation must not get them.
+                # A put waiting for room for it gives up (the engine thread
+                # is not held by a replica that no longer counts).
+                tx.drop(r.ctl_url)
             # Complete the lost steps now: the engine must not wait for them.
             for p in lost:
                 p.lost = True
@@ -652,9 +690,7 @@ class ConnexPPExecutor(MultiprocExecutor):
                 tr("h_prefill", seq)
             raw = self.ctl.encode(("EXEC", seq, epoch, so, self.owner))
             tr("h_exec_send", seq)
-            for r in route:
-                if r is not None:
-                    self.ctl.send(r.ctl_url, None, raw=raw)
+            self._send_step(route, raw, "h_exec_tx", seq)
             tr("h_exec_sent", seq)
         out = super().execute_model(so, non_block)
         tr("h_exec_local", seq)
@@ -673,14 +709,26 @@ class ConnexPPExecutor(MultiprocExecutor):
             p.t_send = time.monotonic()
             tr("h_sample_enc", seq)
             raw = self.ctl.encode(("SAMPLE", seq, p.epoch, grammar_output, self.owner))
-            for r in route:
-                if r is not None:
-                    self.ctl.send(r.ctl_url, None, raw=raw)
+            self._send_step(route, raw, "h_sample_tx", seq)
             tr("h_sample_sent", seq)
         local = super().sample_tokens(grammar_output, non_block=True)
         tr("h_sample_local", seq)
         fut = _StepFuture(self, local, p)
         return fut if non_block else fut.result()
+
+    def _send_step(self, route: list, raw: bytes, tag: str, seq: int) -> None:
+        """An EXEC or SAMPLE to every route member. Queued (ctltx), so the
+        engine thread does not wait for the sends; one FIFO per replica
+        keeps each stage's EXEC/SAMPLE sequence as the engine issued it.
+        With CONNEX_PP_ASYNC_CTRL=0, sent here, one after the other."""
+        tx = getattr(self, "ctl_tx", None)
+        for r in route:
+            if r is None:
+                continue
+            if tx is None:
+                self.ctl.send(r.ctl_url, None, raw=raw)
+            else:
+                tx.put(r.ctl_url, raw, (tag, seq))
 
     def _lost_output(self, p: Pending) -> ModelRunnerOutput:
         """Output of a step that was lost in a failover: no tokens. The first
@@ -715,6 +763,11 @@ class ConnexPPExecutor(MultiprocExecutor):
         return list(getattr(self, "failovers", []))
 
     def shutdown(self):
+        tx = getattr(self, "ctl_tx", None)
+        if tx is not None:
+            # Let what is queued go out while the engine still runs (inline
+            # sends had all left by now); then discard, bounded.
+            tx.close(drain_s=1.0)
         ctl = getattr(self, "ctl", None)
         if ctl is not None:
             ctl.close()
