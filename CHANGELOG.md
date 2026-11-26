@@ -18,6 +18,32 @@ ucx-py. Use connex-rs (`connex-ai[rs]`) or ConnexTE (Mooncake) instead.
 
 ### Performance
 
+- PD/RL reads over connex-rs post the whole op list in one call
+  (`Engine.transfer_batch_sync`, connex-rs >= 0.1.7; 0.1.8 waits on the last
+  op first). mlx5 RDMA loopback, 32768 x 4 KiB: wall 50 -> 43 ms, caller CPU
+  50 -> 14 ms. Older connex-rs or `CONNEX_RS_BATCH=0` keeps per-op reads. (#39)
+- PD host staging moves fragmented blocks with one gather + scatter per 64 MiB
+  chunk through the pinned mirrors' device mapping, instead of one memcpy per
+  range. A40, 32 layers x K/V: 64 fragmented blocks 57.7 -> 0.73 ms on the
+  engine thread (6.2 ms until done); 512 blocks 392 -> 3.7 ms (47 ms done).
+  `CONNEX_PD_STAGING_VECTOR=0` restores the per-range copies. (#39)
+- vLLM PP: stage 0's EXEC/SAMPLE sends leave the engine thread (one ordered
+  sender per downstream replica; 3 peers, 20 KB: 2.3 ms -> 0.13 ms of engine
+  time per step). `CONNEX_PP_ASYNC_CTRL=0` sends inline. (#39)
+- vLLM PP: the KV cache is sized around the pipeline link's GPU memory. vLLM
+  takes its memory snapshot after the PP group (with its send/receive rings)
+  exists, and the channel rings come after the KV cache, so both came out of
+  the activation headroom. The worker now holds their size while vLLM
+  profiles and releases it once the KV cache is allocated
+  (`CONNEX_PP_PROFILE_HOLD=0` to disable, `CONNEX_PP_CHAN_RESERVE_MB` for the
+  channel-ring part). (#39, #28)
+- Front router: route JSON is cached per route and per model and spliced into
+  replies (old clients get identical bytes); new clients ask for a compact or
+  empty register reply. 2000 routes: 23 ms -> 0.9 ms (old client) / 0.1 ms
+  (compact) per register; worst heartbeat in a 5000-route re-registration
+  storm 666 ms -> 44 / 11 ms. Replies carry `router_id`, so clients resync
+  after a router restart instead of trusting a stale seq. (#39)
+
 - PP host-buffer path (transfer engine without GPUDirect): send buffers are
   now freed as soon as their 1 s RDMA-read hold expires, from a deadline
   queue drained on every send and at close. Before, one worker freed one

@@ -33,6 +33,25 @@ _TRACE_SYNC = os.getenv("CONNEX_PP_TRACE_SYNC", "0") == "1"
 
 
 class ConnexPPWorker(Worker):
+    def load_model(self, *args, **kwargs):
+        out = super().load_model(*args, **kwargs)
+        # After vLLM's memory snapshot, before it profiles: hold the PP link's
+        # memory so the KV cache is sized around it (StageLink.hold_for_profiling).
+        link = getattr(get_pp_group(), "link", None)
+        if link is not None and hasattr(link, "hold_for_profiling"):
+            n = link.hold_for_profiling()
+            if n:
+                log.info("Connex PP: holding %.0f MiB of GPU memory for the pipeline "
+                         "link while vLLM sizes the KV cache", n / 2**20)
+        return out
+
+    def initialize_from_config(self, *args, **kwargs):
+        out = super().initialize_from_config(*args, **kwargs)
+        link = getattr(get_pp_group(), "link", None)
+        if link is not None and hasattr(link, "release_profiling_hold"):
+            link.release_profiling_hold()   # KV cache allocated: rings use this room
+        return out
+
     def execute_model(self, scheduler_output):
         group = get_pp_group()
         begin = getattr(group, "begin_step", None)

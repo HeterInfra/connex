@@ -265,14 +265,11 @@ class StageLink:
                 raise RuntimeError(f"connex-rs: registering {buf.numel()} bytes failed ({rc})")
         self.send_ring = _Ring(nbytes)
         self.recv_ring = _Ring(nbytes)
-        # Channel rings (same-host IPC, cross-host push) are created on first
-        # use, after vLLM has profiled memory and sized the KV cache, so they
-        # came out of the headroom left for activations (issue #39). Hold
-        # their expected size now, while profiling counts it; the first ring
-        # created frees this placeholder and takes its memory.
-        reserve = chan_reserve_bytes(ipc_slots, ipc_slot_bytes, chan_rings)
-        self._chan_reserve = (torch.empty(reserve, dtype=torch.uint8, device=device)
-                              if reserve and device.type == "cuda" else None)
+        # Expected size of the channel rings (same-host IPC, cross-host push),
+        # which are created on first use, after vLLM has sized the KV cache.
+        # See hold_for_profiling().
+        self._chan_reserve_bytes = chan_reserve_bytes(ipc_slots, ipc_slot_bytes, chan_rings)
+        self._chan_reserve = None
         self.copy_stream = torch.cuda.Stream(device)
         self.on_peer_failed = on_peer_failed
         self.on_control = on_control
@@ -641,9 +638,29 @@ class StageLink:
             ch = self._tx_chans[k] = TxChannel(self.device, slots, slot_bytes, f"{tag[0]}")
         return ch, True
 
+    def hold_for_profiling(self) -> int:
+        """Hold GPU memory while vLLM profiles, so the KV cache is sized
+        around this link's memory (issue #39, see #28). vLLM takes its memory
+        snapshot after the PP group (and so this link's send/receive rings)
+        was created, so those rings count as already used and came out of the
+        headroom; the channel rings come later still. Called from the worker
+        after the snapshot (load_model): hold the size of both, release it
+        once the KV cache exists (release_profiling_hold) or when the first
+        channel ring is allocated. Returns the bytes held."""
+        if self._chan_reserve is not None or self.device.type != "cuda":
+            return 0
+        n = self._chan_reserve_bytes + self.send_buf.numel() + self.recv_buf.numel()
+        if os.getenv("CONNEX_PP_PROFILE_HOLD", "1") == "0" or n <= 0:
+            return 0
+        self._chan_reserve = torch.empty(n, dtype=torch.uint8, device=self.device)
+        return n
+
+    def release_profiling_hold(self) -> None:
+        self._free_chan_reserve()
+
     def _free_chan_reserve(self) -> None:
-        """Release the placeholder held for channel rings (see __init__) just
-        before a ring is allocated, so the ring reuses that memory."""
+        """Release the memory held for profiling just before a channel ring is
+        allocated (the ring reuses it) or once the KV cache is allocated."""
         if getattr(self, "_chan_reserve", None) is not None:
             self._chan_reserve = None
 

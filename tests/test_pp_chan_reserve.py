@@ -27,6 +27,26 @@ def test_first_ring_frees_the_placeholder():
 
 
 @pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs CUDA")
+def test_profiling_hold_covers_rings_and_buffers(monkeypatch):
+    import torch
+
+    monkeypatch.delenv("CONNEX_PP_CHAN_RESERVE_MB", raising=False)
+    sl = link.StageLink.__new__(link.StageLink)
+    sl.device = torch.device("cuda", 0)
+    sl.send_buf = torch.empty(1 << 20, dtype=torch.uint8, device=sl.device)
+    sl.recv_buf = torch.empty(1 << 20, dtype=torch.uint8, device=sl.device)
+    sl._chan_reserve_bytes = 3 << 20
+    sl._chan_reserve = None
+    assert sl.hold_for_profiling() == 5 << 20
+    assert sl._chan_reserve.numel() == 5 << 20
+    assert sl.hold_for_profiling() == 0          # held once
+    sl.release_profiling_hold()
+    assert sl._chan_reserve is None
+    monkeypatch.setenv("CONNEX_PP_PROFILE_HOLD", "0")
+    assert sl.hold_for_profiling() == 0
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="needs CUDA")
 def test_placeholder_memory_is_reused_by_the_ring():
     import torch
 
