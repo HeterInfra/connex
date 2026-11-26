@@ -38,6 +38,7 @@ dropped.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import pickle
 import queue
@@ -297,6 +298,8 @@ class StageLink:
         self._rx_last: dict[str, int] = {}
         self._graveyard = None
         self._ip = self.url.split(":", 1)[0]
+        if IPC_ENABLED and device.type == "cuda":
+            publish_gpu(self.url, device)
         self._waiter = None
         self._outstanding: dict[int, tuple] = {}
         self._msg_id = 0
@@ -622,8 +625,11 @@ class StageLink:
         self.fatal(f"push of {key} from {peer} into channel {cid} failed ({err})")
 
     def same_host(self, url: str) -> bool:
-        return (bool(url) and IPC_ENABLED and self.ipc_slot_bytes > 0
-                and url.split(":", 1)[0] == self._ip)
+        """Use the CUDA IPC channel to ``url`` (see ipc_ok)."""
+        if not (url and IPC_ENABLED and self.ipc_slot_bytes > 0
+                and url.split(":", 1)[0] == self._ip):
+            return False
+        return _ipc_ok_cached(self.url, url)
 
     def tx_chan(self, url: str, tag: tuple, slot_bytes: int, slots: int):
         """Our channel to ``url`` for ``tag``; (channel, created)."""
@@ -1173,6 +1179,10 @@ class StageLink:
 
     def close(self) -> None:
         self._closed = True
+        try:
+            os.unlink(_gpu_file(self.url))
+        except OSError:
+            pass
         self._tx.put(None)
         self._reap.put(None)
         try:
@@ -1221,6 +1231,81 @@ def loads_plain(data) -> Any:
     import io
 
     return _PlainUnpickler(io.BytesIO(bytes(data))).load()
+
+
+_GPU_DIR = os.getenv("CONNEX_PP_GPU_DIR", "/dev/shm")
+
+
+def _gpu_file(url: str) -> str:
+    host_port = url.split("#", 1)[0]
+    return os.path.join(_GPU_DIR, "cxppgpu-" + "".join(c if c.isalnum() else "_" for c in host_port))
+
+
+def publish_gpu(url: str, device: torch.device) -> None:
+    """Write this endpoint's GPU UUID and the GPUs it can see, for ipc_ok().
+    Same-host CUDA IPC already needs a /dev/shm shared by both processes
+    (ipcchan's flags live there), so peers that can use IPC can read it."""
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        own = str(torch.cuda.get_device_properties(idx).uuid)
+        n = torch.cuda.device_count()
+        seen = [str(torch.cuda.get_device_properties(i).uuid) for i in range(n)]
+        # GPUs whose memory a kernel on ours can address (the IPC ring of a
+        # peer on another GPU is read over peer-to-peer access)
+        p2p = [seen[i] for i in range(n)
+               if i == idx or torch.cuda.can_device_access_peer(idx, i)]
+        path = _gpu_file(url)
+        tmp = f"{path}.{os.getpid()}"
+        with open(tmp, "w") as f:
+            json.dump({"gpu": own, "visible": seen, "p2p": p2p}, f)
+        os.replace(tmp, path)
+    except Exception as e:  # noqa: BLE001 - no file: peers fall back to RDMA
+        log.debug("connex-pp: cannot publish GPU identity for %s: %s", url, e)
+
+
+def _gpu_info(url: str):
+    try:
+        with open(_gpu_file(url)) as f:
+            d = json.load(f)
+        return d["gpu"], set(d["visible"]), set(d.get("p2p", [d["gpu"]]))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def ipc_ok(a: str, b: str) -> bool:
+    """Whether endpoints ``a`` and ``b`` can exchange CUDA IPC handles: same
+    host (IP) and each can see the other's GPU. Stages in separate containers
+    that each see only their own GPU share the IP but cannot open each
+    other's handles (issue #40), and two GPUs without peer-to-peer access
+    cannot read each other's rings. Symmetric, so both ends and every TP rank
+    decide the same; without the published identities (older peer, separate
+    /dev/shm) the answer is no and the stages use the RDMA path."""
+    if not (a and b) or a.split(":", 1)[0] != b.split(":", 1)[0]:
+        return False
+    ia, ib = _gpu_info(a), _gpu_info(b)
+    if ia is None or ib is None:
+        return False
+    # each sees the other's GPU, and each GPU can address the other's memory
+    return ia[0] in ib[1] and ib[0] in ia[1] and ia[0] in ib[2] and ib[0] in ia[2]
+
+
+_IPC_CACHE: dict = {}
+_IPC_TTL_S = 5.0
+
+
+def _ipc_ok_cached(a: str, b: str) -> bool:
+    """ipc_ok() without reading two files on every step."""
+    now = time.monotonic()
+    hit = _IPC_CACHE.get((a, b))
+    if hit is not None and now - hit[1] < _IPC_TTL_S:
+        return hit[0]
+    ok = ipc_ok(a, b)
+    if _gpu_info(a) is None or _gpu_info(b) is None:
+        return ok   # a peer not up yet: decide again next time, do not cache
+    if len(_IPC_CACHE) > 256:
+        _IPC_CACHE.clear()
+    _IPC_CACHE[(a, b)] = (ok, now)
+    return ok
 
 
 def _peer_id(url: str) -> tuple:

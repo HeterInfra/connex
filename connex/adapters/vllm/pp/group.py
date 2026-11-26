@@ -490,8 +490,11 @@ class ConnexPPGroup(GroupCoordinator):
         """Same decision on every TP rank (only TP rank 0 has a link)."""
         from connex.adapters.vllm.pp.link import IPC_ENABLED
 
+        from connex.adapters.vllm.pp.link import _ipc_ok_cached
+
         own = self._route[self.rank_in_group] if len(self._route) > self.rank_in_group else None
-        return bool(IPC_ENABLED and url and own and url.split(":", 1)[0] == own.split(":", 1)[0])
+        return bool(IPC_ENABLED and url and own and url.split(":", 1)[0] == own.split(":", 1)[0]
+                    and _ipc_ok_cached(own, url))
 
     def _recv_sampled(self, tensor: torch.Tensor) -> None:
         key = self._bkey()
