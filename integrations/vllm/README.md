@@ -44,6 +44,17 @@ with downstream replicas (see `docs/deploy.md`). The results in
 `docs/results.md` section 13 were measured on vLLM main as of 2026-10-26
 with the V2 model runner (the default).
 
+### MoE: expert parallelism inside the stages
+
+A stage can be a TP group with `--enable-expert-parallel`: vLLM builds one EP
+group per pipeline stage, so the experts of a stage's layers are spread over
+that stage's GPUs. Nothing changes in Connex. Pass the same `-tp` and
+`--enable-expert-parallel` to every stage (`EXTRA_ARGS` in
+`docker/launch_stage.sh`). Compare against a PP=1 server with the same TP
+width and EP, and run the exact comparison with `--enforce-eager`: with CUDA
+graphs, stock vLLM PP does not repeat from one fresh server to the next
+(`docs/results.md` section 13, `benchmarks/pp_upstream/ep_gate`).
+
 ### Mode 1: stock vLLM PP, inter-stage traffic over connex-rs instead of NCCL
 
 All stages are ranks of one vLLM instance, as with plain

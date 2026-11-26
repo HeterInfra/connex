@@ -1514,6 +1514,53 @@ start of stage 1's prefill in the earlier trace is the scheduler running a
 step ahead (async scheduling); whether in-process NCCL PP pays the same was
 not measured, and no change was made for it.
 
+### Expert parallelism inside the stages (MoE)
+
+Qwen3-30B-A3B (bf16, 128 experts, top-8) on one host with 4x A40: PP=2,
+each stage TP=2 with `--enable-expert-parallel`, so each stage's EP group is
+its two GPUs (each GPU holds 64 experts of the stage's 24 layers). The
+reference is a fresh PP=1 server with TP=2 and EP on two GPUs, which uses
+the same expert partition and the same TP width. Each TP+EP pair sits under
+one PCIe switch and the pipeline crosses the socket. Same build as above
+(vLLM main of 2026-10-26 with the three PP branches, Connex 0.3.0, connex-rs
+0.1.9). Every run uses a fresh server and 20 serial greedy prompts, 128
+tokens each, of which 3 are long (`benchmarks/pp_upstream/ep_gate`).
+
+| comparison, `--enforce-eager` | prompts identical |
+|---|---|
+| reference vs reference | 20/20 |
+| Connex, one instance per stage, vs reference | 20/20 |
+| Connex, one instance (`-pp 2`), vs reference | 20/20 |
+| both Connex modes vs stock vLLM PP (NCCL), two stock runs | 20/20 |
+
+With CUDA graphs on (the default) the exact comparison is not usable,
+because stock vLLM PP itself does not repeat. The PP=1 reference stays
+deterministic:
+
+| comparison, CUDA graphs on | prompts identical |
+|---|---|
+| reference vs reference | 20/20 |
+| stock PP + EP vs stock PP + EP (fresh) | 14/20 |
+| stock PP without EP vs itself (fresh) | 17/20 |
+| Connex, one instance per stage, vs itself (three runs) | 15/20, 16/20, 16/20 |
+| Connex, one instance, vs stock PP | 12-15/20 |
+| any PP run vs reference | 4-5/20 |
+
+Teacher-forced on the reference, stock PP and both Connex modes each have
+4 of 2,560 tokens more than 0.5 nats below the argmax (worst 1.5 nats); a
+second reference run has 0 (worst 0.375). Under `--enforce-eager` the
+re-score finds 9 of 2,560 for every run including a second reference, the
+floor of comparing prefill log-probabilities with decoded tokens. So the
+CUDA-graph path of PP in vLLM drifts on its own, and the Connex modes stay
+inside that drift. Connex needed no change for expert parallelism. Memory
+at 2,048 KV blocks: 17.2 GB per GPU for PP2 x EP2 and 32.6 GB per GPU for
+the reference.
+
+A random-init tiny Qwen3-MoE (4 layers, 16 experts) gives the same picture
+with CUDA graphs on. Both Connex modes match stock PP 20/20, all PP runs
+diverge from the reference at the same 17 positions, and every run is
+0 of 2,560 off the argmax (worst gap 0.001).
+
 ## 14. Import and CLI startup time
 
 `connex/__init__.py` used to import every legacy module eagerly, and two of

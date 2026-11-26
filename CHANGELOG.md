@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- vLLM PP: expert parallelism inside pipeline stages (MoE) is verified on GPUs. Qwen3-30B-A3B, PP=2 with
+  TP=2 + EP per stage, both plugin modes: greedy output identical to a PP=1 TP=2 + EP server and to stock
+  vLLM PP (20/20 prompts, `--enforce-eager`). With CUDA graphs on, stock vLLM PP is not deterministic
+  between fresh servers, and Connex stays inside that spread. No code change was needed. New gate
+  tooling in `benchmarks/pp_upstream/ep_gate`; notes in `integrations/vllm/README.md` and
+  `docs/results.md` (#41).
+
 ## 0.3.0
 
 This release removes the pre-0.2 endpoint stack that no supported path
