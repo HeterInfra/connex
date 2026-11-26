@@ -21,7 +21,7 @@ Where things live:
   ``connex.serving.proxy``.
 """
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 # Public names are resolved lazily (PEP 562) so that ``import connex`` and
 # ``import connex.<subpackage>`` do not pull in torch/vLLM/UCX up front.

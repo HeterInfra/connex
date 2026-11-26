@@ -120,6 +120,14 @@ The compose file pins connex-rs to TCP, shared memory and CUDA IPC
 (`UCX_TLS`); for RDMA uncomment the `/dev/infiniband` lines and unset
 `UCX_TLS`. `make down` stops everything.
 
+**Containers and the data plane.** Each stage container sees only its own
+GPU, so the stages cannot open each other's CUDA IPC handles; since 0.3.0
+they detect this (#40) and move hidden states over connex-rs instead. For
+GPU memory over connex-rs the containers need the RDMA devices
+(`--device /dev/infiniband --ulimit memlock=-1`, and `nvidia_peermem` on
+the host): without them UCX falls back to TCP, whose software RMA copies
+device memory with the CPU and crashes the stage.
+
 ## Tier 2: several hosts (docker, RDMA or TCP)
 
 Run one container per stage replica with `docker/launch_stage.sh` (the

@@ -1,10 +1,42 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 This release removes the pre-0.2 endpoint stack that no supported path
-used (about 12k lines) and gives every connex-rs engine the same UCX
-defaults.
+used (about 12k lines), fixes the defects found in a full review of the
+code (issues #30-#40), and speeds up the PD, RL, PP and control-plane hot
+paths. `connex-ai[rs]` still accepts `connex-rs>=0.1.6`; batched reads need
+0.1.7 or later, and the submodule and Docker default are at connex-rs
+v0.1.8.
+
+**Upgrade notes:**
+
+- Upgrade all pipeline stages together. The ZeroMQ fallback now sends one
+  message per step with raw tensor frames and a correlation id (older
+  receivers cannot read it; `CONNEX_PP_ZMQ_RAW=0` keeps `torch.save` frames
+  for them). The GPUDirect wire adds an integrity stamp that older receivers
+  ignore, so they keep working, but only upgraded receivers check it.
+- `/sessions/{sid}/migrate` and `/sessions/drain` now require loopback or the
+  admin token (`CONNEX_SESSION_ADMIN_TOKEN` / `--admin-token`).
+- vLLM PP: the KV cache comes out smaller by the pipeline link's memory
+  (send/receive rings and channel rings), which used to sit outside
+  vLLM's memory budget; `CONNEX_PP_PROFILE_HOLD=0` restores the old sizing.
+
+**Performance**
+
+| Path | 0.2.1 | 0.3.0 |
+|---|---|---|
+| PD host staging, 64 fragmented blocks x 32 layers x K/V (A40), engine-thread time | 57.7 ms | 0.73 ms (6.2 ms until done) |
+| PD host staging, 512 fragmented blocks (1 GB) | 392 ms | 3.7 ms (47 ms until done) |
+| connex-rs read of 32768 x 4 KiB (mlx5 RDMA loopback), wall / caller CPU | 50 / 50 ms | 43 / 14 ms |
+| PD registered-memory check, 1024 fragmented blocks | 68 ms | bisect, O(ops log spans) |
+| PP ZeroMQ fallback, 3-stage CPU chain, small / 4 MiB tensors | 5.4 / 43 ms per step | 0.63 / 19 ms |
+| PP host-buffer path, live send buffers after 1000 steps | 2985 (growing) | ~780 (flat) |
+| vLLM PP stage-0 control sends, 3 peers x 20 KB, engine time per step | 2.3 ms | 0.13 ms |
+| Front-router register at 2000 routes (old client / compact) | 23 ms | 0.9 / 0.1 ms |
+| Worst heartbeat during a 5000-route re-registration storm | 666 ms | 44 / 11 ms |
+| EP plan_repair, 58 x 256 x 288 table, no moves | 177 ms | 8 ms |
+| PD take_finished with 20k holds, per engine step | 14 ms | 0.6 us |
 
 **Breaking:** the following modules are gone, together with their names in
 the lazy `connex.<Name>` exports: `epc_v3`, `epc_v31`, `epc_api`,
@@ -62,6 +94,10 @@ ucx-py. Use connex-rs (`connex-ai[rs]`) or ConnexTE (Mooncake) instead.
 
 ### Fixes
 
+- vLLM PP: same-host CUDA IPC is chosen only when both stages can see each
+  other's GPU and address it peer to peer (identities published in
+  /dev/shm). Stages in separate containers with one GPU each shared the IP,
+  picked IPC and crashed on the first step; they now use RDMA. (#40)
 - PD: a release that arrived while `KVProducer.hold` was staging no longer
   leaves the blocks pinned for `retain_s`; direct GPUDirect KV reads wait for
   engine work queued before the pull (async scheduling could write the
