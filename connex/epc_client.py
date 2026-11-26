@@ -230,6 +230,13 @@ class EPCV2ClientConfig:
         )
     )
     
+    # Route table carried by the register reply: "compact" (whole model,
+    # data-plane fields only; the default), "full" (what routers always
+    # sent, also what older routers send whatever is asked) or "none" (no
+    # table: the cache is filled lazily, off the register path, by the event
+    # loop's refresh, and stage lookups query the router until then).
+    register_snapshot: str = "compact"
+
     # Transport configuration
     ucx_enabled: bool = True
     gpu_direct_enabled: bool = False
@@ -574,6 +581,7 @@ class EPCV2Client:
         self._last_seq: Optional[int] = None
         self._needs_full_refresh = False
         self._hb_seen_seq: Optional[int] = None  # router seq seen on previous heartbeat
+        self._router_id: Optional[str] = None    # instance id of the router (newer routers)
         self._stage_query_supported = True
         self.stats: Dict[str, int] = {
             "full_refreshes": 0,
@@ -737,16 +745,30 @@ class EPCV2Client:
             }
             if self.config.group_size > 1:
                 params["group_size"] = int(self.config.group_size)
+            snapshot = self.config.register_snapshot
+            if snapshot != "full":
+                # Routers that do not know the field ignore it and send the
+                # full table, which is handled the same way below.
+                params["snapshot"] = snapshot
             response = self._call_api("register", params, channel=channel,
                                       timeout_ms=timeout_ms)
             
             if response.get("success"):
                 self._local_epoch = response.get("epoch", 0)
                 self._registered = True
+                self._note_router_id(response.get("router_id"))
                 
                 # Update route table
-                route_table = response.get("route_table", [])
-                self._apply_snapshot(route_table, self._local_epoch, response.get("seq"))
+                route_table = response.get("route_table")
+                if route_table is not None:
+                    self._apply_snapshot(route_table, self._local_epoch, response.get("seq"))
+                else:
+                    # No table asked for: the cache is not known to match the
+                    # router, so stage lookups query it and the event loop
+                    # fetches the model's table when idle.
+                    route_table = []
+                    with self._sync_lock:
+                        self._needs_full_refresh = True
                 
                 is_reconnect = response.get("is_reconnect", False)
                 logger.info(
@@ -787,6 +809,7 @@ class EPCV2Client:
                 )
                 self._local_epoch = server_epoch
             
+            self._note_router_id(response.get("router_id"))
             self._check_seq_from_heartbeat(response.get("seq"))
             
             ok = response.get("success", False)
@@ -832,6 +855,27 @@ class EPCV2Client:
         self._rereg_next = time.monotonic() + self._rereg_delay * random.uniform(0.5, 1.5)
         return False
 
+    def _note_router_id(self, router_id: Optional[str]):
+        """Reset event-sequence tracking when the router is a new instance.
+
+        Sequence numbers restart at 0 in a new router process. Without this
+        a client that had processed seq 5000 from the old router would take
+        the new router's snapshots (seq 3) as stale and its events as
+        already covered, and keep serving its old cache as in sync.
+        Older routers send no id; nothing changes for them.
+        """
+        if router_id is None:
+            return
+        with self._sync_lock:
+            prev = self._router_id
+            self._router_id = router_id
+            if prev is not None and prev != router_id:
+                logger.info("Front router restarted (%s -> %s); resyncing routes",
+                            prev, router_id)
+                self._last_seq = None
+                self._hb_seen_seq = None
+                self._needs_full_refresh = True
+
     def _check_seq_from_heartbeat(self, server_seq: Optional[int]):
         """Detect silently missed events (e.g. PUB/SUB slow joiner).
 
@@ -870,8 +914,10 @@ class EPCV2Client:
     def refresh_routes(self) -> List[RouteEntry]:
         """Refresh route table from Front Router (full, model-scoped)."""
         try:
+            # compact: the client keeps only data-plane fields; routers that
+            # predate the flag ignore it and send the full form.
             response = self._call_api("get_routes", {
-                "model_name": self.lid.model_name
+                "model_name": self.lid.model_name, "compact": True,
             })
             
             routes = response.get("routes", [])

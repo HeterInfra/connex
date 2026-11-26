@@ -111,11 +111,72 @@ class LogicalEndpointID:
         )
     
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        # Same dict as dataclasses.asdict (field order included), without its
+        # recursive deep copy: this runs for every route of a reply.
+        return {"model_name": self.model_name, "stage_idx": self.stage_idx,
+                "shard_idx": self.shard_idx, "replica_idx": self.replica_idx}
     
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "LogicalEndpointID":
         return cls(**d)
+
+
+_UNSET = object()
+
+
+def _json_number(x: Any) -> str:
+    """Encode a number exactly as json.dumps would (repr for finite floats)."""
+    if type(x) is float and x - x == 0.0:
+        return float.__repr__(x)
+    return json.dumps(x)
+
+
+class EncodedJSON:
+    """A reply value that is already JSON text.
+
+    The API thread splices it into the reply as is (see
+    FrontRouter._encode_reply) instead of building Python objects for it and
+    encoding them again. In-process callers can still use it like the list
+    or dict it encodes; it is decoded on first such use.
+    """
+    __slots__ = ("text", "_value", "_data")
+
+    def __init__(self, text: str):
+        self.text = text
+        self._value = _UNSET
+        self._data: Optional[bytes] = None
+
+    @property
+    def data(self) -> bytes:
+        """UTF-8 bytes of ``text``, kept so a cached table is encoded once."""
+        if self._data is None:
+            self._data = self.text.encode("utf8")
+        return self._data
+
+    def value(self) -> Any:
+        if self._value is _UNSET:
+            self._value = json.loads(self.text)
+        return self._value
+
+    def __iter__(self):
+        return iter(self.value())
+
+    def __len__(self):
+        return len(self.value())
+
+    def __getitem__(self, i):
+        return self.value()[i]
+
+    def __contains__(self, x):
+        return x in self.value()
+
+    def __eq__(self, other):
+        if isinstance(other, EncodedJSON):
+            other = other.value()
+        return self.value() == other
+
+    def __repr__(self):
+        return f"EncodedJSON({self.text[:60]!r}...)"
 
 
 @dataclass
@@ -155,6 +216,69 @@ class RouteEntry:
             d["group_size"] = self.group_size
         return d
 
+    # -- cached JSON fragments -------------------------------------------
+    # A register reply carries the model's whole route table, and encoding
+    # thousands of routes from scratch (to_dict + json.dumps) took tens of
+    # milliseconds on the single API thread that also serves heartbeats.
+    # Each route keeps its encoded form and drops it when a field it encodes
+    # is assigned (__setattr__ below); the owning RouteManager is told too, so
+    # it can drop its cached per-model table. This relies on fields being
+    # rebound, never edited in place: write route.metadata = {...}, not
+    # route.metadata[k] = v (all code in this module does).
+    # last_heartbeat changes on every heartbeat and is not in the compact
+    # form, so assigning it invalidates nothing; the full form is cached as
+    # the text before and after it and the timestamp is formatted per use.
+
+    def __setattr__(self, name: str, value: Any):
+        d = self.__dict__
+        changed = False
+        if name in _ROUTE_ENCODED_FIELDS:
+            old = d.get(name, _UNSET)
+            # equal values of another type (1 vs 1.0) encode differently
+            changed = old is not value and (type(old) is not type(value) or old != value)
+        object.__setattr__(self, name, value)
+        if changed:
+            # Re-registration rebinds addresses/epoch/state to equal values;
+            # only a real change drops the cached forms.
+            d.pop("_wire", None)
+            d.pop("_wire_full", None)
+            cb = d.get("_on_change")
+            if cb is not None:
+                cb(self)
+
+    def _wire_cache(self) -> tuple:
+        c = self.__dict__.get("_wire")
+        if c is None:
+            d = self.to_dict()
+            head = {k: d[k] for k in ("lid", "addresses", "capabilities", "epoch", "state")}
+            # json.dumps(dict) text up to the last_heartbeat value and after it;
+            # head + number + tail is byte-identical to json.dumps(to_dict()).
+            full_head = json.dumps(head)[:-1] + ', "last_heartbeat": '
+            full_tail = (', "registered_at": ' + _json_number(d["registered_at"])
+                         + ', "metadata": ' + json.dumps(d["metadata"]) + "}")
+            c = (full_head, full_tail, json.dumps(self.to_compact_dict()))
+            self.__dict__["_wire"] = c
+        return c
+
+    def to_json(self) -> str:
+        """json.dumps(self.to_dict()), from cached fragments.
+
+        The finished text is kept with the heartbeat time it was made for, so
+        routes that have not heartbeated since the last reply cost a lookup.
+        """
+        hb = self.last_heartbeat
+        f = self.__dict__.get("_wire_full")
+        if f is not None and f[0] is hb:
+            return f[1]
+        c = self._wire_cache()
+        text = c[0] + _json_number(hb) + c[1]
+        self.__dict__["_wire_full"] = (hb, text)
+        return text
+
+    def to_compact_json(self) -> str:
+        """json.dumps(self.to_compact_dict()), cached."""
+        return self._wire_cache()[2]
+
     @property
     def group_size(self) -> int:
         """Shards in this endpoint's group (1: not grouped). A group, e.g. the
@@ -174,6 +298,21 @@ class RouteEntry:
             registered_at=d.get("registered_at", time.time()),
             metadata=d.get("metadata", {}),
         )
+
+
+# Fields that appear in a route's encoded forms (all but last_heartbeat).
+_ROUTE_ENCODED_FIELDS = frozenset(
+    f for f in RouteEntry.__dataclass_fields__ if f != "last_heartbeat")
+
+
+def encode_routes(routes: List[RouteEntry], compact: bool = False) -> EncodedJSON:
+    """The JSON list of ``routes`` (full or compact form) from per-route
+    cached fragments; same text json.dumps would produce for the dicts."""
+    if compact:
+        parts = [r.to_compact_json() for r in routes]
+    else:
+        parts = [r.to_json() for r in routes]
+    return EncodedJSON("[" + ", ".join(parts) + "]")
 
 
 @dataclass
@@ -255,6 +394,12 @@ class RouteManager:
         self._routes: Dict[str, RouteEntry] = {}
         self._by_stage: Dict[Tuple[str, int], Dict[str, RouteEntry]] = {}
         self._by_model: Dict[str, Dict[str, RouteEntry]] = {}
+        # model_name -> its compact route table as JSON text. Dropped when a
+        # route of the model is added, removed or changes a compact field;
+        # rebuilt on the next request. During a storm of re-registrations
+        # that change nothing (same address, already ACTIVE) every register
+        # reply reuses it.
+        self._compact_json: Dict[str, EncodedJSON] = {}
         self._hb_order: "OrderedDict[str, float]" = OrderedDict()
         self._lock = threading.RLock()
         self._persistence = persistence
@@ -271,12 +416,16 @@ class RouteManager:
             (route.lid.model_name, route.lid.stage_idx), {}
         )[key] = route
         self._by_model.setdefault(route.lid.model_name, {})[key] = route
+        self._compact_json.pop(route.lid.model_name, None)
+        route.__dict__["_on_change"] = self._route_changed
         self._touch_locked(key, route.last_heartbeat)
     
     def _index_remove(self, key: str) -> Optional[RouteEntry]:
         route = self._routes.pop(key, None)
         self._hb_order.pop(key, None)
         if route is not None:
+            route.__dict__.pop("_on_change", None)
+            self._compact_json.pop(route.lid.model_name, None)
             skey = (route.lid.model_name, route.lid.stage_idx)
             bucket = self._by_stage.get(skey)
             if bucket is not None:
@@ -290,6 +439,26 @@ class RouteManager:
                     del self._by_model[route.lid.model_name]
         return route
     
+    def _route_changed(self, route: RouteEntry):
+        # Called from RouteEntry.__setattr__ when an encoded field changed.
+        # Some (registered_at, metadata other than group_size) are not in the
+        # compact form, but dropping the table is cheap and always safe.
+        self._compact_json.pop(route.lid.model_name, None)
+
+    def model_routes_json(self, model_name: str, compact: bool) -> EncodedJSON:
+        """The model's route table as JSON text (cached for the compact form;
+        the full form carries live heartbeat times, so it is joined from the
+        per-route fragments each time)."""
+        with self._lock:
+            if not compact:
+                return encode_routes(self.get_routes_for_model(model_name))
+            enc = self._compact_json.get(model_name)
+            if enc is None:
+                enc = encode_routes(self.get_routes_for_model(model_name), compact=True)
+                if model_name in self._by_model:
+                    self._compact_json[model_name] = enc
+            return enc
+
     def _touch_locked(self, key: str, ts: float):
         """Record a heartbeat time, keeping _hb_order sorted by time."""
         self._hb_order[key] = ts
@@ -305,6 +474,7 @@ class RouteManager:
             )
             for route in entries:
                 self._index_add(route.lid.to_key(), route)
+                route._wire_cache()   # see add_route
             logger.info("Loaded %d routes from persistence", len(self._routes))
         except Exception as e:
             logger.warning("Failed to load routes from persistence: %s", e)
@@ -342,6 +512,10 @@ class RouteManager:
                     last_heartbeat=now,
                 )
                 self._index_add(key, route)
+            # Encode the route now, while serving its own register, so the
+            # first reply that lists every route (e.g. after a restart or a
+            # bulk load) does not pay for encoding all of them at once.
+            route._wire_cache()
             
             # Persist
             if self._persistence:
@@ -1048,6 +1222,9 @@ class FrontRouter:
             # TODO: Implement etcd/Redis backends
             self._persistence = InMemoryPersistence()
         
+        # Identifies this router process (see the heartbeat reply).
+        self.router_id = os.urandom(8).hex()
+
         # Core components
         self.route_manager = RouteManager(self._persistence)
         self.epoch_manager = EpochManager(self._persistence)
@@ -1147,7 +1324,7 @@ class FrontRouter:
                 if self._api_socket.poll(timeout=1000):
                     request = self._api_socket.recv_json()
                     response = self._handle_request(request)
-                    self._api_socket.send_json(response)
+                    self._api_socket.send(self._encode_reply(response))
                     self._stats["api_requests"] += 1
             except Exception as e:
                 logger.error("API error: %s", e)
@@ -1156,6 +1333,25 @@ class FrontRouter:
                 except:
                     pass
     
+    @staticmethod
+    def _encode_reply(response: Dict[str, Any]) -> bytes:
+        """Encode a reply as send_json would, splicing EncodedJSON values in.
+
+        For replies with an EncodedJSON value the dict is written out key by
+        key with json.dumps' default separators, so the bytes are the same
+        as json.dumps of the decoded reply (same key order, same spacing).
+        """
+        if not any(isinstance(v, EncodedJSON) for v in response.values()):
+            return json.dumps(response).encode("utf8")
+        parts = []
+        for k, v in response.items():
+            parts.append(json.dumps(str(k)).encode("utf8") + b": ")
+            parts.append(v.data if isinstance(v, EncodedJSON)
+                         else json.dumps(v).encode("utf8"))
+            parts.append(b", ")
+        parts[-1] = b"}"
+        return b"{" + b"".join(parts)
+
     def _handle_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Handle an API request."""
         method = request.get("method", "")
@@ -1196,6 +1392,16 @@ class FrontRouter:
             logger.error("Handler error for %s: %s", method, e)
             return {"error": str(e)}
     
+    # Reply forms of the register route table, chosen by the request's
+    # optional "snapshot" field. Requests without it (all older clients) get
+    # "full", the reply they always got.
+    #   full     every route of the model with timestamps and metadata
+    #   compact  every route of the model, data-plane fields only (what
+    #            EPCV2Client keeps); smaller to send and to parse
+    #   none     no table: the client fetches what it needs later (stage
+    #            query or get_routes); the reply still carries seq
+    REGISTER_SNAPSHOTS = ("full", "compact", "none")
+
     def _handle_register(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle endpoint registration."""
         lid = LogicalEndpointID.from_dict(params["lid"])
@@ -1229,16 +1435,28 @@ class FrontRouter:
         # Add/update route
         route = self.route_manager.add_route(lid, addresses, capabilities, epoch)
         gsize = int(params.get("group_size", 1) or 1)
+        # Rebind metadata rather than edit it in place, so the route's cached
+        # JSON forms see the change (see RouteEntry.__setattr__).
+        meta = dict(route.metadata)
         if gsize > 1:
-            route.metadata["group_size"] = gsize
+            meta["group_size"] = gsize
         else:
-            route.metadata.pop("group_size", None)
+            meta.pop("group_size", None)
+        if meta != route.metadata:
+            route.metadata = meta
         
         # Event seq at snapshot time (read before the snapshot; see get_routes)
         snapshot_seq = self.event_bus.seq
         
-        # Get full route table for response
-        all_routes = self.route_manager.get_routes_for_model(lid.model_name)
+        # Route table for the reply, built now (under the route lock, so it
+        # matches snapshot_seq) from the routes' cached JSON fragments.
+        snapshot = params.get("snapshot", "full")
+        if snapshot not in self.REGISTER_SNAPSHOTS:
+            snapshot = "full"
+        table = None
+        if snapshot != "none":
+            table = self.route_manager.model_routes_json(
+                lid.model_name, compact=(snapshot == "compact"))
         
         # Broadcast registration event
         self.event_bus.publish(Event(
@@ -1265,14 +1483,20 @@ class FrontRouter:
         
         self._stats["registrations"] += 1
         
-        return {
+        reply = {
             "success": True,
             "epoch": epoch,
             "is_reconnect": is_reconnect,
             "address_changed": address_changed,
-            "route_table": [r.to_dict() for r in all_routes],
-            "seq": snapshot_seq,
         }
+        if table is not None:
+            reply["route_table"] = table
+        reply["seq"] = snapshot_seq
+        if "snapshot" in params:
+            # Only clients that asked get these; the old reply is unchanged.
+            reply["snapshot"] = snapshot
+            reply["router_id"] = self.router_id
+        return reply
     
     def _broadcast_route_updated(
         self,
@@ -1420,6 +1644,9 @@ class FrontRouter:
             "epoch": self.epoch_manager.current,
             # Additive: lets clients detect missed events.
             "seq": self.event_bus.seq,
+            # Additive: seq restarts in a new router process; this tells
+            # clients the counter they are tracking was reset.
+            "router_id": self.router_id,
         }
     
     def _handle_get_routes(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -1437,20 +1664,18 @@ class FrontRouter:
         model_name = params.get("model_name")
         stage_idx = params.get("stage_idx")
         
+        compact = bool(params.get("compact"))
         if model_name and stage_idx is not None:
             stages = stage_idx if isinstance(stage_idx, list) else [stage_idx]
             routes = []
             for st in stages:
                 routes.extend(self.route_manager.get_routes_for_stage(model_name, int(st)))
+            out = encode_routes(routes, compact=compact)
         elif model_name:
-            routes = self.route_manager.get_routes_for_model(model_name)
+            out = self.route_manager.model_routes_json(model_name, compact=compact)
         else:
-            routes = self.route_manager.get_all_routes()
+            out = encode_routes(self.route_manager.get_all_routes(), compact=compact)
         
-        if params.get("compact"):
-            out = [r.to_compact_dict() for r in routes]
-        else:
-            out = [r.to_dict() for r in routes]
         return {
             "routes": out,
             "epoch": self.epoch_manager.current,
