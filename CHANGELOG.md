@@ -7,7 +7,9 @@ used (about 12k lines), fixes the defects found in a full review of the
 code (issues #30-#40), and speeds up the PD, RL, PP and control-plane hot
 paths. `connex-ai[rs]` still accepts `connex-rs>=0.1.6`; batched reads need
 0.1.7 or later, and the submodule and Docker default are at connex-rs
-v0.1.8.
+v0.1.9 (batched reads wait on the last op; teardown also runs when the
+progress thread panics; the 256 KB TCP segment size applies on UCX >= 1.17,
+1.8 -> 5.6 GB/s for 64 MiB TCP gets on UCX 1.20).
 
 **Upgrade notes:**
 
