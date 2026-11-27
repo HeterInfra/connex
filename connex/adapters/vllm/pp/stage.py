@@ -295,7 +295,11 @@ def main(argv: list[str] | None = None) -> None:
     engine_args = EngineArgs.from_cli_args(args)
     if engine_args.pipeline_stage_rank in (None, 0):
         sys.exit("the stage server runs stages 1..N-1 (--pipeline-stage-rank k >= 1)")
-    vllm_config = engine_args.create_engine_config(UsageContext.ENGINE_CONTEXT)
+    # The context of `vllm serve` (stage 0): its defaults for max_num_seqs and
+    # max_num_batched_tokens (256 / 2048 on most GPUs) differ from
+    # ENGINE_CONTEXT's (128 / ...); a stage with fewer request slots than
+    # stage 0 schedules fails with "No free indices".
+    vllm_config = engine_args.create_engine_config(UsageContext.OPENAI_API_SERVER)
     ph.mark("engine config")
     core = EngineCore(vllm_config, Executor.get_class(vllm_config), log_stats=False,
                       executor_fail_callback=lambda: os._exit(1))

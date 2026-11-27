@@ -464,7 +464,9 @@ class ConnexPPGroup(GroupCoordinator):
         from connex.adapters.vllm.pp.link import _peer_id
 
         for url in peers:
-            if url and self.link.same_host(url):
+            if not url:
+                continue   # no live replica on the route (failover in progress)
+            if self.link.same_host(url):
                 self._push_sampled(url, key[0], tensor)
                 continue
             # The receiver's channel carries this key when it told us so for

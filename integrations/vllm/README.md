@@ -118,6 +118,7 @@ instances it served as soon as it is ready).
 | `CONNEX_PP_RING_MB` | from the config | registered GPU buffer per direction for RDMA ((PP+1) steps of hidden states) |
 | `CONNEX_PP_CUDA_IPC` | 1 | same-host stage pairs over CUDA IPC (0: RDMA loopback) |
 | `CONNEX_PP_RDMA_PUSH` | 1 | between hosts, the sender's NIC writes the receiver's ring and flag (needs connex-rs>=0.1.5, `Engine.put_chain`); 0: one-sided reads, the receiver waits on the CPU |
+| `CONNEX_PP_REQUIRE_GDR` | 1 | hidden states between hosts (or pods with different IPs) need GPUDirect RDMA (`nvidia_peermem`); without it the first such transfer stops the process instead of letting UCX touch GPU memory from the CPU. 0: skip the check (GPU memory registers another way, e.g. dma-buf) |
 | `CONNEX_PP_PUSH_MARGIN` | 8 | sampled tokens from a new (epoch, sender) use the push channel from this many steps on (the channel is announced on the first) |
 | `CONNEX_PP_TP_ENDPOINTS` | 1 | one stage per instance with TP > 1: one endpoint per TP rank (0: TP rank 0 receives and broadcasts over the TP group) |
 | `CONNEX_PP_PORT_BASE` | 47000 | base of the port layout above |

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- vLLM PP, one instance per stage: the stage server takes `vllm serve`'s defaults for `max_num_seqs` and
+  `max_num_batched_tokens` (it used the engine defaults, 128 sequences, and failed with "No free indices"
+  under more load than that); a step whose route has no live replica for a stage no longer crashes the
+  sampled-token send during a failover; on a host without a GPUDirect RDMA driver (`nvidia_peermem`) the
+  first cross-host transfer of hidden states stops the process with a clear error instead of letting UCX
+  touch GPU memory from the CPU (SIGSEGV). `CONNEX_PP_REQUIRE_GDR=0` skips that check (#42).
 - vLLM PP: expert parallelism inside pipeline stages (MoE) is verified on GPUs. Qwen3-30B-A3B, PP=2 with
   TP=2 + EP per stage, both plugin modes: greedy output identical to a PP=1 TP=2 + EP server and to stock
   vLLM PP (20/20 prompts, `--enforce-eager`). With CUDA graphs on, stock vLLM PP is not deterministic

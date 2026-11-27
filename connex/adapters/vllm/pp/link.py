@@ -75,6 +75,13 @@ IPC_ENABLED = os.getenv("CONNEX_PP_CUDA_IPC", "1") == "1"
 # the receiving stream can wait without a Python thread on the path.
 # CONNEX_PP_RDMA_PUSH=0: receive with one-sided reads, waiting on the CPU.
 PUSH_ENABLED = os.getenv("CONNEX_PP_RDMA_PUSH", "1") == "1"
+# Hidden states between hosts (or pods with different IPs) move by RDMA
+# directly on GPU memory, which needs a peer-memory driver (GPUDirect RDMA:
+# nvidia_peermem). Without one UCX may fall back to CPU access of GPU
+# pointers and crash (SIGSEGV) or corrupt data, so the first such transfer
+# stops the process instead. CONNEX_PP_REQUIRE_GDR=0 skips the check (a
+# peer-memory path this check does not know, e.g. dma-buf).
+REQUIRE_GDR = os.getenv("CONNEX_PP_REQUIRE_GDR", "1") == "1"
 _push_ok: bool | None = None
 
 
@@ -123,6 +130,12 @@ def local_ip() -> str:
         return get_ip()
     except Exception:  # noqa: BLE001
         return "127.0.0.1"
+
+
+def _gpudirect() -> bool:
+    from connex.pd.host_staging import gpudirect_available
+
+    return gpudirect_available()
 
 
 def make_engine(model: str, stage: int, shard: int, replica: int, port: int = 0,
@@ -238,6 +251,8 @@ def chan_reserve_bytes(ipc_slots: int, ipc_slot_bytes: int, rings: int = 2) -> i
 class StageLink:
     """See the module docstring."""
 
+    _gdr = True   # GPU memory may go over RDMA (set in __init__)
+
     def __init__(self, model: str, stage: int, shard: int, replica: int,
                  device: torch.device, port: int = 0, ring_mb: int | None = None,
                  on_peer_failed: Callable[[tuple], None] | None = None,
@@ -298,6 +313,11 @@ class StageLink:
         self._rx_last: dict[str, int] = {}
         self._graveyard = None
         self._ip = self.url.split(":", 1)[0]
+        self._gdr = device.type != "cuda" or not REQUIRE_GDR or _gpudirect()
+        if not self._gdr:
+            log.warning("connex-pp: no GPUDirect RDMA driver (nvidia_peermem) on this host: "
+                        "only same-host CUDA IPC peers work; a cross-host transfer of "
+                        "hidden states stops this process (CONNEX_PP_REQUIRE_GDR=0 skips)")
         if IPC_ENABLED and device.type == "cuda":
             publish_gpu(self.url, device)
         self._waiter = None
@@ -325,6 +345,18 @@ class StageLink:
             threading.Thread(target=target, name=name, daemon=True).start()
 
     # ---------------------------------------------------------------- failure
+    def require_gdr(self, what: str) -> bool:
+        """True when GPU memory may go over RDMA here; else stop the
+        process (fatal) and return False."""
+        if self._gdr:
+            return True
+        self.fatal(f"{what} needs GPUDirect RDMA on GPU memory, and this host has no "
+                   "peer-memory driver (nvidia_peermem); refusing UCX's CPU fallback. "
+                   "Load the driver, keep this stage on the same host as its "
+                   "neighbours, or set CONNEX_PP_REQUIRE_GDR=0 if GPU memory "
+                   "registers another way")
+        return False
+
     def fatal(self, reason: str) -> None:
         """This hop cannot deliver the data of a live step: stop the process
         (its stage fails over, the step is recomputed) rather than letting a
@@ -349,6 +381,8 @@ class StageLink:
         layout, total = _layout(tensors)
         if self.same_host(peer_url) and total <= self.ipc_slot_bytes:
             self._send_ipc(peer_url, key, tensors, layout, total, meta)
+            return
+        if not self.require_gdr(f"sending {key} to {peer_url}"):
             return
         tx = self._tx_chans.get((_peer_id(peer_url), ("p", "h")))
         if tx is not None and not tx.dead and total <= tx.slot_bytes:
@@ -517,6 +551,8 @@ class StageLink:
         slots = slots or d_slots
         slot_bytes = slot_bytes or d_bytes
         host = d_host if host is None else host
+        if not host and not self.require_gdr(f"a push channel ({tag}) from {peer}"):
+            raise RuntimeError("no GPUDirect RDMA for a GPU push channel")
         torch.cuda.set_device(self.device)
         k = (tuple(peer), ("p", tag))
         if not host:
@@ -585,6 +621,8 @@ class StageLink:
         torch.cuda.set_device(self.device)
         k = (tuple(peer), ("p", tag))
         host = tag != "h"
+        if not host and not self.require_gdr(f"a push channel ({tag}) to {peer}"):
+            raise RuntimeError("no GPUDirect RDMA for a GPU push channel")
         tx = PushTx(self.engine, self.device, info, staging=host, host_staging=host,
                     timeout_ms=READ_TIMEOUT_MS, arm_timeout_ms=CHAIN_ARM_TIMEOUT_MS)
         tx.extra = extra
@@ -898,6 +936,8 @@ class StageLink:
     def _read_into(self, peer, hdr, posted) -> None:
         _, key, src_url, src_ptr, mid, total = hdr[:6]
         off, slot = posted
+        if not self.require_gdr(f"reading {key} from {src_url}"):
+            return
         # Both rings hold at least ZCOPY_MIN bytes for the message (GPU RMA
         # below UCX's zero-copy threshold crashes in UCX).
         rc = self.engine.transfer_sync_read(src_url, self.recv_buf.data_ptr() + off, src_ptr,
